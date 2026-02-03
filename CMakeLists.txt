@@ -219,3 +219,4 @@ configure_file(config.hpp.in config.hpp)
 
 install( TARGETS athena DESTINATION bin )
 
+set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -Wno-deprecated-gpu-targets") /suppress nvcc warning
