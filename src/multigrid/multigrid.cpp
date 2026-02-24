@@ -31,8 +31,10 @@
 //! \fn Multigrid::Multigrid(MultigridDriver *pmd, MeshBlock *pmb, int nghost)
 //  \brief Multigrid constructor
 
-Multigrid::Multigrid(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost):
-  pmy_driver_(pmd), pmy_pack_(pmbp), pmy_mesh_(pmd->pmy_mesh_), ngh_(nghost), nvar_(pmd->nvar_), defscale_(1.0)  {
+Multigrid::Multigrid(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost,
+                     bool on_host):
+  pmy_driver_(pmd), pmy_pack_(pmbp), pmy_mesh_(pmd->pmy_mesh_), ngh_(nghost),
+  nvar_(pmd->nvar_), defscale_(1.0), on_host_(on_host)  {
   if(pmy_pack_ != nullptr) {
     //Meshblock levels
     indcs_ = pmy_mesh_->mb_indcs;
@@ -132,8 +134,6 @@ Multigrid::Multigrid(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost):
   }
 
   current_level_ = nlevel_-1;
-
-  on_host_ = (pmy_pack_ == nullptr);
 
   // allocate arrays
   u_ = new DualArray5D<Real>[nlevel_];
@@ -586,7 +586,6 @@ void Multigrid::SetFromRootGrid(bool folddata) {
 //! \brief calculate the residual norm
 
 Real Multigrid::CalculateDefectNorm(MGNormType nrm, int n) {
-  auto &def=def_[current_level_].d_view;
   int ll=nlevel_-1-current_level_;
   int is, ie, js, je, ks, ke;
   is=js=ks=ngh_;
@@ -597,39 +596,69 @@ Real Multigrid::CalculateDefectNorm(MGNormType nrm, int n) {
   Real dV = dx * dy * dz;
   CalculateDefectPack();
 
-  // Calculate norm over active zone on device
   Real norm = 0.0;
-  
-  if (nrm == MGNormType::max) {
-    // L-infinity norm: max absolute value
-    Kokkos::parallel_reduce("MG::DefectNorm_Linf", 
-      Kokkos::MDRangePolicy<Kokkos::Rank<5>>(DevExeSpace(), {0, n, ks, js, is}, 
-                                              {nmmb_, n+1, ke+1, je+1, ie+1}),
-      KOKKOS_LAMBDA(const int m, const int v, const int k, const int j, const int i, Real &local_max) {
-        local_max = std::max(local_max, std::abs(def(m, v, k, j, i)));
-      }, Kokkos::Max<Real>(norm));
+
+  if (on_host_) {
+    auto &def = def_[current_level_].h_view;
+    if (nrm == MGNormType::max) {
+      Kokkos::parallel_reduce("MG::DefectNorm_Linf",
+        Kokkos::MDRangePolicy<HostExeSpace, Kokkos::Rank<5>>(
+            {0, n, ks, js, is}, {nmmb_, n+1, ke+1, je+1, ie+1}),
+        KOKKOS_LAMBDA(const int m, const int v, const int k, const int j,
+                       const int i, Real &local_max) {
+          local_max = std::max(local_max, std::abs(def(m, v, k, j, i)));
+        }, Kokkos::Max<Real>(norm));
       return norm;
-  } else if (nrm == MGNormType::l1) {
-    // L1 norm: sum of absolute values
-    Kokkos::parallel_reduce("MG::DefectNorm_L1",
-      Kokkos::MDRangePolicy<Kokkos::Rank<5>>(DevExeSpace(), {0, n, ks, js, is},
-                                              {nmmb_, n+1, ke+1, je+1, ie+1}),
-      KOKKOS_LAMBDA(const int m, const int v, const int k, const int j, const int i, Real &local_sum) {
-        local_sum += std::abs(def(m, v, k, j, i));
-      }, Kokkos::Sum<Real>(norm));
-  } else { // L2 norm (default)
-    // L2 norm: sqrt(sum of squares)
-    Kokkos::parallel_reduce("MG::DefectNorm_L2",
-      Kokkos::MDRangePolicy<Kokkos::Rank<5>>(DevExeSpace(), {0, n, ks, js, is},
-                                              {nmmb_, n+1, ke+1, je+1, ie+1}),
-      KOKKOS_LAMBDA(const int m, const int v, const int k, const int j, const int i, Real &local_sum) {
-        Real val = def(m, v, k, j, i);
-        local_sum += val * val;
+    } else if (nrm == MGNormType::l1) {
+      Kokkos::parallel_reduce("MG::DefectNorm_L1",
+        Kokkos::MDRangePolicy<HostExeSpace, Kokkos::Rank<5>>(
+            {0, n, ks, js, is}, {nmmb_, n+1, ke+1, je+1, ie+1}),
+        KOKKOS_LAMBDA(const int m, const int v, const int k, const int j,
+                       const int i, Real &local_sum) {
+          local_sum += std::abs(def(m, v, k, j, i));
         }, Kokkos::Sum<Real>(norm));
+    } else {
+      Kokkos::parallel_reduce("MG::DefectNorm_L2",
+        Kokkos::MDRangePolicy<HostExeSpace, Kokkos::Rank<5>>(
+            {0, n, ks, js, is}, {nmmb_, n+1, ke+1, je+1, ie+1}),
+        KOKKOS_LAMBDA(const int m, const int v, const int k, const int j,
+                       const int i, Real &local_sum) {
+          Real val = def(m, v, k, j, i);
+          local_sum += val * val;
+        }, Kokkos::Sum<Real>(norm));
+    }
+  } else {
+    auto &def = def_[current_level_].d_view;
+    if (nrm == MGNormType::max) {
+      Kokkos::parallel_reduce("MG::DefectNorm_Linf",
+        Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<5>>(
+            {0, n, ks, js, is}, {nmmb_, n+1, ke+1, je+1, ie+1}),
+        KOKKOS_LAMBDA(const int m, const int v, const int k, const int j,
+                       const int i, Real &local_max) {
+          local_max = std::max(local_max, std::abs(def(m, v, k, j, i)));
+        }, Kokkos::Max<Real>(norm));
+      return norm;
+    } else if (nrm == MGNormType::l1) {
+      Kokkos::parallel_reduce("MG::DefectNorm_L1",
+        Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<5>>(
+            {0, n, ks, js, is}, {nmmb_, n+1, ke+1, je+1, ie+1}),
+        KOKKOS_LAMBDA(const int m, const int v, const int k, const int j,
+                       const int i, Real &local_sum) {
+          local_sum += std::abs(def(m, v, k, j, i));
+        }, Kokkos::Sum<Real>(norm));
+    } else {
+      Kokkos::parallel_reduce("MG::DefectNorm_L2",
+        Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<5>>(
+            {0, n, ks, js, is}, {nmmb_, n+1, ke+1, je+1, ie+1}),
+        KOKKOS_LAMBDA(const int m, const int v, const int k, const int j,
+                       const int i, Real &local_sum) {
+          Real val = def(m, v, k, j, i);
+          local_sum += val * val;
+        }, Kokkos::Sum<Real>(norm));
+    }
   }
   norm *= defscale_;
   return norm;
-
 }
 
 //----------------------------------------------------------------------------------------

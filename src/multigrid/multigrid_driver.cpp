@@ -93,6 +93,31 @@ MultigridDriver::~MultigridDriver() {
 
 
 //----------------------------------------------------------------------------------------
+//! \fn void MultigridDriver::SyncRootToHost()
+//! \brief Sync root grid arrays from device to host (no-op if root runs on host)
+
+void MultigridDriver::SyncRootToHost() {
+  if (mgroot_->on_host_) return;
+  int lev = mgroot_->current_level_;
+  Kokkos::deep_copy(mgroot_->u_[lev].h_view, mgroot_->u_[lev].d_view);
+  Kokkos::deep_copy(mgroot_->uold_[lev].h_view, mgroot_->uold_[lev].d_view);
+  Kokkos::deep_copy(mgroot_->src_[lev].h_view, mgroot_->src_[lev].d_view);
+}
+
+
+//----------------------------------------------------------------------------------------
+//! \fn void MultigridDriver::SyncRootToDevice()
+//! \brief Sync root grid arrays from host to device (no-op if root runs on host)
+
+void MultigridDriver::SyncRootToDevice() {
+  if (mgroot_->on_host_) return;
+  int lev = mgroot_->current_level_;
+  Kokkos::deep_copy(mgroot_->u_[lev].d_view, mgroot_->u_[lev].h_view);
+  Kokkos::deep_copy(mgroot_->src_[lev].d_view, mgroot_->src_[lev].h_view);
+}
+
+
+//----------------------------------------------------------------------------------------
 //! \fn void MultigridDriver::SubtractAverage(MGVariable type)
 //  \brief Calculate the global average and subtract it
 
@@ -240,6 +265,7 @@ void MultigridDriver::InitializeOctets() {
 
 void MultigridDriver::BuildRootFlatBuffers() {
   if (!root_flat_buf_stale_) return;
+  SyncRootToHost();
   auto root_u_h = GetRootData_h();
   auto root_uold_h = GetRootOldData_h();
   int rnx = root_u_h.extent_int(4);
@@ -330,6 +356,7 @@ void MultigridDriver::TransferFromBlocksToRoot(bool initflag) {
   }
   root_flat_buf_stale_ = true;
   mgroot_->current_level_ = nrootlevel_ - 1;
+  SyncRootToDevice();
   return;
 }
 
@@ -761,6 +788,7 @@ void MultigridDriver::RestrictFMGSourceOctets() {
         RestrictOneSrc(oct, v, ngh, ngh, ngh);
   }
   root_flat_buf_stale_ = true;
+  SyncRootToDevice();
 }
 
 
@@ -811,6 +839,7 @@ void MultigridDriver::RestrictOctets() {
       }
     }
     root_flat_buf_stale_ = true;
+    SyncRootToDevice();
   }
 }
 
@@ -1326,6 +1355,7 @@ void MultigridDriver::RestrictOctetsBeforeTransfer() {
                      static_cast<int>(oloc.lx1)+ngh) =
           RestrictOne(oct, v, ngh, ngh, ngh);
   }
+  SyncRootToDevice();
 }
 
 
@@ -1414,6 +1444,7 @@ void MultigridDriver::SetOctetBoundariesBeforeTransfer(bool folddata) {
 
 
 void MultigridDriver::MGRootBoundary() {
+  SyncRootToHost();
   auto u = mgroot_->GetCurrentData_h();
   int nvar = u.extent_int(1);
   int current_level = mgroot_->GetCurrentLevel();
@@ -1452,4 +1483,5 @@ void MultigridDriver::MGRootBoundary() {
     }
   }
   root_flat_buf_stale_ = true;
+  SyncRootToDevice();
 }

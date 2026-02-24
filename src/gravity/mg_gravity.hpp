@@ -37,7 +37,8 @@ struct GravityStencil {
 
 class MGGravity : public Multigrid {
  public:
-  MGGravity(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost);
+  MGGravity(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost,
+            bool on_host = false);
   ~MGGravity();
 
   void SmoothPack(int color) final;

@@ -62,7 +62,8 @@ MGGravityDriver::MGGravityDriver(MeshBlockPack *pmbp, ParameterInput *pin)
   }
   // Allocate the root multigrid
   int nghost = pin->GetOrAddInteger("gravity", "mg_nghost", 1);
-  mgroot_ = new MGGravity(this, nullptr, nghost);
+  bool root_on_host = pin->GetOrAddBoolean("gravity", "root_on_host", false);
+  mgroot_ = new MGGravity(this, nullptr, nghost, root_on_host);
   mglevels_ = new MGGravity(this, pmbp, nghost);
   // allocate boundary buffers
   mglevels_->pbval = new MultigridBoundaryValues(pmbp, pin, false, mglevels_);
@@ -88,7 +89,9 @@ void MGGravityDriver::SetFourPiG(Real four_pi_G) {
 //! \fn MGGravity::MGGravity(MultigridDriver *pmd, MeshBlock *pmb)
 //! \brief MGGravity constructor
 
-MGGravity::MGGravity(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost) : Multigrid(pmd, pmbp, nghost) {
+MGGravity::MGGravity(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost,
+                     bool on_host)
+    : Multigrid(pmd, pmbp, nghost, on_host) {
 }
 
 

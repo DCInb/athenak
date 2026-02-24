@@ -15,6 +15,7 @@
 #include <cstdio> // std::size_t
 #include <cstring> // memcpy
 #include <iostream>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -172,7 +173,8 @@ struct MultigridTaskIDs {
 
 class Multigrid {
  public:
-  Multigrid(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost);
+  Multigrid(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost,
+            bool on_host = false);
   virtual ~Multigrid();
 
   // KGF: Both btype=BoundaryQuantity::mg and btypef=BoundaryQuantity::mg_faceonly (face
@@ -193,9 +195,9 @@ class Multigrid {
   void RestrictCoefficients();
   void FMGProlongatePack();
   void ProlongateAndCorrectPack();
-  void SmoothPack(int color);
-  void CalculateDefectPack();
-  void CalculateFASRHSPack();
+  virtual void SmoothPack(int color) = 0;
+  virtual void CalculateDefectPack() = 0;
+  virtual void CalculateFASRHSPack() = 0;
   void ComputeCorrection();
   void CalculateMatrixPack(Real dt);
   void SetFromRootGrid(bool folddata);
@@ -217,31 +219,100 @@ class Multigrid {
   int GetSize() { return indcs_.nx1; }
   int GetGhostCells() { return ngh_; }
   Real GetRootDx() { return rdx_; }
-  DvceArray5D<Real>& GetCurrentData() { return u_[current_level_]; }
-  DvceArray5D<Real>& GetCurrentSource() { return src_[current_level_]; }
-  DvceArray5D<Real>& GetCurrentOldData() { return uold_[current_level_]; }
-  DvceArray5D<Real>& GetCurrentCoefficient() { return coeff_[current_level_]; }
+  auto GetCurrentData() { return u_[current_level_].d_view; }
+  auto GetCurrentSource() { return src_[current_level_].d_view; }
+  auto GetCurrentOldData() { return uold_[current_level_].d_view; }
+  auto GetCurrentCoefficient() { return coeff_[current_level_].d_view; }
+  auto GetCurrentData_h() { return u_[current_level_].h_view; }
+  auto GetCurrentSource_h() { return src_[current_level_].h_view; }
+  auto GetCurrentOldData_h() { return uold_[current_level_].h_view; }
+  bool OnHost() const { return on_host_; }
 
-  // actual implementations of Multigrid operations
-  void Restrict(DvceArray5D<Real> &dst, const DvceArray5D<Real> &src,
+
+  // actual implementations of Multigrid operations (templated on view type)
+  template <typename ViewType>
+  void Restrict(ViewType &dst, const ViewType &src,
                 int nvar, int il, int iu, int jl, int ju, int kl, int ku, bool th);
-  void ProlongateAndCorrect(DvceArray5D<Real> &dst, const DvceArray5D<Real> &src,
+  template <typename ViewType>
+  void ProlongateAndCorrect(ViewType &dst, const ViewType &src,
     int il, int iu, int jl, int ju, int kl, int ku, int fil, int fjl, int fkl, bool th);
-  void FMGProlongate(DvceArray5D<Real> &dst, const DvceArray5D<Real> &src,
+  template <typename ViewType>
+  void FMGProlongate(ViewType &dst, const ViewType &src,
     int il, int iu, int jl, int ju, int kl, int ku, int fil, int fjl, int fkl);
 
-  // physics-dependent virtual functions
-  virtual void Smooth(DvceArray5D<Real> &dst, const DvceArray5D<Real> &src,
-                      const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrx,
-                      int rlev, int il, int iu, int jl, int ju, int kl, int ku,
-                      int color, bool th) = 0;
-  virtual void CalculateDefect(DvceArray5D<Real> &def, const DvceArray5D<Real> &u,
-               const DvceArray5D<Real> &src, const DvceArray5D<Real> &coeff,
-               const DvceArray5D<Real> &matrix, int rlev, int il, int iu, int jl, int ju,
-               int kl, int ku, bool th) = 0;
-  virtual void CalculateFASRHS(DvceArray5D<Real> &def, const DvceArray5D<Real> &src,
-                 const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrix,
-                 int rlev, int il, int iu, int jl, int ju, int kl, int ku, bool th) = 0;
+  // Physics-dependent operations templated on view type and stencil.
+  // The stencil functor must provide:
+  //   Real Apply(const ViewType&, const ViewType&, int m, int v, int k, int j, int i)
+  //   Real omega_over_diag
+  template <typename ViewType, typename StencilOp>
+  void Smooth(ViewType &u, const ViewType &src, const ViewType &coeff,
+              const ViewType &matrix, const StencilOp &stencil, int rlev,
+              int il, int iu, int jl, int ju, int kl, int ku, int color, bool th) {
+    using ExeSpace = typename ViewType::execution_space;
+    auto brdx = [this]() {
+      if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
+        return block_rdx_.h_view;
+      else
+        return block_rdx_.d_view;
+    }();
+    int rlev_l = rlev;
+    Real odiag = stencil.omega_over_diag;
+    color ^= pmy_driver_->GetCoffset();
+    par_for("Multigrid::Smooth", ExeSpace(), 0, nmmb_-1, kl, ku, jl, ju,
+    KOKKOS_LAMBDA(const int m, const int k, const int j) {
+      Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
+                              : brdx(m) / static_cast<Real>(1<<rlev_l);
+      Real dx2 = dx * dx;
+      const int c = (color + k + j) & 1;
+      for (int i = il + c; i <= iu; i += 2) {
+        Real lap = stencil.Apply(u, coeff, m, 0, k, j, i);
+        u(m,0,k,j,i) -= (lap - src(m,0,k,j,i)*dx2) * odiag;
+      }
+    });
+  }
+
+  template <typename ViewType, typename StencilOp>
+  void CalculateDefect(ViewType &def, const ViewType &u, const ViewType &src,
+                       const ViewType &coeff, const ViewType &matrix,
+                       const StencilOp &stencil, int rlev,
+                       int il, int iu, int jl, int ju, int kl, int ku, bool th) {
+    using ExeSpace = typename ViewType::execution_space;
+    auto brdx = [this]() {
+      if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
+        return block_rdx_.h_view;
+      else
+        return block_rdx_.d_view;
+    }();
+    int rlev_l = rlev;
+    par_for("Multigrid::CalculateDefect", ExeSpace(), 0, nmmb_-1, kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
+                              : brdx(m) / static_cast<Real>(1<<rlev_l);
+      Real idx2 = 1.0 / (dx * dx);
+      def(m,0,k,j,i) = src(m,0,k,j,i) - stencil.Apply(u, coeff, m, 0, k, j, i) * idx2;
+    });
+  }
+
+  template <typename ViewType, typename StencilOp>
+  void CalculateFASRHS(ViewType &src, const ViewType &u, const ViewType &coeff,
+                       const ViewType &matrix, const StencilOp &stencil, int rlev,
+                       int il, int iu, int jl, int ju, int kl, int ku, bool th) {
+    using ExeSpace = typename ViewType::execution_space;
+    auto brdx = [this]() {
+      if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
+        return block_rdx_.h_view;
+      else
+        return block_rdx_.d_view;
+    }();
+    int rlev_l = rlev;
+    par_for("Multigrid::CalculateFASRHS", ExeSpace(), 0, nmmb_-1, kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
+                              : brdx(m) / static_cast<Real>(1<<rlev_l);
+      Real idx2 = 1.0 / (dx * dx);
+      src(m,0,k,j,i) += stencil.Apply(u, coeff, m, 0, k, j, i) * idx2;
+    });
+  }
   
   friend class MultigridDriver;
   friend class MultigridBoundaryValues;
@@ -258,10 +329,12 @@ class Multigrid {
   int nlevel_, ngh_, nvar_, ncoeff_, nmatrix_, current_level_;
   int nmmbx1_, nmmbx2_, nmmbx3_;
   int nmmb_;
+  bool on_host_;
+
   Real rdx_, rdy_, rdz_;
   Real defscale_;
-  DvceArray1D<Real> block_rdx_;
-  DvceArray5D<Real> *u_, *def_, *src_, *uold_, *coeff_, *matrix_;
+  DualArray1D<Real> block_rdx_;
+  DualArray5D<Real> *u_, *def_, *src_, *uold_, *coeff_, *matrix_;
   Coordinates *coord_, *ccoord_;
 };
 
@@ -274,10 +347,13 @@ class MultigridDriver {
   MultigridDriver(MeshBlockPack *pmbp, int invar);
   virtual ~MultigridDriver();
 
+  auto GetRootData_h() { return mgroot_->GetCurrentData_h(); }
+  auto GetRootOldData_h() { return mgroot_->GetCurrentOldData_h(); }
+  auto GetRootSource_h() { return mgroot_->GetCurrentSource_h(); }
   // pure virtual function
   virtual void Solve(Driver *pdriver, int step, Real dt = 0.0) = 0;
   int GetCoffset() const { return coffset_; }
-  void MGRootBoundary(const DvceArray5D<Real> &u);
+  void MGRootBoundary();
   void TransferFromBlocksToRoot(bool initflag);
   void TransferFromRootToBlocks(bool folddata);
 
@@ -400,9 +476,12 @@ class MultigridDriver {
   std::vector<Real> cbuf_, cbufold_;  // scratch buffers for boundary exchange
   std::vector<bool> ncoarse_;         // 3x3x3 flags for coarser neighbors
 
-  // helper to read root grid data on host
-  inline Real RootU(const Kokkos::View<Real*****, Kokkos::HostSpace> &h,
-                    int v, int k, int j, int i) const { return h(0,v,k,j,i); }
+  std::vector<Real> root_u_buf_, root_uold_buf_;
+  int root_buf_nc_;
+  bool root_flat_buf_stale_;
+  void BuildRootFlatBuffers();
+  void SyncRootToHost();
+  void SyncRootToDevice();
 
  private:
   int nb_rank_;
