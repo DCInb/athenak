@@ -235,12 +235,12 @@ struct DvceEdgeFld4D {
 // MD-range policy, so the latter is not used.
 //------------------------------
 // 1D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &il, const int &iu, const Function &function) {
   // compute total number of elements and call Kokkos::parallel_for()
   const int ni = iu - il + 1;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, ni),
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<ExeSpace>(exec_space, 0, ni),
   KOKKOS_LAMBDA(const int &idx) {
     // compute i indices of thread and call function
     int i = (idx) + il;
@@ -250,15 +250,15 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 2D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &jl, const int &ju,
                     const int &il, const int &iu, const Function &function) {
   // compute total number of elements and call Kokkos::parallel_for()
   const int nj = ju - jl + 1;
   const int ni = iu - il + 1;
   const int nji  = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nji),
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nji),
   KOKKOS_LAMBDA(const int &idx) {
     // compute j,i indices of thread and call function
     int j = (idx)/ni;
@@ -270,8 +270,8 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 3D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &kl, const int &ku, const int &jl, const int &ju,
                     const int &il, const int &iu, const Function &function) {
   // compute total number of elements and call Kokkos::parallel_for()
@@ -280,7 +280,7 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   const int ni = iu - il + 1;
   const int nkji = nk * nj * ni;
   const int nji  = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nkji),
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nkji),
   KOKKOS_LAMBDA(const int &idx) {
     // compute k,j,i indices of thread and call function
     int k = (idx)/nji;
@@ -294,8 +294,8 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 4D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &nl, const int &nu, const int &kl, const int &ku,
                     const int &jl, const int &ju, const int &il, const int &iu,
                     const Function &function) {
@@ -307,7 +307,7 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   const int nnkji = nn * nk * nj * ni;
   const int nkji  = nk * nj * ni;
   const int nji   = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nnkji),
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nnkji),
   KOKKOS_LAMBDA(const int &idx) {
     // compute n,k,j,i indices of thread and call function
     int n = (idx)/nkji;
@@ -323,8 +323,8 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 5D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &ml, const int &mu,
                     const int &nl, const int &nu, const int &kl, const int &ku,
                     const int &jl, const int &ju, const int &il, const int &iu,
@@ -339,7 +339,7 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   const int nnkji  = nn * nk * nj * ni;
   const int nkji   = nk * nj * ni;
   const int nji    = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nmnkji),
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nmnkji),
   KOKKOS_LAMBDA(const int &idx) {
     // compute m,n,k,j,i indices of thread and call function
     int m = (idx)/nnkji;

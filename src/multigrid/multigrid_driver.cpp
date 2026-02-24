@@ -42,7 +42,8 @@ MultigridDriver::MultigridDriver(MeshBlockPack *pmbp, int invar):
     needinit_(true), eps_(-1.0),
     niter_(-1), npresmooth_(1), npostsmooth_(1), coffset_(0), fprolongation_(0),
     nb_rank_(0), ncoeff_(0),
-    octets_(nullptr), octetmap_(nullptr), octetbflag_(nullptr), noctets_(nullptr) {
+    octets_(nullptr), octetmap_(nullptr), octetbflag_(nullptr), noctets_(nullptr),
+    root_buf_nc_(0), root_flat_buf_stale_(true) {
   if (pmy_mesh_->mb_indcs.nx2==1 || pmy_mesh_->mb_indcs.nx3==1) {
     std::cout << "### FATAL ERROR in MultigridDriver::MultigridDriver" << std::endl
         << "Currently the Multigrid solver works only in 3D." << std::endl;
@@ -237,6 +238,30 @@ void MultigridDriver::InitializeOctets() {
 }
 
 
+void MultigridDriver::BuildRootFlatBuffers() {
+  if (!root_flat_buf_stale_) return;
+  auto root_u_h = GetRootData_h();
+  auto root_uold_h = GetRootOldData_h();
+  int rnx = root_u_h.extent_int(4);
+  int rny = root_u_h.extent_int(3);
+  int rnz = root_u_h.extent_int(2);
+  int rnv = root_u_h.extent_int(1);
+  root_buf_nc_ = rnx;
+  int total = rnv*rnz*rny*rnx;
+  root_u_buf_.resize(total);
+  root_uold_buf_.resize(total);
+  for (int v = 0; v < rnv; ++v)
+    for (int k = 0; k < rnz; ++k)
+      for (int j = 0; j < rny; ++j)
+        for (int i = 0; i < rnx; ++i) {
+          int idx = ((v*rnz+k)*rny+j)*rnx+i;
+          root_u_buf_[idx] = root_u_h(0,v,k,j,i);
+          root_uold_buf_[idx] = root_uold_h(0,v,k,j,i);
+        }
+  root_flat_buf_stale_ = false;
+}
+
+
 //----------------------------------------------------------------------------------------
 //! \fn void MultigridDriver::TransferFromBlocksToRoot(bool initflag)
 //! \brief collect the coarsest data and transfer to the root grid
@@ -246,15 +271,15 @@ void MultigridDriver::InitializeOctets() {
 void MultigridDriver::TransferFromBlocksToRoot(bool initflag) {
   const int nv = nvar_;
   auto rootbuf = rootbuf_;
-  const auto &src_ = mglevels_->src_[0];
-  const auto &u_ = mglevels_->u_[0];
+  const auto &src = mglevels_->src_[0].d_view;
+  const auto &u = mglevels_->u_[0].d_view;
   const int ngh_mb = mglevels_->ngh_;
   int nmmb = mglevels_->nmmb_ - 1;
   int padding = nslist_[global_variable::my_rank];
   par_for("Multigrid:SaveToRoot", DevExeSpace(), 0, nmmb, KOKKOS_LAMBDA(const int m) {
     for (int v = 0; v < nv; ++v) {
-      rootbuf.d_view(v,    m+padding) = src_(m, v, ngh_mb, ngh_mb, ngh_mb);
-      rootbuf.d_view(v+nv, m+padding) = u_(m, v, ngh_mb, ngh_mb, ngh_mb);
+      rootbuf.d_view(v,    m+padding) = src(m, v, ngh_mb, ngh_mb, ngh_mb);
+      rootbuf.d_view(v+nv, m+padding) = u(m, v, ngh_mb, ngh_mb, ngh_mb);
     }
   });
   rootbuf.template modify<DevExeSpace>();
@@ -270,22 +295,18 @@ void MultigridDriver::TransferFromBlocksToRoot(bool initflag) {
   int rootlevel = locrootlevel_;
   int ngh = mgroot_->ngh_;
 
-  // Scatter block data into root grid or octets
-  const auto &src_r = mgroot_->GetCurrentSource();
-  const auto &u_r = mgroot_->GetCurrentData();
-  auto src_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), src_r);
-  auto u_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), u_r);
+  auto root_src_h = GetRootSource_h();
+  auto root_u_h = GetRootData_h();
 
   for (int n = 0; n < nbtotal_; ++n) {
     int i = static_cast<int>(loc[n].lx1);
     int j = static_cast<int>(loc[n].lx2);
     int k = static_cast<int>(loc[n].lx3);
     if (loc[n].level == rootlevel) {
-      // Root-level block -> root grid
       for (int v = 0; v < nv; ++v) {
-        src_h(0, v, k+ngh, j+ngh, i+ngh) = rootbuf.h_view(v, n);
+        root_src_h(0, v, k+ngh, j+ngh, i+ngh) = rootbuf.h_view(v, n);
         if (!initflag)
-          u_h(0, v, k+ngh, j+ngh, i+ngh) = rootbuf.h_view(v+nv, n);
+          root_u_h(0, v, k+ngh, j+ngh, i+ngh) = rootbuf.h_view(v+nv, n);
       }
     } else {
       // Refined block -> appropriate octet
@@ -307,11 +328,7 @@ void MultigridDriver::TransferFromBlocksToRoot(bool initflag) {
       }
     }
   }
-
-  Kokkos::deep_copy(src_r, src_h);
-  if (!initflag)
-    Kokkos::deep_copy(u_r, u_h);
-
+  root_flat_buf_stale_ = true;
   mgroot_->current_level_ = nrootlevel_ - 1;
   return;
 }
@@ -338,7 +355,7 @@ void MultigridDriver::TransferFromRootToBlocks(bool folddata) {
 void MultigridDriver::FMGProlongate(Driver *pdriver) {
   int ngh = mgroot_->ngh_;
   if (current_level_ == nrootlevel_ + nreflevel_ - 1) {
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     TransferFromRootToBlocks(false);
   }
   if (current_level_ >= nrootlevel_ + nreflevel_ - 1) { // MeshBlocks
@@ -348,13 +365,13 @@ void MultigridDriver::FMGProlongate(Driver *pdriver) {
     current_level_++;
   } else if (current_level_ >= nrootlevel_ - 1) { // octets
     if (current_level_ == nrootlevel_ - 1)
-      MGRootBoundary(mgroot_->GetCurrentData());
+      MGRootBoundary();
     else
       SetBoundariesOctets(true, false);
     FMGProlongateOctets();
     current_level_++;
   } else { // root grid
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     mgroot_->FMGProlongatePack();
     current_level_++;
   }
@@ -369,7 +386,7 @@ void MultigridDriver::FMGProlongate(Driver *pdriver) {
 void MultigridDriver::OneStepToFiner(Driver *pdriver, int nsmooth) {
   int ngh = mgroot_->ngh_;
   if (current_level_ == nrootlevel_ + nreflevel_ - 1) {
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     TransferFromRootToBlocks(true);
   }
   if (current_level_ >= nrootlevel_ + nreflevel_ - 1) { // MeshBlocks
@@ -384,7 +401,7 @@ void MultigridDriver::OneStepToFiner(Driver *pdriver, int nsmooth) {
     current_level_++;
   } else if (current_level_ >= nrootlevel_ - 1) { // octets
     if (current_level_ == nrootlevel_ - 1)
-      MGRootBoundary(mgroot_->GetCurrentData());
+      MGRootBoundary();
     else
       SetBoundariesOctets(true, true);
     ProlongateAndCorrectOctets();
@@ -396,13 +413,13 @@ void MultigridDriver::OneStepToFiner(Driver *pdriver, int nsmooth) {
       SmoothOctets(1 - coffset_);
     }
   } else { // root grid
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     mgroot_->ProlongateAndCorrectPack();
     current_level_++;
     for (int n = 0; n < nsmooth; ++n) {
-      MGRootBoundary(mgroot_->GetCurrentData());
+      MGRootBoundary();
       mgroot_->SmoothPack(coffset_);
-      MGRootBoundary(mgroot_->GetCurrentData());
+      MGRootBoundary();
       mgroot_->SmoothPack(1-coffset_);
     }
   }
@@ -437,16 +454,16 @@ void MultigridDriver::OneStepToCoarser(Driver *pdriver, int nsmooth) {
     }
     RestrictOctets();
   } else { // root grid
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     if (current_level_ < fmglevel_) {
       mgroot_->StoreOldData();
       mgroot_->CalculateFASRHSPack();
     }
     for (int n = 0; n < nsmooth; ++n) {
       mgroot_->SmoothPack(coffset_);
-      MGRootBoundary(mgroot_->GetCurrentData());
+      MGRootBoundary();
       mgroot_->SmoothPack(1-coffset_);
-      MGRootBoundary(mgroot_->GetCurrentData());
+      MGRootBoundary();
     }
     mgroot_->RestrictPack();
   }
@@ -541,6 +558,9 @@ void MultigridDriver::SolveIterative(Driver *pdriver) {
   for (int v = 0; v < nvar_; ++v) {
     def += CalculateDefectNorm(MGNormType::l2, v);
   }
+  if (fshowdef_) {
+    std::cout << "MG initial defect = " << def << std::endl;
+  }
   int n = 0;
   while (def > eps_) {
     SolveVCycle(pdriver, npresmooth_, npostsmooth_);
@@ -571,6 +591,10 @@ void MultigridDriver::SolveIterative(Driver *pdriver) {
 //! \brief Solve iteratively niter_ times (fixed count)
 
 void MultigridDriver::SolveIterativeFixedTimes(Driver *pdriver) {
+  if (fshowdef_) {
+    Real norm = CalculateDefectNorm(MGNormType::l2, 0);
+    std::cout << "MG initial defect = " << norm << std::endl;
+  }
   for (int n = 0; n < niter_; ++n) {
     SolveVCycle(pdriver, npresmooth_, npostsmooth_);
     if (fshowdef_) {
@@ -592,7 +616,7 @@ void MultigridDriver::SolveCoarsestGrid() {
   int ni = (std::max(nrbx1_, std::max(nrbx2_, nrbx3_))
             >> (nrootlevel_-1));
   if (fsubtract_average_ && ni == 1) {
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     mgroot_->StoreOldData();
     mgroot_->ZeroClearData();
     return;
@@ -601,14 +625,14 @@ void MultigridDriver::SolveCoarsestGrid() {
     SubtractAverage(MGVariable::src);
   if (fsubtract_average_)
     SubtractAverage(MGVariable::u);
-  MGRootBoundary(mgroot_->GetCurrentData());
+  MGRootBoundary();
   mgroot_->StoreOldData();
   mgroot_->CalculateFASRHSPack();
   for (int i = 0; i < ni; ++i) {
     mgroot_->SmoothPack(coffset_);
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
     mgroot_->SmoothPack(1-coffset_);
-    MGRootBoundary(mgroot_->GetCurrentData());
+    MGRootBoundary();
   }
   if (fsubtract_average_)
     SubtractAverage(MGVariable::u);
@@ -726,19 +750,17 @@ void MultigridDriver::RestrictFMGSourceOctets() {
         coct.Src(v, ok, oj, oi) = RestrictOneSrc(foct, v, ngh, ngh, ngh);
     }
   }
-  // Octets at level 0 to root grid
-  const auto &rsrc = mgroot_->GetCurrentSource();
-  auto rsrc_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), rsrc);
+  auto root_src_h = GetRootSource_h();
   for (int o = 0; o < noctets_[0]; ++o) {
     MGOctet &oct = octets_[0][o];
     const LogicalLocation &oloc = oct.loc;
     for (int v = 0; v < nvar_; ++v)
-      rsrc_h(0, v, static_cast<int>(oloc.lx3)+ngh,
-                    static_cast<int>(oloc.lx2)+ngh,
-                    static_cast<int>(oloc.lx1)+ngh) =
+      root_src_h(0, v, static_cast<int>(oloc.lx3)+ngh,
+                       static_cast<int>(oloc.lx2)+ngh,
+                       static_cast<int>(oloc.lx1)+ngh) =
         RestrictOneSrc(oct, v, ngh, ngh, ngh);
   }
-  Kokkos::deep_copy(rsrc, rsrc_h);
+  root_flat_buf_stale_ = true;
 }
 
 
@@ -771,10 +793,8 @@ void MultigridDriver::RestrictOctets() {
       }
     }
   } else { // octets to root grid
-    const auto &rsrc = mgroot_->GetCurrentSource();
-    const auto &ru = mgroot_->GetCurrentData();
-    auto rsrc_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), rsrc);
-    auto ru_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ru);
+    auto root_src_h = GetRootSource_h();
+    auto root_u_h = GetRootData_h();
 
     for (int o = 0; o < noctets_[0]; ++o) {
       MGOctet &oct = octets_[0][o];
@@ -784,12 +804,13 @@ void MultigridDriver::RestrictOctets() {
       int rk = static_cast<int>(oloc.lx3);
       CalculateDefectOctet(oct, 1);
       for (int v = 0; v < nvar_; ++v) {
-        rsrc_h(0, v, rk+ngh, rj+ngh, ri+ngh) = RestrictOneDef(oct, v, ngh, ngh, ngh);
-        ru_h(0, v, rk+ngh, rj+ngh, ri+ngh) = RestrictOne(oct, v, ngh, ngh, ngh);
+        root_src_h(0, v, rk+ngh, rj+ngh, ri+ngh) =
+            RestrictOneDef(oct, v, ngh, ngh, ngh);
+        root_u_h(0, v, rk+ngh, rj+ngh, ri+ngh) =
+            RestrictOne(oct, v, ngh, ngh, ngh);
       }
     }
-    Kokkos::deep_copy(rsrc, rsrc_h);
-    Kokkos::deep_copy(ru, ru_h);
+    root_flat_buf_stale_ = true;
   }
 }
 
@@ -808,10 +829,8 @@ void MultigridDriver::ProlongateAndCorrectOctets() {
   constexpr Real inv = 1.0 / 32768.0;
 
   if (flev == 0) { // from root to octets
-    const auto &ru = mgroot_->GetCurrentData();
-    const auto &ruold = mgroot_->GetCurrentOldData();
-    auto ru_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ru);
-    auto ruold_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ruold);
+    auto root_u_h = GetRootData_h();
+    auto root_uold_h = GetRootOldData_h();
 
     for (int o = 0; o < noctets_[0]; ++o) {
       MGOctet &oct = octets_[0][o];
@@ -825,8 +844,8 @@ void MultigridDriver::ProlongateAndCorrectOctets() {
         for (int kk = -1; kk <= 1; ++kk)
           for (int jj = -1; jj <= 1; ++jj)
             for (int ii = -1; ii <= 1; ++ii)
-              cbuf[kk+1][jj+1][ii+1] = ru_h(0, v, rk+kk, rj+jj, ri+ii)
-                                      - ruold_h(0, v, rk+kk, rj+jj, ri+ii);
+              cbuf[kk+1][jj+1][ii+1] = root_u_h(0, v, rk+kk, rj+jj, ri+ii)
+                                      - root_uold_h(0, v, rk+kk, rj+jj, ri+ii);
         for (int dk = 0; dk <= 1; ++dk) {
           const Real *wk = (dk == 0) ? w0 : w1;
           for (int dj = 0; dj <= 1; ++dj) {
@@ -900,8 +919,7 @@ void MultigridDriver::FMGProlongateOctets() {
   constexpr Real inv = 1.0 / 32768.0;
 
   if (flev == 0) { // from root to octets
-    const auto &ru = mgroot_->GetCurrentData();
-    auto ru_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ru);
+    auto root_u_h = GetRootData_h();
 
     for (int o = 0; o < noctets_[0]; ++o) {
       MGOctet &oct = octets_[0][o];
@@ -921,7 +939,7 @@ void MultigridDriver::FMGProlongateOctets() {
                 for (int jj = -1; jj <= 1; ++jj)
                   for (int ii = -1; ii <= 1; ++ii)
                     sum += wk[kk+1]*wj[jj+1]*wi[ii+1]
-                           * ru_h(0, v, rk+kk, rj+jj, ri+ii);
+                           * root_u_h(0, v, rk+kk, rj+jj, ri+ii);
               oct.U(v, ngh+dk, ngh+dj, ngh+di) = sum * inv;
             }
           }
@@ -1027,28 +1045,11 @@ void MultigridDriver::SetBoundariesOctets(bool fprolong, bool folddata) {
               MGOctet &coct = octets_[lev-1][cid];
               SetOctetBoundaryFromCoarser(coct.u, coct.uold, cbuf_, cbufold_,
                                           nvar_, coct.nc, loc, ox1, ox2, ox3, folddata);
-            } else { // from root
-              // Get root data on host
-              const auto &ru = mgroot_->GetCurrentData();
-              const auto &ruold = mgroot_->GetCurrentOldData();
-              auto ru_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ru);
-              auto ruold_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ruold);
-              // Convert to flat vector for SetOctetBoundaryFromCoarser
-              int rnx = ru_h.extent_int(4);
-              int rny = ru_h.extent_int(3);
-              int rnz = ru_h.extent_int(2);
-              int rnv = ru_h.extent_int(1);
-              std::vector<Real> rbuf(rnv*rnz*rny*rnx);
-              std::vector<Real> rbufo(rnv*rnz*rny*rnx);
-              for (int v = 0; v < rnv; ++v)
-                for (int k = 0; k < rnz; ++k)
-                  for (int j = 0; j < rny; ++j)
-                    for (int i = 0; i < rnx; ++i) {
-                      rbuf[((v*rnz+k)*rny+j)*rnx+i] = ru_h(0,v,k,j,i);
-                      rbufo[((v*rnz+k)*rny+j)*rnx+i] = ruold_h(0,v,k,j,i);
-                    }
-              SetOctetBoundaryFromCoarser(rbuf, rbufo, cbuf_, cbufold_,
-                                          nvar_, rnx, nloc, ox1, ox2, ox3, folddata);
+            } else { // from root — sync once on first encounter, then reuse
+              BuildRootFlatBuffers();
+              SetOctetBoundaryFromCoarser(root_u_buf_, root_uold_buf_, cbuf_, cbufold_,
+                                          nvar_, root_buf_nc_, nloc,
+                                          ox1, ox2, ox3, folddata);
             }
           }
         }
@@ -1315,18 +1316,16 @@ void MultigridDriver::RestrictOctetsBeforeTransfer() {
         coct.U(v, ok, oj, oi) = RestrictOne(foct, v, ngh, ngh, ngh);
     }
   }
-  // Octets to root grid
-  const auto &ru = mgroot_->GetCurrentData();
-  auto ru_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ru);
+  auto root_u_h = GetRootData_h();
   for (int o = 0; o < noctets_[0]; ++o) {
     MGOctet &oct = octets_[0][o];
     const LogicalLocation &oloc = oct.loc;
     for (int v = 0; v < nvar_; ++v)
-      ru_h(0, v, static_cast<int>(oloc.lx3)+ngh,
-                 static_cast<int>(oloc.lx2)+ngh,
-                 static_cast<int>(oloc.lx1)+ngh) = RestrictOne(oct, v, ngh, ngh, ngh);
+      root_u_h(0, v, static_cast<int>(oloc.lx3)+ngh,
+                     static_cast<int>(oloc.lx2)+ngh,
+                     static_cast<int>(oloc.lx1)+ngh) =
+          RestrictOne(oct, v, ngh, ngh, ngh);
   }
-  Kokkos::deep_copy(ru, ru_h);
 }
 
 
@@ -1395,26 +1394,11 @@ void MultigridDriver::SetOctetBoundariesBeforeTransfer(bool folddata) {
               MGOctet &coct = octets_[lev-1][cid];
               SetOctetBoundaryFromCoarser(coct.u, coct.uold, cbuf_, cbufold_,
                                           nvar_, coct.nc, oloc, ox1, ox2, ox3, folddata);
-            } else {
-              const auto &ru = mgroot_->GetCurrentData();
-              const auto &ruold = mgroot_->GetCurrentOldData();
-              auto ru_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ru);
-              auto ruold_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ruold);
-              int rnx = ru_h.extent_int(4);
-              int rny = ru_h.extent_int(3);
-              int rnz = ru_h.extent_int(2);
-              int rnv = ru_h.extent_int(1);
-              std::vector<Real> rbuf(rnv*rnz*rny*rnx);
-              std::vector<Real> rbufo(rnv*rnz*rny*rnx);
-              for (int v = 0; v < rnv; ++v)
-                for (int k = 0; k < rnz; ++k)
-                  for (int j = 0; j < rny; ++j)
-                    for (int i = 0; i < rnx; ++i) {
-                      rbuf[((v*rnz+k)*rny+j)*rnx+i] = ru_h(0,v,k,j,i);
-                      rbufo[((v*rnz+k)*rny+j)*rnx+i] = ruold_h(0,v,k,j,i);
-                    }
-              SetOctetBoundaryFromCoarser(rbuf, rbufo, cbuf_, cbufold_,
-                                          nvar_, rnx, nloc, ox1, ox2, ox3, folddata);
+            } else { // from root — sync once on first encounter, then reuse
+              BuildRootFlatBuffers();
+              SetOctetBoundaryFromCoarser(root_u_buf_, root_uold_buf_, cbuf_, cbufold_,
+                                          nvar_, root_buf_nc_, nloc,
+                                          ox1, ox2, ox3, folddata);
             }
           }
         }
@@ -1429,45 +1413,43 @@ void MultigridDriver::SetOctetBoundariesBeforeTransfer(bool folddata) {
 }
 
 
-void MultigridDriver::MGRootBoundary(const DvceArray5D<Real> &u) {
+void MultigridDriver::MGRootBoundary() {
+  auto u = mgroot_->GetCurrentData_h();
   int nvar = u.extent_int(1);
   int current_level = mgroot_->GetCurrentLevel();
   int nlevels = mgroot_->GetNumberOfLevels();
   int ngh = mgroot_->ngh_;
-  
+
   int ll = nlevels - 1 - current_level;
   int nx = (mgroot_->indcs_.nx1 >> ll) + 2*ngh;
   int ny = (mgroot_->indcs_.nx2 >> ll) + 2*ngh;
   int nz = (mgroot_->indcs_.nx3 >> ll) + 2*ngh;
-  
-  // Root grid is single meshblock (m=0)
-  int m = 0;
-  
-  // Apply periodic boundary conditions directly
-  par_for("MG::PackAndSendMGRoot_x", DevExeSpace(),
-          0, nvar-1, 0, nz-1, 0, ny-1,
-  KOKKOS_LAMBDA(const int v, const int k, const int j) {
-    for (int n = 0; n < ngh; ++n) {
-      u(m, v, k, j, n) = u(m, v, k, j, nx - 2*ngh + n);
-      u(m, v, k, j, nx - ngh + n) = u(m, v, k, j, ngh + n);
+
+  for (int v = 0; v < nvar; ++v) {
+    for (int k = 0; k < nz; ++k) {
+      for (int j = 0; j < ny; ++j) {
+        for (int n = 0; n < ngh; ++n) {
+          u(0, v, k, j, n) = u(0, v, k, j, nx - 2*ngh + n);
+          u(0, v, k, j, nx - ngh + n) = u(0, v, k, j, ngh + n);
+        }
+      }
     }
-  });
-  
-  par_for("MG::PackAndSendMGRoot_y", DevExeSpace(),
-          0, nvar-1, 0, nz-1, 0, nx-1,
-  KOKKOS_LAMBDA(const int v, const int k, const int i) {
-    for (int n = 0; n < ngh; ++n) {
-      u(m, v, k, n, i) = u(m, v, k, ny - 2*ngh + n, i);
-      u(m, v, k, ny - ngh + n, i) = u(m, v, k, ngh + n, i);
+    for (int k = 0; k < nz; ++k) {
+      for (int i = 0; i < nx; ++i) {
+        for (int n = 0; n < ngh; ++n) {
+          u(0, v, k, n, i) = u(0, v, k, ny - 2*ngh + n, i);
+          u(0, v, k, ny - ngh + n, i) = u(0, v, k, ngh + n, i);
+        }
+      }
     }
-  });
-  
-  par_for("MG::PackAndSendMGRoot_z", DevExeSpace(),
-          0, nvar-1, 0, ny-1, 0, nx-1,
-  KOKKOS_LAMBDA(const int v, const int j, const int i) {
-    for (int n = 0; n < ngh; ++n) {
-      u(m, v, n, j, i) = u(m, v, nz - 2*ngh + n, j, i);
-      u(m, v, nz - ngh + n, j, i) = u(m, v, ngh + n, j, i);
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 0; i < nx; ++i) {
+        for (int n = 0; n < ngh; ++n) {
+          u(0, v, n, j, i) = u(0, v, nz - 2*ngh + n, j, i);
+          u(0, v, nz - ngh + n, j, i) = u(0, v, ngh + n, j, i);
+        }
+      }
     }
-  });
+  }
+  root_flat_buf_stale_ = true;
 }

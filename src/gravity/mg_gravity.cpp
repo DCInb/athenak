@@ -135,95 +135,57 @@ void MGGravityDriver::Solve(Driver *pdriver, int stage, Real dt) {
   return;
 }
 
-KOKKOS_INLINE_FUNCTION
-Real Laplacian(const DvceArray5D<Real> &u_, int m, int v, int k, int j, int i) {
-  return (6.0*u_(m,v,k,j,i) - u_(m,v,k+1,j,i) - u_(m,v,k,j+1,i)
-          - u_(m,v,k,j,i+1) - u_(m,v,k-1,j,i) - u_(m,v,k,j-1,i)
-          - u_(m,v,k,j,i-1));
+void MGGravity::SmoothPack(int color) {
+  int ll = nlevel_-1-current_level_;
+  int is = ngh_, ie = is+(indcs_.nx1>>ll)-1;
+  int js = ngh_, je = js+(indcs_.nx2>>ll)-1;
+  int ks = ngh_, ke = ks+(indcs_.nx3>>ll)-1;
+  GravityStencil stencil{static_cast<MGGravityDriver*>(pmy_driver_)->omega_/6.0};
+  if (on_host_) {
+    Smooth(u_[current_level_].h_view, src_[current_level_].h_view,
+           coeff_[current_level_].h_view, matrix_[current_level_].h_view,
+           stencil, -ll, is, ie, js, je, ks, ke, color, false);
+  } else {
+    Smooth(u_[current_level_].d_view, src_[current_level_].d_view,
+           coeff_[current_level_].d_view, matrix_[current_level_].d_view,
+           stencil, -ll, is, ie, js, je, ks, ke, color, false);
+  }
 }
 
-//----------------------------------------------------------------------------------------
-//! \fn  void MGGravity::Smooth(DvceArray5D<Real> &u, const DvceArray5D<Real> &src,
-//!           const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &mmatrix, int rlev,
-//!           int il, int iu, int jl, int ju, int kl, int ku, int color, bool th)
-//! \brief Implementation of the Red-Black Gauss-Seidel Smoother
-//!        rlev = relative level from the finest level of this Multigrid block
-
-void MGGravity::Smooth(DvceArray5D<Real> &u, const DvceArray5D<Real> &src,
-                const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrix, int rlev,
-                int il, int iu, int jl, int ju, int kl, int ku, int color, bool th) {
-  auto brdx = block_rdx_;
-  int rlev_l = rlev;
-  Real isix = static_cast<MGGravityDriver*>(pmy_driver_)->omega_/6.0;
-  color ^= pmy_driver_->GetCoffset();
-  
-  par_for("MGGravity::Smooth", DevExeSpace(),0 ,nmmb_-1, kl, ku, jl, ju,
-  KOKKOS_LAMBDA(const int m, const int k, const int j) {
-    Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
-                            : brdx(m) / static_cast<Real>(1<<rlev_l);
-    Real dx2 = dx * dx;
-    const int c = (color + k + j) & 1;
-    for (int i = il + c; i <= iu; i += 2) {
-      u(m,0,k,j,i) -= (Laplacian(u, m, 0, k, j, i)-src(m,0,k,j,i)*dx2)*isix;
-    }
-  });
-  return;
+void MGGravity::CalculateDefectPack() {
+  int ll = nlevel_-1-current_level_;
+  int is = ngh_, ie = is+(indcs_.nx1>>ll)-1;
+  int js = ngh_, je = js+(indcs_.nx2>>ll)-1;
+  int ks = ngh_, ke = ks+(indcs_.nx3>>ll)-1;
+  GravityStencil stencil{0.0};
+  if (on_host_) {
+    CalculateDefect(def_[current_level_].h_view, u_[current_level_].h_view,
+                    src_[current_level_].h_view, coeff_[current_level_].h_view,
+                    matrix_[current_level_].h_view,
+                    stencil, -ll, is, ie, js, je, ks, ke, false);
+  } else {
+    CalculateDefect(def_[current_level_].d_view, u_[current_level_].d_view,
+                    src_[current_level_].d_view, coeff_[current_level_].d_view,
+                    matrix_[current_level_].d_view,
+                    stencil, -ll, is, ie, js, je, ks, ke, false);
+  }
 }
 
-
-//----------------------------------------------------------------------------------------
-//! \fn  void MGGravity::CalculateDefect(DvceArray5D<Real> &def,
-//!             const DvceArray5D<Real> &u, const DvceArray5D<Real> &src,
-//!             const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrix,
-//!            int rlev, int il, int iu, int jl, int ju, int kl, int ku, bool th)
-//! \brief Implementation of the Defect calculation
-//!        rlev = relative level from the finest level of this Multigrid block
-
-void MGGravity::CalculateDefect(DvceArray5D<Real> &def, const DvceArray5D<Real> &u,
-                const DvceArray5D<Real> &src, const DvceArray5D<Real> &coeff,
-                const DvceArray5D<Real> &matrix, int rlev,
-                int il, int iu, int jl, int ju, int kl, int ku, bool th) {
-  auto brdx = block_rdx_;
-  int rlev_l = rlev;
-
-  auto def_ = def;
-  auto u_ = u;
-  auto src_ = src;
-  par_for("MGGravity::CalculateDefect", DevExeSpace(),
-          0, nmmb_-1, kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
-                            : brdx(m) / static_cast<Real>(1<<rlev_l);
-    Real idx2 = 1.0 / (dx * dx);
-    def_(m,0,k,j,i) = src_(m,0,k,j,i) - Laplacian(u, m, 0, k, j, i) * idx2;
-  });
-
-  return;
-}
-
-
-//----------------------------------------------------------------------------------------
-//! \fn  void MGGravity::CalculateFASRHS(DvceArray5D<Real> &src,
-//!             const DvceArray5D<Real> &u, const DvceArray5D<Real> &coeff,
-//!             const DvceArray5D<Real> &matrix, int rlev, int il, int iu, int jl, int ju,
-//!             int kl, int ku, bool th)
-//! \brief Implementation of the RHS calculation for FAS
-//!        rlev = relative level from the finest level of this Multigrid block
-
-void MGGravity::CalculateFASRHS(DvceArray5D<Real> &src, const DvceArray5D<Real> &u,
-                const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrix,
-                int shift, int il, int iu, int jl, int ju, int kl, int ku, bool th) {
-  auto brdx = block_rdx_;
-  int shift_l = shift;
-  par_for("MGGravity::CalculateFASRHS", DevExeSpace(),
-          0, nmmb_-1, kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    Real dx = (shift_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-shift_l))
-                             : brdx(m) / static_cast<Real>(1<<shift_l);
-    Real idx2 = 1.0 / (dx * dx);
-    src(m,0,k,j,i) +=  Laplacian(u, m, 0, k, j, i) * idx2;    
-  });
-  return;
+void MGGravity::CalculateFASRHSPack() {
+  int ll = nlevel_-1-current_level_;
+  int is = ngh_, ie = is+(indcs_.nx1>>ll)-1;
+  int js = ngh_, je = js+(indcs_.nx2>>ll)-1;
+  int ks = ngh_, ke = ks+(indcs_.nx3>>ll)-1;
+  GravityStencil stencil{0.0};
+  if (on_host_) {
+    CalculateFASRHS(src_[current_level_].h_view, u_[current_level_].h_view,
+                    coeff_[current_level_].h_view, matrix_[current_level_].h_view,
+                    stencil, -ll, is, ie, js, je, ks, ke, false);
+  } else {
+    CalculateFASRHS(src_[current_level_].d_view, u_[current_level_].d_view,
+                    coeff_[current_level_].d_view, matrix_[current_level_].d_view,
+                    stencil, -ll, is, ie, js, je, ks, ke, false);
+  }
 }
 
 

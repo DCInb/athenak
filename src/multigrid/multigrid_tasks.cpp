@@ -44,13 +44,15 @@ TaskStatus MultigridDriver::ClearSend(Driver *pdrive, int stage) {
 
 TaskStatus MultigridDriver::SendBoundary(Driver *pdrive, int stage) {
   TaskStatus tstat;
-  tstat = pmg->pbval->PackAndSendMG(pmg->GetCurrentData());
+  DvceArray5D<Real> u = pmg->GetCurrentData();
+  tstat = pmg->pbval->PackAndSendMG(u);
   return tstat;
 }
 
 TaskStatus MultigridDriver::RecvBoundary(Driver *pdrive, int stage) {
   TaskStatus tstat;
-  tstat = pmg->pbval->RecvAndUnpackMG(pmg->GetCurrentData());
+  DvceArray5D<Real> u = pmg->GetCurrentData();
+  tstat = pmg->pbval->RecvAndUnpackMG(u);
   return tstat;
 }
 
@@ -106,7 +108,8 @@ TaskStatus MultigridDriver::ProlongateBoundaryForProlongation(Driver *pdrive, in
 
 TaskStatus MultigridDriver::FillFCBoundary(Driver *pdrive, int stage) {
   if (nreflevel_ == 0) return TaskStatus::complete;
-  pmg->pbval->FillFineCoarseMGGhosts(pmg->GetCurrentData());
+  DvceArray5D<Real> u = pmg->GetCurrentData();
+  pmg->pbval->FillFineCoarseMGGhosts(u);
   return TaskStatus::complete;
 }
 

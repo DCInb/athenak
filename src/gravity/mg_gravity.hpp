@@ -18,6 +18,20 @@ class Coordinates;
 class Multigrid;
 class MultigridDriver;
 
+// 7-point Laplacian stencil for Poisson gravity
+struct GravityStencil {
+  Real omega_over_diag;
+
+  template <typename ViewType>
+  KOKKOS_INLINE_FUNCTION
+  Real Apply(const ViewType &u, const ViewType &coeff,
+             int m, int v, int k, int j, int i) const {
+    return 6.0*u(m,v,k,j,i) - u(m,v,k+1,j,i) - u(m,v,k,j+1,i)
+           - u(m,v,k,j,i+1) - u(m,v,k-1,j,i) - u(m,v,k,j-1,i)
+           - u(m,v,k,j,i-1);
+  }
+};
+
 //! \class MGGravity
 //! \brief Multigrid gravity solver for each block
 
@@ -26,18 +40,9 @@ class MGGravity : public Multigrid {
   MGGravity(MultigridDriver *pmd, MeshBlockPack *pmbp, int nghost);
   ~MGGravity();
 
-  void Smooth(DvceArray5D<Real> &dst, const DvceArray5D<Real> &src,
-              const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrix, int rlev,
-              int il, int iu, int jl, int ju, int kl, int ku, int color, bool th) final;
-  void CalculateDefect(DvceArray5D<Real> &def, const DvceArray5D<Real> &u,
-                const DvceArray5D<Real> &src, const DvceArray5D<Real> &coeff,
-                const DvceArray5D<Real> &matrix, int rlev, int il, int iu, int jl, int ju,
-                int kl, int ku, bool th) final;
-  void CalculateFASRHS(DvceArray5D<Real> &def, const DvceArray5D<Real> &src,
-                const DvceArray5D<Real> &coeff, const DvceArray5D<Real> &matrix,
-                int rlev, int il, int iu, int jl, int ju, int kl, int ku, bool th) final;
-
-  void SmoothFAS();
+  void SmoothPack(int color) final;
+  void CalculateDefectPack() final;
+  void CalculateFASRHSPack() final;
 };
 
 
