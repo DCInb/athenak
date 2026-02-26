@@ -39,7 +39,7 @@ MultigridDriver::MultigridDriver(MeshBlockPack *pmbp, int invar):
     nrbx1_(pmbp->pmesh->nmb_rootx1), nrbx2_(pmbp->pmesh->nmb_rootx2), nrbx3_(pmbp->pmesh->nmb_rootx3),
     pmy_pack_(pmbp),
     pmy_mesh_(pmbp->pmesh),
-    needinit_(true), eps_(-1.0),
+    needinit_(true), nreflevel_(0), eps_(-1.0),
     niter_(-1), npresmooth_(1), npostsmooth_(1), coffset_(0), fprolongation_(0),
     nb_rank_(0), ncoeff_(0),
     octets_(nullptr), octetmap_(nullptr), octetbflag_(nullptr), noctets_(nullptr),
@@ -131,32 +131,39 @@ void MultigridDriver::SubtractAverage(MGVariable type) {
 //! \fn void MultigridDriver::SetupMultigrid(Real dt, bool ftrivial)
 //  \brief initialize the source assuming that the source terms are already loaded
 
-void MultigridDriver::SetupMultigrid(Real dt, bool ftrivial) {
+void MultigridDriver::PrepareForAMR() {
   locrootlevel_ = pmy_mesh_->root_level;
-  nrootlevel_ = mgroot_->GetNumberOfLevels();
-  nmblevel_ = mglevels_->GetNumberOfLevels();
-  
+
+  // Detect if mesh has changed (AMR)
+  int new_nbtotal = pmy_mesh_->nmb_total;
+  if (new_nbtotal != nbtotal_) {
+    nbtotal_ = new_nbtotal;
+    delete[] ranklist_;
+    ranklist_ = new int[nbtotal_];
+    int nv = nvar_*2;
+    Kokkos::realloc(rootbuf_, nv, nbtotal_);
+    needinit_ = true;
+  }
+
   // Calculate number of refinement levels present in mesh
+  int old_nreflevel = nreflevel_;
   nreflevel_ = 0;
   if (pmy_mesh_->multilevel) {
     for (int n = 0; n < nbtotal_; ++n) {
       int lev = pmy_mesh_->lloc_eachmb[n].level - locrootlevel_;
       nreflevel_ = std::max(nreflevel_, lev);
     }
-    if (nreflevel_ > 0) {
+    if (nreflevel_ != old_nreflevel) {
       std::cout << "MultigridDriver::SetupMultigrid: Number of refinement levels = "
                 << nreflevel_ << std::endl;
+      needinit_ = true;
     }
   }
-  
-  // Include refinement levels in total (octets are V-cycle participants)
-  ntotallevel_ = nrootlevel_ + nmblevel_ + nreflevel_ - 1;
-  os_ = mgroot_->ngh_;
-  oe_ = os_+1;
-  
+
   if (needinit_) {
+    mglevels_->ReallocateForAMR();
     for (int n = 0; n < nbtotal_; ++n)
-      ranklist_[n] = pmy_mesh_->gids_eachrank[n];
+      ranklist_[n] = pmy_mesh_->rank_eachmb[n];
     for (int n = 0; n < nranks_; ++n) {
       nslist_[n]  = pmy_mesh_->gids_eachrank[n];
       nblist_[n]  = pmy_mesh_->nmb_eachrank[n];
@@ -168,8 +175,22 @@ void MultigridDriver::SetupMultigrid(Real dt, bool ftrivial) {
     if (nreflevel_ > 0) {
       InitializeOctets();
     }
+    root_flat_buf_stale_ = true;
   }
   needinit_ = false;
+}
+
+
+void MultigridDriver::SetupMultigrid(Real dt, bool ftrivial) {
+  locrootlevel_ = pmy_mesh_->root_level;
+  nrootlevel_ = mgroot_->GetNumberOfLevels();
+  nmblevel_ = mglevels_->GetNumberOfLevels();
+
+  // Include refinement levels in total (octets are V-cycle participants)
+  ntotallevel_ = nrootlevel_ + nmblevel_ + nreflevel_ - 1;
+  os_ = mgroot_->ngh_;
+  oe_ = os_+1;
+
   if (fsubtract_average_) {
     pmg = mglevels_;
     SubtractAverage(MGVariable::src);
@@ -596,9 +617,9 @@ void MultigridDriver::SolveIterative(Driver *pdriver) {
     for (int v = 0; v < nvar_; ++v) {
       def += CalculateDefectNorm(MGNormType::l2, v);
     }
-    if (fshowdef_) {
-      std::cout << "  MG iteration " << n << ": defect = " << def << std::endl; 
-    }
+    //if (fshowdef_) {
+    //  std::cout << "  MG iteration " << n << ": defect = " << def << std::endl; 
+    //}
     if (def/olddef > 0.9) {
       if (eps_ == 0.0) break;
       if (fshowdef_) {
@@ -624,10 +645,10 @@ void MultigridDriver::SolveIterativeFixedTimes(Driver *pdriver) {
   }
   for (int n = 0; n < niter_; ++n) {
     SolveVCycle(pdriver, npresmooth_, npostsmooth_);
-    if (fshowdef_) {
-      Real norm = CalculateDefectNorm(MGNormType::l2, 0);
-      std::cout << "MG iteration " << n << ": defect = " << norm << std::endl;
-    }
+    //if (fshowdef_) {
+    //  Real norm = CalculateDefectNorm(MGNormType::l2, 0);
+    //  std::cout << "MG iteration " << n << ": defect = " << norm << std::endl;
+    //}
   }
   Kokkos::fence();
   return;

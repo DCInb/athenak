@@ -182,6 +182,7 @@ class Multigrid {
   // BoundaryQuantity::mg is handled in a case in InitBoundaryData(). Passed directly
   // (not through btype) in MGBoundaryValues() ctor
   MultigridBoundaryValues *pbval = nullptr;
+  void ReallocateForAMR();
   void LoadFinestData(const DvceArray5D<Real> &src, int ns, int ngh);
   void LoadSource(const DvceArray5D<Real> &src, int ns, int ngh, Real fac);
   void LoadCoefficients(const DvceArray5D<Real> &coeff, int ngh);
@@ -352,6 +353,7 @@ class MultigridDriver {
   auto GetRootSource_h() { return mgroot_->GetCurrentSource_h(); }
   // pure virtual function
   virtual void Solve(Driver *pdriver, int step, Real dt = 0.0) = 0;
+  void PrepareForAMR();
   int GetCoffset() const { return coffset_; }
   void MGRootBoundary();
   void TransferFromBlocksToRoot(bool initflag);

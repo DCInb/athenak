@@ -110,6 +110,19 @@ MGGravity::~MGGravity() {
 
 void MGGravityDriver::Solve(Driver *pdriver, int stage, Real dt) {
   RegionIndcs &indcs_ = pmy_pack_->pmesh->mb_indcs;
+
+  // Reallocate MG arrays and phi if AMR has changed the mesh
+  PrepareForAMR();
+  {
+    int nmb = pmy_pack_->nmb_thispack;
+    if (static_cast<int>(pmy_pack_->pgrav->phi.extent_int(0)) != nmb) {
+      int ncells1 = indcs_.nx1 + 2*indcs_.ng;
+      int ncells2 = (indcs_.nx2 > 1) ? (indcs_.nx2 + 2*indcs_.ng) : 1;
+      int ncells3 = (indcs_.nx3 > 1) ? (indcs_.nx3 + 2*indcs_.ng) : 1;
+      Kokkos::realloc(pmy_pack_->pgrav->phi, nmb, 1, ncells3, ncells2, ncells1);
+    }
+  }
+
   // mglevels_ points to the Multigrid object for all MeshBlocks
   // The MG smoother solves -∇²u = src (note the minus sign from the Laplacian
   // convention: Laplacian(u) = 6u - neighbors = -dx²∇²u).  To obtain the

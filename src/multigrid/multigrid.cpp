@@ -182,6 +182,38 @@ Multigrid::~Multigrid() {
 
 
 //----------------------------------------------------------------------------------------
+//! \fn void Multigrid::ReallocateForAMR()
+//! \brief Reallocate MG arrays when the number of MeshBlocks changes (AMR)
+
+void Multigrid::ReallocateForAMR() {
+  if (pmy_pack_ == nullptr) return;
+  int new_nmmb = pmy_pack_->nmb_thispack;
+  if (new_nmmb == nmmb_) return;
+  nmmb_ = new_nmmb;
+
+  Kokkos::realloc(block_rdx_, nmmb_);
+  auto brdx_h = block_rdx_.h_view;
+  auto &mb_size = pmy_pack_->pmb->mb_size;
+  Real rnx1 = static_cast<Real>(indcs_.nx1);
+  for (int m = 0; m < nmmb_; ++m) {
+    brdx_h(m) = (mb_size.h_view(m).x1max - mb_size.h_view(m).x1min) / rnx1;
+  }
+  Kokkos::deep_copy(block_rdx_.d_view, brdx_h);
+
+  for (int l = 0; l < nlevel_; l++) {
+    int ll = nlevel_ - 1 - l;
+    int ncx = (indcs_.nx1 >> ll) + 2 * ngh_;
+    int ncy = (indcs_.nx2 >> ll) + 2 * ngh_;
+    int ncz = (indcs_.nx3 >> ll) + 2 * ngh_;
+    Kokkos::realloc(u_[l],   nmmb_, nvar_, ncz, ncy, ncx);
+    Kokkos::realloc(src_[l], nmmb_, nvar_, ncz, ncy, ncx);
+    Kokkos::realloc(def_[l], nmmb_, nvar_, ncz, ncy, ncx);
+    if (l != nlevel_ - 1)
+      Kokkos::realloc(uold_[l], nmmb_, nvar_, ncz, ncy, ncx);
+  }
+}
+
+
 //! \fn void Multigrid::LoadFinestData(const DvceArray5D<Real> &src, int ns, int ngh)
 //! \brief Fill the inital guess in the active zone of the finest level
 
