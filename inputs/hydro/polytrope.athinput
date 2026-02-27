@@ -1,0 +1,94 @@
+# AthenaK input file for polytropic-star collapse test
+
+<comment>
+problem = polytropic_star
+
+<job>
+basename = PolyStar
+
+<mesh>
+nghost = 4
+nx1 = 32
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2 = 32
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 32
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<mesh_refinement>
+refinement = static
+
+<refined_region1>
+level = 4
+x1min = -0.01
+x1max = 0.01
+x2min = -0.01
+x2max = 0.01
+x3min = -0.01
+x3max = 0.01
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.2
+nlim = -1
+tlim = 1.0
+ndiag = 1
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = llf
+# For polytropic consistency, set gamma = 1 + 1/n.
+# Here n=1.5, so gamma must be 5/3.
+gamma = 1.6666666666667
+
+<gravity>
+four_pi_G = 1.0
+threshold = 0.0
+npresmooth = 1
+npostsmooth = 1
+full_multigrid = true
+fmg_ncycle = 20
+show_defect = true
+subtract_average = true
+
+<hydro_srcterms>
+self_gravity = true
+
+<problem>
+rho_central = 1.0
+star_radius = 0.3
+rho_floor = 1.0e-8
+poly_n = 1.5
+# poly_K is derived numerically from Lane-Emden n, rho_central, star_radius, and four_pi_G.
+amp = 0.0
+x_center = 0.0
+y_center = 0.0
+z_center = 0.0
+njeans = 16.0
+
+<output1>
+file_type = hst
+dt = 0.01
+
+<output2>
+file_type = bin
+variable = hydro_w
+dt = 0.01
