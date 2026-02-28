@@ -148,16 +148,32 @@ void MultigridDriver::PrepareForAMR() {
   // Calculate number of refinement levels present in mesh
   int old_nreflevel = nreflevel_;
   nreflevel_ = 0;
-  if (pmy_mesh_->multilevel) {
-    for (int n = 0; n < nbtotal_; ++n) {
-      int lev = pmy_mesh_->lloc_eachmb[n].level - locrootlevel_;
+  std::uint64_t new_mesh_sig = 1469598103934665603ULL;
+  auto hash_combine = [&new_mesh_sig](std::uint64_t v) {
+    new_mesh_sig ^= v + 0x9e3779b97f4a7c15ULL + (new_mesh_sig << 6) + (new_mesh_sig >> 2);
+  };
+  for (int n = 0; n < nbtotal_; ++n) {
+    const auto &ll = pmy_mesh_->lloc_eachmb[n];
+    hash_combine(static_cast<std::uint64_t>(static_cast<std::uint32_t>(ll.lx1)));
+    hash_combine(static_cast<std::uint64_t>(static_cast<std::uint32_t>(ll.lx2)));
+    hash_combine(static_cast<std::uint64_t>(static_cast<std::uint32_t>(ll.lx3)));
+    hash_combine(static_cast<std::uint64_t>(static_cast<std::uint32_t>(ll.level)));
+    hash_combine(static_cast<std::uint64_t>(static_cast<std::uint32_t>(pmy_mesh_->rank_eachmb[n])));
+    if (pmy_mesh_->multilevel) {
+      int lev = ll.level - locrootlevel_;
       nreflevel_ = std::max(nreflevel_, lev);
     }
-    if (nreflevel_ != old_nreflevel) {
+  }
+  if (nreflevel_ != old_nreflevel) {
+    if (global_variable::my_rank == 0) {
       std::cout << "MultigridDriver::SetupMultigrid: Number of refinement levels = "
                 << nreflevel_ << std::endl;
-      needinit_ = true;
     }
+    needinit_ = true;
+  }
+  if (new_mesh_sig != mesh_sig_) {
+    mesh_sig_ = new_mesh_sig;
+    needinit_ = true;
   }
 
   if (needinit_) {
@@ -278,8 +294,10 @@ void MultigridDriver::InitializeOctets() {
   cbufold_.assign(nv * cbnc * cbnc * cbnc, 0.0);
   ncoarse_.assign(3 * 3 * 3, false);
 
-  for (int l = 0; l < nreflevel_; ++l) {
-    std::cout << "  Octet level " << l << ": " << noctets_[l] << " octets" << std::endl;
+  if (global_variable::my_rank == 0) {
+    for (int l = 0; l < nreflevel_; ++l) {
+      std::cout << "  Octet level " << l << ": " << noctets_[l] << " octets" << std::endl;
+    }
   }
 }
 
@@ -606,7 +624,7 @@ void MultigridDriver::SolveIterative(Driver *pdriver) {
   for (int v = 0; v < nvar_; ++v) {
     def += CalculateDefectNorm(MGNormType::l2, v);
   }
-  if (fshowdef_) {
+  if (fshowdef_ && global_variable::my_rank == 0) {
     std::cout << "MG initial defect = " << def << std::endl;
   }
   int n = 0;
@@ -639,7 +657,7 @@ void MultigridDriver::SolveIterative(Driver *pdriver) {
 //! \brief Solve iteratively niter_ times (fixed count)
 
 void MultigridDriver::SolveIterativeFixedTimes(Driver *pdriver) {
-  if (fshowdef_) {
+  if (fshowdef_ && global_variable::my_rank == 0) {
     Real norm = CalculateDefectNorm(MGNormType::l2, 0);
     std::cout << "MG initial defect = " << norm << std::endl;
   }

@@ -12,6 +12,7 @@
 #include <limits>
 #include <cstdio> // fclose
 #include <string> // string
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -364,12 +365,9 @@ void Mesh::PrintMeshDiagnostics() {
 
   // if more than one physical level: compute/output # of blocks and cost per level
   if ((max_level - root_level) > 1) {
-    int nb_per_plevel[max_level];      // NOLINT(runtime/arrays)
-    float cost_per_plevel[max_level];  // NOLINT(runtime/arrays)
-    for (int i=0; i<max_level; ++i) {
-      nb_per_plevel[i] = 0;
-      cost_per_plevel[i] = 0.0;
-    }
+    int nplevels = max_level - root_level + 1;
+    std::vector<int> nb_per_plevel(nplevels, 0);
+    std::vector<float> cost_per_plevel(nplevels, 0.0);
     for (int i=0; i<nmb_total; i++) {
       nb_per_plevel[(lloc_eachmb[i].level - root_level)]++;
       cost_per_plevel[(lloc_eachmb[i].level - root_level)] += cost_eachmb[i];

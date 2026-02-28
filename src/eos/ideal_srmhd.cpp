@@ -44,7 +44,8 @@ IdealSRMHD::IdealSRMHD(MeshBlockPack *pp, ParameterInput *pin) :
 //!    m^i = \gamma w u^i are components of the momentum in the lab frame.
 //! Note we evolve (E-D). This improves accuracy/stability in high-density regions.
 //!
-//! In SR mhd, the primitive variables are: (\rho, P_gas, u^i).
+//! In SR mhd, the primitive variables are: (\rho, e_int, u^i), with
+//! P_gas = (\Gamma - 1) e_int.
 //! Note components of the 4-velocity (not 3-velocity) are stored in the primitive
 //! variables because tests show it is better to reconstruct the 4-vel.
 //!

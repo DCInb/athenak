@@ -143,7 +143,9 @@ void MGGravityDriver::Solve(Driver *pdriver, int stage, Real dt) {
 
   if (fshowdef_) {
     Real norm = CalculateDefectNorm(MGNormType::l2, 0);
-    std::cout << "MGGravityDriver::Solve: Final defect norm = " << norm << std::endl;
+    if (global_variable::my_rank == 0) {
+      std::cout << "MGGravityDriver::Solve: Final defect norm = " << norm << std::endl;
+    }
   }
 
   mglevels_->RetrieveResult(pmy_pack_->pgrav->phi, 0, indcs_.ng);

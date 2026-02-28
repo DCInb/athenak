@@ -1250,7 +1250,7 @@ void MultigridBoundaryValues::RemapIndicesForMG() {
 //! \fn TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts()
 //! \brief Fill ghost cells at fine-coarse boundaries.
 //! Faces use flux-conserving prolongation/restriction matching Athena++ formulas.
-//! Edges and corners use simple injection/restriction. Same-rank only.
+//! Edges and corners use simple injection/restriction.
 
 TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u) {
   if (pmy_mg == nullptr) return TaskStatus::complete;
@@ -1272,6 +1272,125 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
   auto &lloc = pmy_pack->pmesh->lloc_eachmb;
 
   auto u_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), u);
+  int ni_tot = u_h.extent_int(4);
+  int nj_tot = u_h.extent_int(3);
+  int nk_tot = u_h.extent_int(2);
+
+#if MPI_PARALLEL_ENABLED
+  struct RemoteRecvBlock {
+    int gid;
+    int rank;
+    std::vector<Real> data;
+    MPI_Request req;
+  };
+  struct RemoteSendBlock {
+    int m;
+    int gid;
+    int rank;
+    std::vector<Real> data;
+    MPI_Request req;
+  };
+
+  std::vector<RemoteRecvBlock> recv_blocks;
+  std::vector<RemoteSendBlock> send_blocks;
+
+  auto has_recv = [&recv_blocks](int gid) {
+    for (const auto &rb : recv_blocks) {
+      if (rb.gid == gid) return true;
+    }
+    return false;
+  };
+  auto has_send = [&send_blocks](int m, int rank) {
+    for (const auto &sb : send_blocks) {
+      if (sb.m == m && sb.rank == rank) return true;
+    }
+    return false;
+  };
+
+  // Exchange full block data only for remote fine/coarse neighbors.
+  for (int m = 0; m < nmb; ++m) {
+    int m_lev = mblev.h_view(m);
+    for (int n = 0; n < nnghbr; ++n) {
+      if (nghbr.h_view(m, n).gid < 0) continue;
+      if (nghbr.h_view(m, n).lev == m_lev) continue;
+      int rk = nghbr.h_view(m, n).rank;
+      if (rk == my_rank) continue;
+      int gid = nghbr.h_view(m, n).gid;
+      if (!has_recv(gid)) {
+        recv_blocks.push_back({gid, rk, {}, MPI_REQUEST_NULL});
+      }
+      if (!has_send(m, rk)) {
+        send_blocks.push_back({m, mbgid.h_view(m), rk, {}, MPI_REQUEST_NULL});
+      }
+    }
+  }
+
+  if (!recv_blocks.empty() || !send_blocks.empty()) {
+    constexpr int kCFTagBufId = 56;
+    int block_size = nvar * nk_tot * nj_tot * ni_tot;
+    bool no_errors = true;
+
+    for (auto &rb : recv_blocks) {
+      rb.data.resize(block_size);
+      int lid = rb.gid - pmy_pack->pmesh->gids_eachrank[rb.rank];
+      int tag = CreateBvals_MPI_Tag(lid, kCFTagBufId);
+      int ierr = MPI_Irecv(rb.data.data(), block_size, MPI_ATHENA_REAL, rb.rank, tag,
+                           comm_vars, &(rb.req));
+      if (ierr != MPI_SUCCESS) no_errors = false;
+    }
+
+    for (auto &sb : send_blocks) {
+      sb.data.resize(block_size);
+      int idx = 0;
+      for (int v = 0; v < nvar; ++v) {
+        for (int k = 0; k < nk_tot; ++k) {
+          for (int j = 0; j < nj_tot; ++j) {
+            for (int i = 0; i < ni_tot; ++i) {
+              sb.data[idx++] = u_h(sb.m, v, k, j, i);
+            }
+          }
+        }
+      }
+      int lid = sb.gid - pmy_pack->pmesh->gids_eachrank[my_rank];
+      int tag = CreateBvals_MPI_Tag(lid, kCFTagBufId);
+      int ierr = MPI_Isend(sb.data.data(), block_size, MPI_ATHENA_REAL, sb.rank, tag,
+                           comm_vars, &(sb.req));
+      if (ierr != MPI_SUCCESS) no_errors = false;
+    }
+
+    for (auto &rb : recv_blocks) {
+      if (rb.req != MPI_REQUEST_NULL) {
+        int ierr = MPI_Wait(&(rb.req), MPI_STATUS_IGNORE);
+        if (ierr != MPI_SUCCESS) no_errors = false;
+      }
+    }
+    for (auto &sb : send_blocks) {
+      if (sb.req != MPI_REQUEST_NULL) {
+        int ierr = MPI_Wait(&(sb.req), MPI_STATUS_IGNORE);
+        if (ierr != MPI_SUCCESS) no_errors = false;
+      }
+    }
+
+    if (!no_errors) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "MPI error in remote fine/coarse MG exchange"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+#endif
+
+  auto NeighborValue = [&](int dm, const std::vector<Real> *remote_data, int v,
+                           int k, int j, int i) -> Real {
+#if MPI_PARALLEL_ENABLED
+    if (remote_data != nullptr) {
+      int idx = ((v*nk_tot + k)*nj_tot + j)*ni_tot + i;
+      return (*remote_data)[idx];
+    }
+#endif
+    return u_h(dm, v, k, j, i);
+  };
+
   bool modified = false;
   constexpr Real ot = 1.0/3.0;
 
@@ -1294,10 +1413,28 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
 
               int nlev = nghbr.h_view(m, n).lev;
               if (nlev == m_lev) continue;
-              if (nghbr.h_view(m, n).rank != my_rank) continue;
+              int ngid = nghbr.h_view(m, n).gid;
+              int nrank = nghbr.h_view(m, n).rank;
+              bool remote_neighbor = (nrank != my_rank);
 
-              int dm = nghbr.h_view(m, n).gid - mbgid.h_view(0);
-              if (dm < 0 || dm >= nmb) continue;
+              int dm = -1;
+              const std::vector<Real> *remote_data = nullptr;
+              if (remote_neighbor) {
+#if MPI_PARALLEL_ENABLED
+                for (const auto &rb : recv_blocks) {
+                  if (rb.gid == ngid) {
+                    remote_data = &(rb.data);
+                    break;
+                  }
+                }
+                if (remote_data == nullptr) continue;
+#else
+                continue;
+#endif
+              } else {
+                dm = ngid - mbgid.h_view(0);
+                if (dm < 0 || dm >= nmb) continue;
+              }
 
               int child_x = m_loc.lx1 & 1;
               int child_y = m_loc.lx2 & 1;
@@ -1317,9 +1454,11 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                       for (int sj = sj0; sj < sj0 + half; ++sj) {
                         int fj = ngh + 2*(sj - sj0);
                         int fk = ngh + 2*(sk - sk0);
-                        Real cc = u_h(dm,v,sk,sj,si);
-                        Real gy = 0.125*(u_h(dm,v,sk,sj+1,si)-u_h(dm,v,sk,sj-1,si));
-                        Real gz = 0.125*(u_h(dm,v,sk+1,sj,si)-u_h(dm,v,sk-1,sj,si));
+                        Real cc = NeighborValue(dm, remote_data, v, sk, sj, si);
+                        Real gy = 0.125*(NeighborValue(dm, remote_data, v, sk, sj+1, si)
+                                       - NeighborValue(dm, remote_data, v, sk, sj-1, si));
+                        Real gz = 0.125*(NeighborValue(dm, remote_data, v, sk+1, sj, si)
+                                       - NeighborValue(dm, remote_data, v, sk-1, sj, si));
                         u_h(m,v,fk  ,fj  ,fig)=ot*(2.0*(cc-gy-gz)+u_h(m,v,fk  ,fj  ,fi));
                         u_h(m,v,fk  ,fj+1,fig)=ot*(2.0*(cc+gy-gz)+u_h(m,v,fk  ,fj+1,fi));
                         u_h(m,v,fk+1,fj  ,fig)=ot*(2.0*(cc-gy+gz)+u_h(m,v,fk+1,fj  ,fi));
@@ -1338,9 +1477,11 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                       for (int si = si0; si < si0 + half; ++si) {
                         int fi = ngh + 2*(si - si0);
                         int fk = ngh + 2*(sk - sk0);
-                        Real cc = u_h(dm,v,sk,sj,si);
-                        Real gx = 0.125*(u_h(dm,v,sk,sj,si+1)-u_h(dm,v,sk,sj,si-1));
-                        Real gz = 0.125*(u_h(dm,v,sk+1,sj,si)-u_h(dm,v,sk-1,sj,si));
+                        Real cc = NeighborValue(dm, remote_data, v, sk, sj, si);
+                        Real gx = 0.125*(NeighborValue(dm, remote_data, v, sk, sj, si+1)
+                                       - NeighborValue(dm, remote_data, v, sk, sj, si-1));
+                        Real gz = 0.125*(NeighborValue(dm, remote_data, v, sk+1, sj, si)
+                                       - NeighborValue(dm, remote_data, v, sk-1, sj, si));
                         u_h(m,v,fk  ,fjg,fi  )=ot*(2.0*(cc-gx-gz)+u_h(m,v,fk  ,fj,fi  ));
                         u_h(m,v,fk  ,fjg,fi+1)=ot*(2.0*(cc+gx-gz)+u_h(m,v,fk  ,fj,fi+1));
                         u_h(m,v,fk+1,fjg,fi  )=ot*(2.0*(cc-gx+gz)+u_h(m,v,fk+1,fj,fi  ));
@@ -1359,9 +1500,11 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                       for (int si = si0; si < si0 + half; ++si) {
                         int fi = ngh + 2*(si - si0);
                         int fj = ngh + 2*(sj - sj0);
-                        Real cc = u_h(dm,v,sk,sj,si);
-                        Real gx = 0.125*(u_h(dm,v,sk,sj,si+1)-u_h(dm,v,sk,sj,si-1));
-                        Real gy = 0.125*(u_h(dm,v,sk,sj+1,si)-u_h(dm,v,sk,sj-1,si));
+                        Real cc = NeighborValue(dm, remote_data, v, sk, sj, si);
+                        Real gx = 0.125*(NeighborValue(dm, remote_data, v, sk, sj, si+1)
+                                       - NeighborValue(dm, remote_data, v, sk, sj, si-1));
+                        Real gy = 0.125*(NeighborValue(dm, remote_data, v, sk, sj+1, si)
+                                       - NeighborValue(dm, remote_data, v, sk, sj-1, si));
                         u_h(m,v,fkg,fj  ,fi  )=ot*(2.0*(cc-gx-gy)+u_h(m,v,fk,fj  ,fi  ));
                         u_h(m,v,fkg,fj  ,fi+1)=ot*(2.0*(cc+gx-gy)+u_h(m,v,fk,fj  ,fi+1));
                         u_h(m,v,fkg,fj+1,fi  )=ot*(2.0*(cc-gx+gy)+u_h(m,v,fk,fj+1,fi  ));
@@ -1403,8 +1546,10 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                       for (int gj = gjs; gj <= gje; ++gj) {
                         int fj0 = ngh + 2*(gj - (ngh + sub_y*half));
                         int fk0 = ngh + 2*(gk - (ngh + sub_z*half));
-                        Real favg = 0.25*(u_h(dm,v,fk0,fj0,fi)+u_h(dm,v,fk0,fj0+1,fi)
-                                         +u_h(dm,v,fk0+1,fj0,fi)+u_h(dm,v,fk0+1,fj0+1,fi));
+                        Real favg = 0.25*(NeighborValue(dm, remote_data, v, fk0, fj0, fi)
+                                         +NeighborValue(dm, remote_data, v, fk0, fj0+1, fi)
+                                         +NeighborValue(dm, remote_data, v, fk0+1, fj0, fi)
+                                         +NeighborValue(dm, remote_data, v, fk0+1, fj0+1, fi));
                         u_h(m,v,gk,gj,gis) = ot*(4.0*favg - u_h(m,v,gk+ok,gj+oj,gis+oi));
                       }
                     }
@@ -1416,8 +1561,10 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                       for (int gi = gis; gi <= gie; ++gi) {
                         int fi0 = ngh + 2*(gi - (ngh + sub_x*half));
                         int fk0 = ngh + 2*(gk - (ngh + sub_z*half));
-                        Real favg = 0.25*(u_h(dm,v,fk0,fj,fi0)+u_h(dm,v,fk0,fj,fi0+1)
-                                         +u_h(dm,v,fk0+1,fj,fi0)+u_h(dm,v,fk0+1,fj,fi0+1));
+                        Real favg = 0.25*(NeighborValue(dm, remote_data, v, fk0, fj, fi0)
+                                         +NeighborValue(dm, remote_data, v, fk0, fj, fi0+1)
+                                         +NeighborValue(dm, remote_data, v, fk0+1, fj, fi0)
+                                         +NeighborValue(dm, remote_data, v, fk0+1, fj, fi0+1));
                         u_h(m,v,gk,gjs,gi) = ot*(4.0*favg - u_h(m,v,gk+ok,gjs+oj,gi+oi));
                       }
                     }
@@ -1429,8 +1576,10 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                       for (int gi = gis; gi <= gie; ++gi) {
                         int fi0 = ngh + 2*(gi - (ngh + sub_x*half));
                         int fj0 = ngh + 2*(gj - (ngh + sub_y*half));
-                        Real favg = 0.25*(u_h(dm,v,fk,fj0,fi0)+u_h(dm,v,fk,fj0,fi0+1)
-                                         +u_h(dm,v,fk,fj0+1,fi0)+u_h(dm,v,fk,fj0+1,fi0+1));
+                        Real favg = 0.25*(NeighborValue(dm, remote_data, v, fk, fj0, fi0)
+                                         +NeighborValue(dm, remote_data, v, fk, fj0, fi0+1)
+                                         +NeighborValue(dm, remote_data, v, fk, fj0+1, fi0)
+                                         +NeighborValue(dm, remote_data, v, fk, fj0+1, fi0+1));
                         u_h(m,v,gks,gj,gi) = ot*(4.0*favg - u_h(m,v,gks+ok,gj+oj,gi+oi));
                       }
                     }
@@ -1466,7 +1615,7 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                         else if (ox3 > 0) sk = ngh;
                         else sk = ngh + child_z*(half) + (gk - ngh)/2;
 
-                        u_h(m, v, gk, gj, gi) = u_h(dm, v, sk, sj, si);
+                        u_h(m, v, gk, gj, gi) = NeighborValue(dm, remote_data, v, sk, sj, si);
                       }
                     }
                   }
@@ -1519,10 +1668,14 @@ TaskStatus MultigridBoundaryValues::FillFineCoarseMGGhosts(DvceArray5D<Real> &u)
                           fk0 = ngh + 2*(gk - (ngh + sub_z*half)); fk1 = fk0 + 1;
                         }
                         u_h(m, v, gk, gj, gi) = 0.125 * (
-                          u_h(dm,v,fk0,fj0,fi0) + u_h(dm,v,fk0,fj0,fi1) +
-                          u_h(dm,v,fk0,fj1,fi0) + u_h(dm,v,fk0,fj1,fi1) +
-                          u_h(dm,v,fk1,fj0,fi0) + u_h(dm,v,fk1,fj0,fi1) +
-                          u_h(dm,v,fk1,fj1,fi0) + u_h(dm,v,fk1,fj1,fi1));
+                          NeighborValue(dm, remote_data, v, fk0, fj0, fi0) +
+                          NeighborValue(dm, remote_data, v, fk0, fj0, fi1) +
+                          NeighborValue(dm, remote_data, v, fk0, fj1, fi0) +
+                          NeighborValue(dm, remote_data, v, fk0, fj1, fi1) +
+                          NeighborValue(dm, remote_data, v, fk1, fj0, fi0) +
+                          NeighborValue(dm, remote_data, v, fk1, fj0, fi1) +
+                          NeighborValue(dm, remote_data, v, fk1, fj1, fi0) +
+                          NeighborValue(dm, remote_data, v, fk1, fj1, fi1));
                       }
                     }
                   }
@@ -1665,6 +1818,13 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
             data_size >>= shift_;
 
           auto send_ptr = Kokkos::subview(sendbuf[n].vars, m, Kokkos::ALL);
+
+          // MG tasklists can post multiple sends in one cycle; ensure request slot is reusable.
+          if (sendbuf[n].vars_req[m] != MPI_REQUEST_NULL) {
+            int ierr_wait = MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
+            if (ierr_wait != MPI_SUCCESS) {no_errors=false;}
+          }
+
           int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,
                                comm_vars, &(sendbuf[n].vars_req[m]));
           if (ierr != MPI_SUCCESS) {no_errors=false;}
@@ -1724,7 +1884,6 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
   }
   // exit if recv boundary buffer communications have not completed
   if (bflag) {return TaskStatus::incomplete;}
-  MPI_Barrier(comm_vars);
 #endif
 
   //----- STEP 2: buffers have all completed, so unpack
@@ -1831,6 +1990,12 @@ TaskStatus MultigridBoundaryValues::InitRecvMG(const int nvars) {
             data_size >>= shift_;
 
           auto recv_ptr = Kokkos::subview(recvbuf[n].vars, m, Kokkos::ALL);
+
+          // MG tasklists can post multiple receives in one cycle; ensure request slot is reusable.
+          if (recvbuf[n].vars_req[m] != MPI_REQUEST_NULL) {
+            int ierr_wait = MPI_Wait(&(recvbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
+            if (ierr_wait != MPI_SUCCESS) {no_errors=false;}
+          }
 
           // Post non-blocking receive for this buffer on this MeshBlock
           int ierr = MPI_Irecv(recv_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,

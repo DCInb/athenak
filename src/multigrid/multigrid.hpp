@@ -460,6 +460,7 @@ class MultigridDriver {
   Multigrid *mglevels_;
   Multigrid *pmg;
   bool fsubtract_average_, needinit_;
+  std::uint64_t mesh_sig_;
   Real last_ave_;
   Real eps_;
   int niter_, npresmooth_, npostsmooth_;

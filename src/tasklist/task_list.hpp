@@ -163,7 +163,7 @@ class TaskList {
   // arguments (Driver*, int). Usage:
   //     taskid = tl.AddTask(DoSomething, dependency, name);
   template <class F>
-  TaskID AddTask(F func, TaskID &dep) {
+  TaskID AddTask(F func, const TaskID &dep) {
     auto size = task_list_.size();
     TaskID id(size+1);
     task_list_.push_back(
@@ -176,7 +176,7 @@ class TaskList {
   // arguments (Driver*, int).  Usage:
   //     taskid = tl.AddTask(&T::DoSomething, T, dependency);
   template <class F, class T>
-  TaskID AddTask(F func, T *obj, TaskID &dep) {
+  TaskID AddTask(F func, T *obj, const TaskID &dep) {
     auto size = task_list_.size();
     TaskID id(size+1);
     task_list_.push_back( Task(id, dep,
@@ -188,7 +188,7 @@ class TaskList {
   // list. Returns ID of new task. Task function must have arguments (Driver*, int).
   // Usage:
   //      taskid = tl.AddTask(DoSomething, dependency);
-  TaskID AddTask(std::function<TaskStatus(Driver*, int)> func, TaskID &dep) {
+  TaskID AddTask(std::function<TaskStatus(Driver*, int)> func, const TaskID &dep) {
     auto size = task_list_.size();
     TaskID id(size+1);
     task_list_.push_back(Task(id, dep, func));
@@ -196,7 +196,7 @@ class TaskList {
   }
 
   template <class F, class T1>
-  TaskID AddTask(F func, T1 *obj, TaskID &dep, int mg) {
+  TaskID AddTask(F func, T1 *obj, const TaskID &dep, int mg) {
     auto size = task_list_.size();
     TaskID id(size+1);
     task_list_.push_back( Task(id, dep,
@@ -209,7 +209,7 @@ class TaskList {
   // or taskID(0) if location not found. Usage:
   //     taskid = tl.InsertTask(&T::DoSomething, T, dependency, location);
   template <class F, class T>
-  TaskID InsertTask(F func, T *obj, TaskID &dep, TaskID &loc) {
+  TaskID InsertTask(F func, T *obj, const TaskID &dep, TaskID &loc) {
     std::list<Task>::iterator it;
     for (it=task_list_.begin(); it!=task_list_.end(); ++it) {
       if (it->GetID() == loc) {

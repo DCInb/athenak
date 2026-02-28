@@ -73,6 +73,7 @@ subtract_average = true
 self_gravity = true
 
 <problem>
+pgen_name = polytropic_star
 rho_central = 1.0
 star_radius = 0.3
 rho_floor = 1.0e-8
