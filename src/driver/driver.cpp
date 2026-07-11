@@ -310,6 +310,17 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 //  outputting ICs, and computing initial time step
 
 void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool res_flag) {
+  // Problem generators know only about the total ideal-gas state.  On a new run,
+  // initialize the redundant ion/electron energies before boundary communication.
+  if (!res_flag) {
+    if (pmesh->pmb_pack->phydro != nullptr) {
+      pmesh->pmb_pack->phydro->InitializeTwoTemperature();
+    }
+    if (pmesh->pmb_pack->pmhd != nullptr) {
+      pmesh->pmb_pack->pmhd->InitializeTwoTemperature();
+    }
+  }
+
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 

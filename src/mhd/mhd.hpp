@@ -29,6 +29,7 @@ class OrbitalAdvectionFC;
 class ShearingBoxCC;
 class ShearingBoxFC;
 class Driver;
+namespace two_temperature {class TwoTemperature;}
 
 // function ptr for user-defined MHD boundary functions enrolled in problem generator
 namespace mhd {
@@ -75,6 +76,7 @@ struct MHDTaskIDs {
   TaskID prol;
   TaskID c2p;
   TaskID newdt;
+  TaskID t2exch;
   TaskID csend;
   TaskID crecv;
 };
@@ -95,7 +97,8 @@ class MHD {
   EquationOfState *peos;   // chosen EOS
 
   int nmhd;                // number of mhd variables (5/4 for ideal/isothermal EOS)
-  int nscalars;            // number of passive scalars
+  int nscalars;            // total number of advected scalars, including 2T energies
+  int nuser_scalars;       // number of user-requested passive scalars
   DvceArray5D<Real> u0;    // conserved variables
   DvceArray5D<Real> w0;    // primitive variables
   DvceFaceFld4D<Real> b0;  // face-centered magnetic fields
@@ -121,6 +124,7 @@ class MHD {
   Resistivity *presist = nullptr;
   Conduction *pcond = nullptr;
   SourceTerms *psrc = nullptr;
+  two_temperature::TwoTemperature *ptwo_temp = nullptr;
 
   // following only used for time-evolving flow
   DvceArray5D<Real> u1;       // conserved variables, second register
@@ -183,6 +187,7 @@ class MHD {
   TaskStatus Prolongate(Driver* pdrive, int stage);
   TaskStatus ConToPrim(Driver *d, int stage);
   TaskStatus NewTimeStep(Driver *d, int stage);
+  TaskStatus TwoTempExchange(Driver *d, int stage);
   // ...in "after_stagen_tl" task list
   TaskStatus ClearSend(Driver *d, int stage);
   TaskStatus ClearRecv(Driver *d, int stage);  // also in Driver::Initialize
@@ -193,6 +198,9 @@ class MHD {
 
   // first-order flux correction
   void FOFC(Driver *d, int stage);
+
+  // Called once after a new problem generator has initialized the total fluid state.
+  void InitializeTwoTemperature();
 
   DvceArray5D<Real> utest, bcctest;  // scratch arrays for FOFC
 

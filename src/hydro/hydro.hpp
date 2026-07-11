@@ -26,6 +26,7 @@ class SourceTerms;
 class OrbitalAdvectionCC;
 class ShearingBoxCC;
 class Driver;
+namespace two_temperature {class TwoTemperature;}
 
 // constants that enumerate Hydro Riemann Solver options
 enum class Hydro_RSolver {advect, llf, hlle, hllc, roe,    // non-relativistic
@@ -55,6 +56,7 @@ struct HydroTaskIDs {
   TaskID prol;
   TaskID c2p;
   TaskID newdt;
+  TaskID t2exch;
   TaskID csend;
   TaskID crecv;
 };
@@ -75,7 +77,8 @@ class Hydro {
   EquationOfState *peos;  // chosen EOS
 
   int nhydro;             // number of hydro variables (5/4 for ideal/isothermal EOS)
-  int nscalars;           // number of passive scalars
+  int nscalars;           // total number of advected scalars, including 2T energies
+  int nuser_scalars;      // number of user-requested passive scalars
   DvceArray5D<Real> u0;   // conserved variables
   DvceArray5D<Real> w0;   // primitive variables
 
@@ -93,6 +96,7 @@ class Hydro {
   Viscosity *pvisc = nullptr;
   Conduction *pcond = nullptr;
   SourceTerms *psrc = nullptr;
+  two_temperature::TwoTemperature *ptwo_temp = nullptr;
 
   // following only used for time-evolving flow
   DvceArray5D<Real> u1;       // conserved variables at intermediate step
@@ -129,6 +133,7 @@ class Hydro {
   TaskStatus Prolongate(Driver* pdrive, int stage);
   TaskStatus ConToPrim(Driver *d, int stage);
   TaskStatus NewTimeStep(Driver *d, int stage);
+  TaskStatus TwoTempExchange(Driver *d, int stage);
   // ...in "after_stagen_tl" list
   TaskStatus ClearSend(Driver *d, int stage);
   TaskStatus ClearRecv(Driver *d, int stage);  // also in Driver::Initialize
@@ -139,6 +144,9 @@ class Hydro {
 
   // first-order flux correction
   void FOFC(Driver *d, int stage);
+
+  // Called once after a new problem generator has initialized the total fluid state.
+  void InitializeTwoTemperature();
 
  private:
   MeshBlockPack* pmy_pack;  // ptr to MeshBlockPack containing this Hydro

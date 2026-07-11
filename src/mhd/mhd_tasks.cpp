@@ -27,6 +27,7 @@
 #include "shearing_box/orbital_advection.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 namespace mhd {
 //----------------------------------------------------------------------------------------
@@ -37,6 +38,12 @@ namespace mhd {
 
 void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) {
   TaskID none(0);
+
+  // FLASH-style ion/electron exchange is operator split from MHD.
+  if (ptwo_temp != nullptr) {
+    id.t2exch = tl["after_timeintegrator"]->AddTask(
+        &MHD::TwoTempExchange, this, none);
+  }
 
   // assemble "before_timeintegrator" task list
   id.savest = tl["before_timeintegrator"]->AddTask(&MHD::SaveMHDState, this, none);
@@ -550,6 +557,34 @@ TaskStatus MHD::ConToPrim(Driver *pdrive, int stage) {
   int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
   int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
   peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
+  if (ptwo_temp != nullptr) {
+    ptwo_temp->Sync(u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);
+  }
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MHD::InitializeTwoTemperature()
+//! \brief Initialize component energies after the problem generator has set total energy.
+
+void MHD::InitializeTwoTemperature() {
+  if (ptwo_temp == nullptr) return;
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  ptwo_temp->Initialize(u0, w0, indcs.is, indcs.ie, indcs.js, indcs.je,
+                        indcs.ks, indcs.ke);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MHD::TwoTempExchange()
+//! \brief Apply the operator-split, exactly integrated ion/electron heat exchange.
+
+TaskStatus MHD::TwoTempExchange(Driver *pdrive, int stage) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int n1m1 = indcs.nx1 + 2*indcs.ng - 1;
+  int n2m1 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng - 1 : 0;
+  int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
+  ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
+                      0, n1m1, 0, n2m1, 0, n3m1);
   return TaskStatus::complete;
 }
 

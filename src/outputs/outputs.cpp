@@ -193,7 +193,9 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         if (opar.variable.compare("mhd_w") == 0 ||
             opar.variable.compare("mhd_u") == 0 ||
             opar.variable.compare("hydro_w") == 0 ||
-            opar.variable.compare("hydro_u") == 0) {
+            opar.variable.compare("hydro_u") == 0 ||
+            opar.variable.compare("hydro_2t") == 0 ||
+            opar.variable.compare("mhd_2t") == 0) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "PDF output block '" << opar.block_name
               << "' cannot output variable '" << opar.variable << "'."

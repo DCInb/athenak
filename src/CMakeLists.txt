@@ -155,6 +155,8 @@ add_executable(
 
         tasklist/numerical_relativity.cpp
 
+        two_temperature/two_temperature.cpp
+
         units/units.cpp
         utils/change_rundir.cpp
         utils/derived_vars.cpp

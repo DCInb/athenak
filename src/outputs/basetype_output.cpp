@@ -28,6 +28,7 @@
 #include "z4c/z4c.hpp"
 #include "srcterms/srcterms.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "two_temperature/two_temperature.hpp"
 #include "outputs.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -168,6 +169,23 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing corresponding block" << std::endl;
     exit(EXIT_FAILURE);
   }
+  if ((ivar>=153) && (ivar<158) &&
+      (pm->pmb_pack->phydro == nullptr ||
+       pm->pmb_pack->phydro->ptwo_temp == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Two-temperature Hydro output requested in <output> block '"
+       << out_params.block_name << "' but <hydro>/two_temperature is not enabled."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if ((ivar>=158) && (ivar<163) &&
+      (pm->pmb_pack->pmhd == nullptr || pm->pmb_pack->pmhd->ptwo_temp == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Two-temperature MHD output requested in <output> block '"
+       << out_params.block_name << "' but <mhd>/two_temperature is not enabled."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
 
   // Now load STL vector of output variables
   outvars.clear();
@@ -272,11 +290,18 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       int nhyd = pm->pmb_pack->phydro->nhydro;
       int nvars = nhyd + pm->pmb_pack->phydro->nscalars;
       for (int n=nhyd; n<nvars; ++n) {
-        char number[3];
-        std::snprintf(number,sizeof(number),"%02d",(n - nhyd)%100);
         std::string vname;
-        vname.assign("r_");
-        vname.append(number);
+        auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
+        if (ptwo != nullptr && n == ptwo->iion) {
+          vname.assign("eion_d");
+        } else if (ptwo != nullptr && n == ptwo->iele) {
+          vname.assign("eele_d");
+        } else {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d", (n - nhyd)%100);
+          vname.assign("r_");
+          vname.append(number);
+        }
         outvars.emplace_back(vname,n,&(pm->pmb_pack->phydro->u0));
       }
     }
@@ -289,11 +314,18 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       int nhyd = pm->pmb_pack->phydro->nhydro;
       int nvars = nhyd + pm->pmb_pack->phydro->nscalars;
       for (int n=nhyd; n<nvars; ++n) {
-        char number[3];
-        std::snprintf(number,sizeof(number),"%02d",(n - nhyd)%100);
         std::string vname;
-        vname.assign("s_");
-        vname.append(number);
+        auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
+        if (ptwo != nullptr && n == ptwo->iion) {
+          vname.assign("eion");
+        } else if (ptwo != nullptr && n == ptwo->iele) {
+          vname.assign("eele");
+        } else {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d", (n - nhyd)%100);
+          vname.assign("s_");
+          vname.append(number);
+        }
         outvars.emplace_back(vname,n,&(pm->pmb_pack->phydro->w0));
       }
     }
@@ -408,11 +440,18 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       int nmhd = pm->pmb_pack->pmhd->nmhd;
       int nvars = nmhd + pm->pmb_pack->pmhd->nscalars;
       for (int n=nmhd; n<nvars; ++n) {
-        char number[3];
-        std::snprintf(number,sizeof(number),"%02d",(n - nmhd)%100);
         std::string vname;
-        vname.assign("r_");
-        vname.append(number);
+        auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
+        if (ptwo != nullptr && n == ptwo->iion) {
+          vname.assign("eion_d");
+        } else if (ptwo != nullptr && n == ptwo->iele) {
+          vname.assign("eele_d");
+        } else {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d", (n - nmhd)%100);
+          vname.assign("r_");
+          vname.append(number);
+        }
         outvars.emplace_back(vname,n,&(pm->pmb_pack->pmhd->u0));
       }
     }
@@ -427,13 +466,52 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       int nmhd = pm->pmb_pack->pmhd->nmhd;
       int nvars = nmhd + pm->pmb_pack->pmhd->nscalars;
       for (int n=nmhd; n<nvars; ++n) {
-        char number[3];
-        std::snprintf(number,sizeof(number),"%02d",(n - nmhd)%100);
         std::string vname;
-        vname.assign("s_");
-        vname.append(number);
+        auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
+        if (ptwo != nullptr && n == ptwo->iion) {
+          vname.assign("eion");
+        } else if (ptwo != nullptr && n == ptwo->iele) {
+          vname.assign("eele");
+        } else {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d", (n - nmhd)%100);
+          vname.assign("s_");
+          vname.append(number);
+        }
         outvars.emplace_back(vname,n,&(pm->pmb_pack->pmhd->w0));
       }
+    }
+
+    // Newtonian two-temperature component energies and temperatures
+    if (variable.compare("hydro_eion") == 0 || variable.compare("hydro_2t") == 0) {
+      auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
+      outvars.emplace_back("eion", ptwo->iion, &(pm->pmb_pack->phydro->w0));
+    }
+    if (variable.compare("hydro_eele") == 0 || variable.compare("hydro_2t") == 0) {
+      auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
+      outvars.emplace_back("eele", ptwo->iele, &(pm->pmb_pack->phydro->w0));
+    }
+    if (variable.compare("hydro_tion") == 0 || variable.compare("hydro_2t") == 0) {
+      outvars.emplace_back("tion", 0,
+          &(pm->pmb_pack->phydro->ptwo_temp->temperature));
+    }
+    if (variable.compare("hydro_tele") == 0 || variable.compare("hydro_2t") == 0) {
+      outvars.emplace_back("tele", 1,
+          &(pm->pmb_pack->phydro->ptwo_temp->temperature));
+    }
+    if (variable.compare("mhd_eion") == 0 || variable.compare("mhd_2t") == 0) {
+      auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
+      outvars.emplace_back("eion", ptwo->iion, &(pm->pmb_pack->pmhd->w0));
+    }
+    if (variable.compare("mhd_eele") == 0 || variable.compare("mhd_2t") == 0) {
+      auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
+      outvars.emplace_back("eele", ptwo->iele, &(pm->pmb_pack->pmhd->w0));
+    }
+    if (variable.compare("mhd_tion") == 0 || variable.compare("mhd_2t") == 0) {
+      outvars.emplace_back("tion", 0, &(pm->pmb_pack->pmhd->ptwo_temp->temperature));
+    }
+    if (variable.compare("mhd_tele") == 0 || variable.compare("mhd_2t") == 0) {
+      outvars.emplace_back("tele", 1, &(pm->pmb_pack->pmhd->ptwo_temp->temperature));
     }
 
     // mhd cell-centered magnetic fields

@@ -22,6 +22,7 @@
 #include "shearing_box/orbital_advection.hpp"
 #include "bvals/bvals.hpp"
 #include "mhd/mhd.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 namespace mhd {
 //----------------------------------------------------------------------------------------
@@ -93,8 +94,23 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
 
-  // (2) Initialize scalars, diffusion, source terms
-  nscalars = pin->GetOrAddInteger("mhd","nscalars",0);
+  // (2) Initialize scalars, two-temperature model, diffusion, and source terms
+  nuser_scalars = pin->GetOrAddInteger("mhd", "nscalars", 0);
+  nscalars = nuser_scalars;
+  bool use_two_temperature = pin->GetOrAddBoolean("mhd", "two_temperature", false);
+  if (use_two_temperature) {
+    if (!peos->eos_data.is_ideal || pmy_pack->pcoord->is_special_relativistic ||
+        pmy_pack->pcoord->is_general_relativistic ||
+        pin->DoesBlockExist("ion-neutral") || pin->DoesBlockExist("radiation")) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/two_temperature currently requires standalone "
+                << "Newtonian ideal-gas MHD" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    nscalars += 2;
+    ptwo_temp = new two_temperature::TwoTemperature(
+        "mhd", ppack, pin, nmhd + nuser_scalars);
+  }
 
   // Viscosity (only constructed if needed)
   if (pin->DoesParameterExist("mhd","nu_iso") ||
@@ -376,6 +392,7 @@ MHD::~MHD() {
   if (pcond != nullptr) {delete pcond;}
   if (presist!= nullptr) {delete presist;}
   if (pvisc != nullptr) {delete pvisc;}
+  if (ptwo_temp != nullptr) {delete ptwo_temp;}
   delete peos;
 }
 
