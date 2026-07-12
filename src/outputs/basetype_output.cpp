@@ -28,6 +28,7 @@
 #include "z4c/z4c.hpp"
 #include "srcterms/srcterms.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "two_temperature/thermal_radiation.hpp"
 #include "two_temperature/two_temperature.hpp"
 #include "outputs.hpp"
 
@@ -186,6 +187,26 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl;
     exit(EXIT_FAILURE);
   }
+  if (ivar == 163 &&
+      (pm->pmb_pack->phydro == nullptr ||
+       pm->pmb_pack->phydro->ptwo_temp == nullptr ||
+       pm->pmb_pack->phydro->ptwo_temp->pradiation == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Three-temperature Hydro output requested in <output> block '"
+       << out_params.block_name << "' but <thermal_radiation> is not enabled."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if (ivar == 164 &&
+      (pm->pmb_pack->pmhd == nullptr ||
+       pm->pmb_pack->pmhd->ptwo_temp == nullptr ||
+       pm->pmb_pack->pmhd->ptwo_temp->pradiation == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Three-temperature MHD output requested in <output> block '"
+       << out_params.block_name << "' but <thermal_radiation> is not enabled."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
 
   // Now load STL vector of output variables
   outvars.clear();
@@ -296,6 +317,15 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
           vname.assign("eion_d");
         } else if (ptwo != nullptr && n == ptwo->iele) {
           vname.assign("eele_d");
+        } else if (ptwo != nullptr && ptwo->pradiation != nullptr &&
+                   n >= ptwo->pradiation->ifirst &&
+                   n < ptwo->pradiation->ifirst+ptwo->pradiation->ngroups) {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d",
+                        n-ptwo->pradiation->ifirst);
+          vname.assign("erad");
+          vname.append(number);
+          vname.append("_d");
         } else {
           char number[4];
           std::snprintf(number, sizeof(number), "%02d", (n - nhyd)%100);
@@ -320,6 +350,14 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
           vname.assign("eion");
         } else if (ptwo != nullptr && n == ptwo->iele) {
           vname.assign("eele");
+        } else if (ptwo != nullptr && ptwo->pradiation != nullptr &&
+                   n >= ptwo->pradiation->ifirst &&
+                   n < ptwo->pradiation->ifirst+ptwo->pradiation->ngroups) {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d",
+                        n-ptwo->pradiation->ifirst);
+          vname.assign("erad");
+          vname.append(number);
         } else {
           char number[4];
           std::snprintf(number, sizeof(number), "%02d", (n - nhyd)%100);
@@ -446,6 +484,15 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
           vname.assign("eion_d");
         } else if (ptwo != nullptr && n == ptwo->iele) {
           vname.assign("eele_d");
+        } else if (ptwo != nullptr && ptwo->pradiation != nullptr &&
+                   n >= ptwo->pradiation->ifirst &&
+                   n < ptwo->pradiation->ifirst+ptwo->pradiation->ngroups) {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d",
+                        n-ptwo->pradiation->ifirst);
+          vname.assign("erad");
+          vname.append(number);
+          vname.append("_d");
         } else {
           char number[4];
           std::snprintf(number, sizeof(number), "%02d", (n - nmhd)%100);
@@ -472,6 +519,14 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
           vname.assign("eion");
         } else if (ptwo != nullptr && n == ptwo->iele) {
           vname.assign("eele");
+        } else if (ptwo != nullptr && ptwo->pradiation != nullptr &&
+                   n >= ptwo->pradiation->ifirst &&
+                   n < ptwo->pradiation->ifirst+ptwo->pradiation->ngroups) {
+          char number[4];
+          std::snprintf(number, sizeof(number), "%02d",
+                        n-ptwo->pradiation->ifirst);
+          vname.assign("erad");
+          vname.append(number);
         } else {
           char number[4];
           std::snprintf(number, sizeof(number), "%02d", (n - nmhd)%100);
@@ -483,35 +538,70 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     }
 
     // Newtonian two-temperature component energies and temperatures
-    if (variable.compare("hydro_eion") == 0 || variable.compare("hydro_2t") == 0) {
+    if (variable.compare("hydro_eion") == 0 || variable.compare("hydro_2t") == 0 ||
+        variable.compare("hydro_3t") == 0) {
       auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
       outvars.emplace_back("eion", ptwo->iion, &(pm->pmb_pack->phydro->w0));
     }
-    if (variable.compare("hydro_eele") == 0 || variable.compare("hydro_2t") == 0) {
+    if (variable.compare("hydro_eele") == 0 || variable.compare("hydro_2t") == 0 ||
+        variable.compare("hydro_3t") == 0) {
       auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
       outvars.emplace_back("eele", ptwo->iele, &(pm->pmb_pack->phydro->w0));
     }
-    if (variable.compare("hydro_tion") == 0 || variable.compare("hydro_2t") == 0) {
+    if (variable.compare("hydro_tion") == 0 || variable.compare("hydro_2t") == 0 ||
+        variable.compare("hydro_3t") == 0) {
       outvars.emplace_back("tion", 0,
           &(pm->pmb_pack->phydro->ptwo_temp->temperature));
     }
-    if (variable.compare("hydro_tele") == 0 || variable.compare("hydro_2t") == 0) {
+    if (variable.compare("hydro_tele") == 0 || variable.compare("hydro_2t") == 0 ||
+        variable.compare("hydro_3t") == 0) {
       outvars.emplace_back("tele", 1,
           &(pm->pmb_pack->phydro->ptwo_temp->temperature));
     }
-    if (variable.compare("mhd_eion") == 0 || variable.compare("mhd_2t") == 0) {
+    if (variable.compare("mhd_eion") == 0 || variable.compare("mhd_2t") == 0 ||
+        variable.compare("mhd_3t") == 0) {
       auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
       outvars.emplace_back("eion", ptwo->iion, &(pm->pmb_pack->pmhd->w0));
     }
-    if (variable.compare("mhd_eele") == 0 || variable.compare("mhd_2t") == 0) {
+    if (variable.compare("mhd_eele") == 0 || variable.compare("mhd_2t") == 0 ||
+        variable.compare("mhd_3t") == 0) {
       auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
       outvars.emplace_back("eele", ptwo->iele, &(pm->pmb_pack->pmhd->w0));
     }
-    if (variable.compare("mhd_tion") == 0 || variable.compare("mhd_2t") == 0) {
+    if (variable.compare("mhd_tion") == 0 || variable.compare("mhd_2t") == 0 ||
+        variable.compare("mhd_3t") == 0) {
       outvars.emplace_back("tion", 0, &(pm->pmb_pack->pmhd->ptwo_temp->temperature));
     }
-    if (variable.compare("mhd_tele") == 0 || variable.compare("mhd_2t") == 0) {
+    if (variable.compare("mhd_tele") == 0 || variable.compare("mhd_2t") == 0 ||
+        variable.compare("mhd_3t") == 0) {
       outvars.emplace_back("tele", 1, &(pm->pmb_pack->pmhd->ptwo_temp->temperature));
+    }
+
+    // Multigroup thermal radiation. Group fields and erad are specific energies;
+    // trad is defined by the summed radiation energy density E_rad=a_r*T_rad^4.
+    if (variable.compare("hydro_3t") == 0) {
+      auto *prad = pm->pmb_pack->phydro->ptwo_temp->pradiation;
+      for (int g = 0; g < prad->ngroups; ++g) {
+        char number[12];
+        std::snprintf(number, sizeof(number), "%02d", g);
+        std::string label("erad");
+        label.append(number);
+        outvars.emplace_back(label, prad->ifirst+g, &(pm->pmb_pack->phydro->w0));
+      }
+      outvars.emplace_back("erad", 0, &(prad->diagnostics));
+      outvars.emplace_back("trad", 1, &(prad->diagnostics));
+    }
+    if (variable.compare("mhd_3t") == 0) {
+      auto *prad = pm->pmb_pack->pmhd->ptwo_temp->pradiation;
+      for (int g = 0; g < prad->ngroups; ++g) {
+        char number[12];
+        std::snprintf(number, sizeof(number), "%02d", g);
+        std::string label("erad");
+        label.append(number);
+        outvars.emplace_back(label, prad->ifirst+g, &(pm->pmb_pack->pmhd->w0));
+      }
+      outvars.emplace_back("erad", 0, &(prad->diagnostics));
+      outvars.emplace_back("trad", 1, &(prad->diagnostics));
     }
 
     // mhd cell-centered magnetic fields

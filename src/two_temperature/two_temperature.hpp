@@ -17,6 +17,8 @@ class ParameterInput;
 
 namespace two_temperature {
 
+class ThermalRadiation;
+
 //----------------------------------------------------------------------------------------
 //! \class TwoTemperature
 //! \brief Evolves redundant ion and electron internal energies alongside total energy.
@@ -32,13 +34,18 @@ class TwoTemperature {
  public:
   TwoTemperature(const std::string &block, MeshBlockPack *ppack, ParameterInput *pin,
                  int first_component_index);
-  ~TwoTemperature() = default;
+  ~TwoTemperature();
 
   int iion;  // conserved rho*e_i / primitive e_i index
   int iele;  // conserved rho*e_e / primitive e_e index
 
   // component 0 = ion temperature, component 1 = electron temperature
   DvceArray5D<Real> temperature;
+
+  // Optional FLASH-like thermal multigroup radiation model.
+  ThermalRadiation *pradiation = nullptr;
+
+  int NumberOfRadiationGroups() const;
 
   // Set initial component energies from the total internal energy and requested Te/Ti.
   void Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
@@ -51,6 +58,10 @@ class TwoTemperature {
   // Apply exact, energy-conserving ion/electron temperature relaxation over dt.
   void Exchange(Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
                 int il, int iu, int jl, int ju, int kl, int ku);
+
+  // Add multigroup FLD fluxes and compute their explicit stability limit.
+  void AddRadiationFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx);
+  void RadiationNewTimeStep(const DvceArray5D<Real> &prim);
 
  private:
   MeshBlockPack *pmy_pack_;

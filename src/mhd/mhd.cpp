@@ -107,9 +107,15 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
                 << "Newtonian ideal-gas MHD" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    nscalars += 2;
     ptwo_temp = new two_temperature::TwoTemperature(
         "mhd", ppack, pin, nmhd + nuser_scalars);
+    nscalars += 2 + ptwo_temp->NumberOfRadiationGroups();
+  } else if (pin->DoesBlockExist("thermal_radiation") &&
+             pin->GetOrAddBoolean("thermal_radiation", "enabled", true)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "<thermal_radiation> requires "
+              << "<mhd>/two_temperature=true" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 
   // Viscosity (only constructed if needed)

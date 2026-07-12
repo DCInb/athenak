@@ -84,9 +84,15 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
                 << "Newtonian ideal-gas hydrodynamics" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    nscalars += 2;
     ptwo_temp = new two_temperature::TwoTemperature(
         "hydro", ppack, pin, nhydro + nuser_scalars);
+    nscalars += 2 + ptwo_temp->NumberOfRadiationGroups();
+  } else if (pin->DoesBlockExist("thermal_radiation") &&
+             pin->GetOrAddBoolean("thermal_radiation", "enabled", true)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "<thermal_radiation> requires "
+              << "<hydro>/two_temperature=true" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 
   // Viscosity (if requested in input file)

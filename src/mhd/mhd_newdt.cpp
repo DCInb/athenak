@@ -21,6 +21,8 @@
 #include "diffusion/viscosity.hpp"
 #include "diffusion/resistivity.hpp"
 #include "srcterms/srcterms.hpp"
+#include "two_temperature/thermal_radiation.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 namespace mhd {
 
@@ -168,6 +170,10 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   // compute source terms timestep
   if (psrc != nullptr) {
     psrc->NewTimeStep(w0, peos->eos_data);
+  }
+  if (ptwo_temp != nullptr && ptwo_temp->pradiation != nullptr) {
+    ptwo_temp->RadiationNewTimeStep(w0);
+    dtnew = std::min(dtnew, ptwo_temp->pradiation->dtnew);
   }
 
   return TaskStatus::complete;

@@ -156,6 +156,7 @@ add_executable(
         tasklist/numerical_relativity.cpp
 
         two_temperature/two_temperature.cpp
+        two_temperature/thermal_radiation.cpp
 
         units/units.cpp
         utils/change_rundir.cpp

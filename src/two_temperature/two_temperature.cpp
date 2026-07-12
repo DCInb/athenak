@@ -15,6 +15,7 @@
 #include "athena.hpp"
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
+#include "two_temperature/thermal_radiation.hpp"
 #include "two_temperature/two_temperature.hpp"
 
 namespace two_temperature {
@@ -61,6 +62,24 @@ TwoTemperature::TwoTemperature(const std::string &block, MeshBlockPack *ppack,
   int ncells2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
   Kokkos::realloc(temperature, nmb, 2, ncells3, ncells2, ncells1);
+
+  if (pin->DoesBlockExist("thermal_radiation") &&
+      pin->GetOrAddBoolean("thermal_radiation", "enabled", true)) {
+    pradiation = new ThermalRadiation(ppack, pin, iele + 1, iele,
+        gamma_minus_one_, cv_e_fraction_);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+
+TwoTemperature::~TwoTemperature() {
+  if (pradiation != nullptr) delete pradiation;
+}
+
+//----------------------------------------------------------------------------------------
+
+int TwoTemperature::NumberOfRadiationGroups() const {
+  return (pradiation == nullptr) ? 0 : pradiation->ngroups;
 }
 
 //----------------------------------------------------------------------------------------
@@ -91,6 +110,9 @@ void TwoTemperature::Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim
     temp(m, 0, k, j, i) = gm1*eion/(density*fi);
     temp(m, 1, k, j, i) = gm1*eele/(density*fe);
   });
+  if (pradiation != nullptr) {
+    pradiation->Initialize(cons, prim, il, iu, jl, ju, kl, ku);
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -132,6 +154,9 @@ void TwoTemperature::Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
     temp(m, 0, k, j, i) = gm1*eion/(density*fi);
     temp(m, 1, k, j, i) = gm1*eele/(density*fe);
   });
+  if (pradiation != nullptr) {
+    pradiation->UpdateDiagnostics(cons, prim, il, iu, jl, ju, kl, ku);
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -140,45 +165,62 @@ void TwoTemperature::Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
 void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
                               DvceArray5D<Real> &prim,
                               int il, int iu, int jl, int ju, int kl, int ku) {
-  if (t_ei_ < 0.0) return;  // negative t_ei explicitly disables collisional exchange
+  if (t_ei_ >= 0.0) {
+    int nmb1 = pmy_pack_->nmb_thispack - 1;
+    int iion_ = iion;
+    int iele_ = iele;
+    Real gm1 = gamma_minus_one_;
+    Real fi = cv_i_fraction_;
+    Real fe = cv_e_fraction_;
+    Real decay = 0.0;
+    if (t_ei_ > 0.0) {
+      // FLASH: Delta T decays as exp[-(1 + cv_e/cv_i) dt/t_ei].
+      decay = exp(-(1.0 + fe/fi)*dt/t_ei_);
+    }
+    auto temp = temperature;
 
-  int nmb1 = pmy_pack_->nmb_thispack - 1;
-  int iion_ = iion;
-  int iele_ = iele;
-  Real gm1 = gamma_minus_one_;
-  Real fi = cv_i_fraction_;
-  Real fe = cv_e_fraction_;
-  Real decay = 0.0;
-  if (t_ei_ > 0.0) {
-    // FLASH: Delta T decays as exp[-(1 + cv_e/cv_i) dt/t_ei].
-    decay = exp(-(1.0 + fe/fi)*dt/t_ei_);
+    par_for("two_temp_exchange", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real density = cons(m, IDN, k, j, i);
+      Real eion = cons(m, iion_, k, j, i);
+      Real eele = cons(m, iele_, k, j, i);
+      Real eint = eion + eele;
+
+      Real tion = gm1*eion/(density*fi);
+      Real tele = gm1*eele/(density*fe);
+      Real teq = fi*tion + fe*tele;
+      Real delta_t = (tion - tele)*decay;
+      Real tion_new = teq + fe*delta_t;
+
+      Real eion_new = density*fi*tion_new/gm1;
+      eion_new = fmin(fmax(eion_new, 0.0), eint);
+      Real eele_new = eint - eion_new;
+
+      cons(m, iion_, k, j, i) = eion_new;
+      cons(m, iele_, k, j, i) = eele_new;
+      prim(m, iion_, k, j, i) = eion_new/density;
+      prim(m, iele_, k, j, i) = eele_new/density;
+      temp(m, 0, k, j, i) = gm1*eion_new/(density*fi);
+      temp(m, 1, k, j, i) = gm1*eele_new/(density*fe);
+    });
   }
-  auto temp = temperature;
 
-  par_for("two_temp_exchange", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    Real density = cons(m, IDN, k, j, i);
-    Real eion = cons(m, iion_, k, j, i);
-    Real eele = cons(m, iele_, k, j, i);
-    Real eint = eion + eele;
+  if (pradiation != nullptr) {
+    pradiation->Couple(dt, cons, prim, temperature, il, iu, jl, ju, kl, ku);
+  }
+}
 
-    Real tion = gm1*eion/(density*fi);
-    Real tele = gm1*eele/(density*fe);
-    Real teq = fi*tion + fe*tele;
-    Real delta_t = (tion - tele)*decay;
-    Real tion_new = teq + fe*delta_t;
+//----------------------------------------------------------------------------------------
 
-    Real eion_new = density*fi*tion_new/gm1;
-    eion_new = fmin(fmax(eion_new, 0.0), eint);
-    Real eele_new = eint - eion_new;
+void TwoTemperature::AddRadiationFluxes(const DvceArray5D<Real> &prim,
+                                        DvceFaceFld5D<Real> &flx) {
+  if (pradiation != nullptr) pradiation->AddFluxes(prim, flx);
+}
 
-    cons(m, iion_, k, j, i) = eion_new;
-    cons(m, iele_, k, j, i) = eele_new;
-    prim(m, iion_, k, j, i) = eion_new/density;
-    prim(m, iele_, k, j, i) = eele_new/density;
-    temp(m, 0, k, j, i) = gm1*eion_new/(density*fi);
-    temp(m, 1, k, j, i) = gm1*eele_new/(density*fe);
-  });
+//----------------------------------------------------------------------------------------
+
+void TwoTemperature::RadiationNewTimeStep(const DvceArray5D<Real> &prim) {
+  if (pradiation != nullptr) pradiation->NewTimeStep(prim);
 }
 
 } // namespace two_temperature

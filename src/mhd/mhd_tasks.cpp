@@ -211,6 +211,9 @@ TaskStatus MHD::Fluxes(Driver *pdrive, int stage) {
   if ((presist != nullptr) && (peos->eos_data.is_ideal)) {
     presist->AddResistiveFluxes(b0, uflx);
   }
+  if (ptwo_temp != nullptr) {
+    ptwo_temp->AddRadiationFluxes(w0, uflx);
+  }
 
   // call FOFC if necessary
   if (use_fofc) {

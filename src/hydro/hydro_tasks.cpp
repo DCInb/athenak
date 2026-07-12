@@ -194,6 +194,9 @@ TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
   if (pvisc != nullptr) {
     pvisc->AddViscousFluxes(w0, peos->eos_data, uflx);
   }
+  if (ptwo_temp != nullptr) {
+    ptwo_temp->AddRadiationFluxes(w0, uflx);
+  }
 
   // call FOFC if necessary
   if (use_fofc) {

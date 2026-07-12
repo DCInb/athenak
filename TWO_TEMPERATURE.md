@@ -86,6 +86,9 @@ Two ready-to-run examples are provided:
 - `inputs/hydro/two_temperature_relax.athinput`
 - `inputs/mhd/two_temperature_bw.athinput`
 
+For three-temperature ion/electron/thermal-radiation calculations, including multigroup
+flux-limited diffusion, see `THERMAL_RADIATION.md`.
+
 ## Output variables
 
 `hydro_2t` and `mhd_2t` output `eion`, `eele`, `tion`, and `tele`.  Each field can also
@@ -96,11 +99,12 @@ their conservative energy densities also appear as `eion_d` and `eele_d` in the 
 
 ## Current scope
 
-This first implementation intentionally supports standalone Newtonian ideal-gas hydro
-and MHD with a common gamma and a constant equilibration time.  Relativistic fluids,
-ion-neutral two-fluid runs, radiation coupling, tabulated multitemperature equations of
-state, a locally calculated Spitzer/Lee--More equilibration time, and electron-only
-thermal conduction are not yet implemented.  The RAGE-like method also partitions shock
+This implementation supports standalone Newtonian ideal-gas hydro and MHD with a common
+gamma and a constant equilibration time.  Optional thermal multigroup radiation is
+documented separately.  Relativistic fluids, ion-neutral two-fluid runs, tabulated
+multitemperature equations of state, a locally calculated Spitzer/Lee--More equilibration
+time, and electron-only thermal conduction are not yet implemented.  The RAGE-like method
+also partitions shock
 heating by pressure; unlike FLASH's entropy-advection alternative, it does not force all
 irreversible shock heating into ions.
 
