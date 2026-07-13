@@ -103,6 +103,7 @@ flux_limiter = levermore-pomraning
 flux_limit_coefficient = 1.0
 source_cfl = 0.1
 couple_matter = true
+opacity_model = constant
 
 group_bound_0 = 0.0
 group_bound_1 = 0.5
@@ -120,6 +121,79 @@ kappa_absorption_2 = 0.5
 There must be `n_groups+1` strictly increasing group boundaries.  Each group requires a
 positive `kappa_transport_g`.  `kappa_absorption_g` defaults to zero and
 `kappa_emission_g` defaults to the corresponding absorption opacity.
+
+### Tabulated opacities
+
+Set `opacity_model=table` to replace the constant group values with separate tabulated
+transport (Rosseland), Planck absorption, and Planck emission mass opacities.  Following
+FLASH, each opacity is a function of mass density, electron temperature, and group.  The
+lookup is bilinear in density and electron temperature; states outside the table are
+clamped to its nearest edge.
+
+```text
+opacity_model = table
+opacity_table_file = inputs/hydro/two_temperature_opacity_table.dat
+opacity_interpolation = linear
+```
+
+`opacity_interpolation` may be `linear` (the default) or `log`.  Log interpolation is
+performed on the opacity values, not the coordinates, and therefore requires every
+stored opacity to be strictly positive.  Linear tables may contain zero absorption or
+emission opacity.  Transport opacity must always be positive.
+
+The native, comment-friendly table format is:
+
+```text
+athenak_opacity_table 1
+dimensions 2 2 2              # n_density, n_temperature, n_groups
+density 1.0 3.0
+temperature 1.0 2.0
+group_bound 0.0 1.0 100.0
+
+transport
+# group 0: density row 0, density row 1; temperature varies fastest
+100.0 400.0
+900.0 3600.0
+# group 1
+200.0 800.0
+1800.0 7200.0
+
+absorption
+# 2 groups * 2 densities * 2 temperatures values
+0.10 0.40 0.90 3.60
+0.20 0.80 1.80 7.20
+
+emission
+0.15 0.60 1.35 5.40
+0.25 1.00 2.25 9.00
+end
+```
+
+The group count and boundaries in the table must match the radiation input.  Table
+coordinates and values are in code units by default.  The following optional multipliers
+permit a physical table to be used without rewriting it:
+
+```text
+# Multiply code rho and Te before looking up table coordinates.
+opacity_density_scale = 1.0
+opacity_temperature_scale = 1.0
+
+# Multiply stored bounds before comparing them with group_bound_g.
+opacity_group_bound_scale = 1.0
+
+# Convert stored mass opacities back to code units.  Per-kind values override the common
+# scale and correspond to FLASH's transport, absorption, and emission scale factors.
+opacity_value_scale = 1.0
+opacity_transport_scale = 1.0
+opacity_absorption_scale = 1.0
+opacity_emission_scale = 1.0
+```
+
+The supplied example table is intentionally nonlinear and can be run with either linear
+or log interpolation.  The format stores only radiation opacity data rather than the
+unrelated EOS arrays required by an IONMIX file; IONMIX data can be converted by writing
+its density/temperature axes, group boundaries, Rosseland opacity, Planck absorption,
+and Planck emission in the order above.
 
 `source_cfl > 0` limits the fractional electron-energy change for accuracy.  The local
 source update remains positive and conservative without this limit.  Set
@@ -148,19 +222,23 @@ Ready-to-run examples are:
 
 - `inputs/hydro/two_temperature_mgfld.athinput`: uniform electron-radiation relaxation;
 - `inputs/hydro/mgfld_diffusion.athinput`: periodic FLD smoothing of a radiation step;
+- `inputs/hydro/two_temperature_opacity_table.athinput`: tabulated-opacity relaxation;
+- `inputs/hydro/mgfld_opacity_table_diffusion.athinput`: tabulated-opacity diffusion;
 - `inputs/mhd/two_temperature_mgfld.athinput`: Brio--Wu MHD with two radiation groups.
 
 ## Current scope
 
-This implementation supports standalone Newtonian ideal-gas Hydro and MHD, constant
-group opacities, Cartesian finite-volume diffusion, and up to 100 groups.  It models
-thermal transport and electron-radiation energy exchange.  Radiation pressure, momentum
-feedback, radiation work, frequency-space Doppler coupling, tabulated opacities, and an
-implicit global diffusion solver are not yet included.  It is therefore appropriate when
-radiation energy transport and thermal coupling matter but radiation forces are
+This implementation supports standalone Newtonian ideal-gas Hydro and MHD, constant or
+single-material density/electron-temperature opacity tables, Cartesian finite-volume
+diffusion, and up to 100 groups.  It models thermal transport and electron-radiation
+energy exchange.  Radiation pressure, momentum feedback, radiation work,
+frequency-space Doppler coupling, multispecies opacity mixing, direct IONMIX parsing, and
+an implicit global diffusion solver are not yet included.  It is therefore appropriate
+when radiation energy transport and thermal coupling matter but radiation forces are
 subdominant.
 
 The design follows the FLASH User's Guide sections on
 [3T capabilities](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node103.html),
 [multigroup diffusion](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node154.html),
+[opacity models and interpolation](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node149.html),
 and [flux limiters](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node128.html).

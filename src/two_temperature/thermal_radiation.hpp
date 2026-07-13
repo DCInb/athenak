@@ -15,6 +15,8 @@ class ParameterInput;
 
 namespace two_temperature {
 
+class OpacityTable;
+
 //----------------------------------------------------------------------------------------
 //! \class ThermalRadiation
 //! \brief Evolves comoving radiation-group energy densities with explicit FLD.
@@ -30,7 +32,7 @@ class ThermalRadiation {
   ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin, int first_group_index,
                    int electron_index, Real gamma_minus_one,
                    Real electron_heat_capacity_fraction);
-  ~ThermalRadiation() = default;
+  ~ThermalRadiation();
 
   int ngroups;
   int ifirst;
@@ -65,6 +67,8 @@ class ThermalRadiation {
   Real source_cfl_;
   int initial_profile_mode_;
   bool couple_matter_;
+  bool use_opacity_table_ = false;
+  OpacityTable *opacity_table_ = nullptr;
 
   DualArray1D<Real> group_bounds_;
   DualArray1D<Real> kappa_transport_;

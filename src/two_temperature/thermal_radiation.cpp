@@ -17,6 +17,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
+#include "two_temperature/opacity_table.hpp"
 #include "two_temperature/thermal_radiation.hpp"
 
 namespace two_temperature {
@@ -89,7 +90,7 @@ Real FLDCoefficient(Real sigma, Real energy, Real grad, Real alpha,
 
 //----------------------------------------------------------------------------------------
 // Constructor.  Group boundaries are photon energies h*nu/k_B in code-temperature units;
-// opacities are constant mass opacities, so sigma=rho*kappa.
+// constant and tabulated models both return mass opacities, so sigma=rho*kappa.
 
 ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
     int first_group_index, int electron_index, Real gamma_minus_one,
@@ -186,22 +187,39 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
       std::exit(EXIT_FAILURE);
     }
   }
-  for (int g = 0; g < ngroups; ++g) {
-    std::string suffix = std::to_string(g);
-    kappa_transport_.h_view(g) = pin->GetReal(
-        "thermal_radiation", "kappa_transport_" + suffix);
-    kappa_absorption_.h_view(g) = pin->GetOrAddReal(
-        "thermal_radiation", "kappa_absorption_" + suffix, 0.0);
-    kappa_emission_.h_view(g) = pin->GetOrAddReal(
-        "thermal_radiation", "kappa_emission_" + suffix,
-        kappa_absorption_.h_view(g));
-    if (kappa_transport_.h_view(g) <= 0.0 ||
-        kappa_absorption_.h_view(g) < 0.0 || kappa_emission_.h_view(g) < 0.0) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Transport opacities must be positive and absorption/"
-                << "emission opacities must be non-negative" << std::endl;
-      std::exit(EXIT_FAILURE);
+  std::string opacity_model =
+      pin->GetOrAddString("thermal_radiation", "opacity_model", "constant");
+  if (opacity_model == "constant") {
+    for (int g = 0; g < ngroups; ++g) {
+      std::string suffix = std::to_string(g);
+      kappa_transport_.h_view(g) = pin->GetReal(
+          "thermal_radiation", "kappa_transport_" + suffix);
+      kappa_absorption_.h_view(g) = pin->GetOrAddReal(
+          "thermal_radiation", "kappa_absorption_" + suffix, 0.0);
+      kappa_emission_.h_view(g) = pin->GetOrAddReal(
+          "thermal_radiation", "kappa_emission_" + suffix,
+          kappa_absorption_.h_view(g));
+      if (kappa_transport_.h_view(g) <= 0.0 ||
+          kappa_absorption_.h_view(g) < 0.0 || kappa_emission_.h_view(g) < 0.0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Transport opacities must be positive and absorption/"
+                  << "emission opacities must be non-negative" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
+  } else if (opacity_model == "table" || opacity_model == "tabulated") {
+    use_opacity_table_ = true;
+    opacity_table_ = new OpacityTable(pin, ngroups, group_bounds_);
+    for (int g = 0; g < ngroups; ++g) {
+      kappa_transport_.h_view(g) = 1.0;
+      kappa_absorption_.h_view(g) = 0.0;
+      kappa_emission_.h_view(g) = 0.0;
+    }
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Unknown <thermal_radiation>/opacity_model='"
+              << opacity_model << "'" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
   group_bounds_.modify_host();
   kappa_transport_.modify_host();
@@ -218,6 +236,12 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   int ncells2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
   Kokkos::realloc(diagnostics, nmb, 2, ncells3, ncells2, ncells1);
+}
+
+//----------------------------------------------------------------------------------------
+
+ThermalRadiation::~ThermalRadiation() {
+  if (opacity_table_ != nullptr) delete opacity_table_;
 }
 
 //----------------------------------------------------------------------------------------
@@ -293,6 +317,12 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
   bool three_d = pmy_pack_->pmesh->three_d;
   auto size = pmy_pack_->pmb->mb_size;
   auto kt = kappa_transport_.d_view;
+  bool use_table = use_opacity_table_;
+  OpacityTableDevice opacity;
+  if (use_table) opacity = opacity_table_->DeviceData();
+  int iele = iele_;
+  Real gm1 = gamma_minus_one_;
+  Real fe = cv_e_fraction_;
   Real chat = chat_;
   Real alpha = flux_limit_coefficient_;
   Real floor = energy_floor_;
@@ -324,8 +354,10 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
     }
     Real energy = 0.5*(el+er);
     Real density = 0.5*(w0(m, IDN, k, j, i-1)+w0(m, IDN, k, j, i));
+    Real tele = 0.5*gm1*(w0(m, iele, k, j, i-1)+w0(m, iele, k, j, i))/fe;
     Real grad = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
-    Real dcoef = FLDCoefficient(density*kt(g), energy, grad, alpha, floor, mode);
+    Real kappa = use_table ? opacity.Get(opacity_transport, g, density, tele) : kt(g);
+    Real dcoef = FLDCoefficient(density*kappa, energy, grad, alpha, floor, mode);
     flx1(m, n, k, j, i) -= chat*dcoef*grad1;
   });
   if (pmy_pack_->pmesh->one_d) return;
@@ -354,8 +386,10 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
     }
     Real energy = 0.5*(el+er);
     Real density = 0.5*(w0(m, IDN, k, j-1, i)+w0(m, IDN, k, j, i));
+    Real tele = 0.5*gm1*(w0(m, iele, k, j-1, i)+w0(m, iele, k, j, i))/fe;
     Real grad = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
-    Real dcoef = FLDCoefficient(density*kt(g), energy, grad, alpha, floor, mode);
+    Real kappa = use_table ? opacity.Get(opacity_transport, g, density, tele) : kt(g);
+    Real dcoef = FLDCoefficient(density*kappa, energy, grad, alpha, floor, mode);
     flx2(m, n, k, j, i) -= chat*dcoef*grad2;
   });
   if (pmy_pack_->pmesh->two_d) return;
@@ -380,8 +414,10 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
     Real grad3 = (er-el)/size.d_view(m).dx3;
     Real energy = 0.5*(el+er);
     Real density = 0.5*(w0(m, IDN, k-1, j, i)+w0(m, IDN, k, j, i));
+    Real tele = 0.5*gm1*(w0(m, iele, k-1, j, i)+w0(m, iele, k, j, i))/fe;
     Real grad = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
-    Real dcoef = FLDCoefficient(density*kt(g), energy, grad, alpha, floor, mode);
+    Real kappa = use_table ? opacity.Get(opacity_transport, g, density, tele) : kt(g);
+    Real dcoef = FLDCoefficient(density*kappa, energy, grad, alpha, floor, mode);
     flx3(m, n, k, j, i) -= chat*dcoef*grad3;
   });
 }
@@ -411,6 +447,9 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
   auto bounds = group_bounds_.d_view;
   auto ka = kappa_absorption_.d_view;
   auto ke = kappa_emission_.d_view;
+  bool use_table = use_opacity_table_;
+  OpacityTableDevice opacity;
+  if (use_table) opacity = opacity_table_->DeviceData();
   auto diag = diagnostics;
 
   par_for("thermal_rad_couple", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
@@ -424,8 +463,12 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
 
     for (int g = 0; g < ng; ++g) {
       Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real siga = density*ka(g);
-      Real sige = density*ke(g);
+      Real kappaa = use_table ? opacity.Get(
+          opacity_absorption, g, density, tele) : ka(g);
+      Real kappae = use_table ? opacity.Get(
+          opacity_emission, g, density, tele) : ke(g);
+      Real siga = density*kappaa;
+      Real sige = density*kappae;
       Real source = sige*blackbody*
           PlanckGroupFraction(bounds(g), bounds(g+1), tele);
       Real updated = (old + dt*chat*source)/(1.0 + dt*chat*siga);
@@ -441,8 +484,12 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     Real total_radiation = 0.0;
     for (int g = 0; g < ng; ++g) {
       Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real siga = density*ka(g);
-      Real sige = density*ke(g);
+      Real kappaa = use_table ? opacity.Get(
+          opacity_absorption, g, density, tele) : ka(g);
+      Real kappae = use_table ? opacity.Get(
+          opacity_emission, g, density, tele) : ke(g);
+      Real siga = density*kappaa;
+      Real sige = density*kappae;
       Real source = sige*blackbody*
           PlanckGroupFraction(bounds(g), bounds(g+1), tele);
       Real updated = (old + dt*chat*source)/(1.0 + dt*chat*siga);
@@ -484,6 +531,9 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
   auto kt = kappa_transport_.d_view;
   auto ka = kappa_absorption_.d_view;
   auto kem = kappa_emission_.d_view;
+  bool use_table = use_opacity_table_;
+  OpacityTableDevice opacity;
+  if (use_table) opacity = opacity_table_->DeviceData();
   auto bounds = group_bounds_.d_view;
   Real chat = chat_;
   Real floor = energy_floor_;
@@ -523,14 +573,20 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
       // Every limiter implemented above satisfies D_fl <= 1/(3*sigma_t).  Using the
       // un-limited coefficient here is conservative even when the face gradient differs
       // from the cell-centered gradient used to evaluate the limiter.
-      Real dcoef = 1.0/(3.0*density*kt(g));
+      Real kappat = use_table ? opacity.Get(
+          opacity_transport, g, density, tele) : kt(g);
+      Real dcoef = 1.0/(3.0*density*kappat);
       cell_dt = fmin(cell_dt, 0.5/(chat*dcoef*inv_dx2));
 
       if (couple && source_cfl > 0.0) {
         Real equilibrium = blackbody*
             PlanckGroupFraction(bounds(g), bounds(g+1), tele);
-        source_rate += chat*fabs(density*kem(g)*equilibrium
-                                 - density*ka(g)*energy);
+        Real kappaa = use_table ? opacity.Get(
+            opacity_absorption, g, density, tele) : ka(g);
+        Real kappae = use_table ? opacity.Get(
+            opacity_emission, g, density, tele) : kem(g);
+        source_rate += chat*fabs(density*kappae*equilibrium
+                                 - density*kappaa*energy);
       }
     }
     if (couple && source_cfl > 0.0 && source_rate > 0.0) {

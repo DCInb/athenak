@@ -157,6 +157,7 @@ add_executable(
         tasklist/numerical_relativity.cpp
 
         two_temperature/two_temperature.cpp
+        two_temperature/opacity_table.cpp
         two_temperature/thermal_radiation.cpp
 
         units/units.cpp
