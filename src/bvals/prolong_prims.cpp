@@ -20,10 +20,28 @@
 #include "eos/ideal_c2p_hyd.hpp"
 #include "eos/ideal_c2p_mhd.hpp"
 #include "bvals.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 #include "coordinates/coordinates.hpp"
 #include "coordinates/cartesian_ks.hpp"
 #include "coordinates/cell_locations.hpp"
+
+namespace {
+
+KOKKOS_INLINE_FUNCTION
+Real BoundaryInternalEnergyFloor(const EOS_Data &eos, const Real dens) {
+  Real eint_floor = eos.pfloor/(eos.gamma - 1.0);
+  if (eos.tfloor > 0.0) {
+    eint_floor = fmax(eint_floor, dens*eos.tfloor/(eos.gamma - 1.0));
+  }
+  if (eos.sfloor > 0.0) {
+    eint_floor = fmax(eint_floor, dens*eos.sfloor*pow(dens, eos.gamma - 1.0)/
+                                  (eos.gamma - 1.0));
+  }
+  return eint_floor;
+}
+
+} // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn void ConsToPrimCoarseBndry()
@@ -320,6 +338,10 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   auto &eos = pmy_pack->pmhd->peos->eos_data;
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
+  const bool use_dual = pmy_pack->pmhd->use_dual_energy;
+  const int iion = use_dual ? pmy_pack->pmhd->ptwo_temp->iion : -1;
+  const int iele = use_dual ? pmy_pack->pmhd->ptwo_temp->iele : -1;
+  const Real dual_eta1 = pmy_pack->pmhd->dual_energy_eta1;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
@@ -428,8 +450,31 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
             w.vy *= factor;
             w.vz *= factor;
           }
-        } else {
+        } else if (!use_dual) {
           SingleC2P_IdealMHD(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+        } else {
+          const Real b2 = SQR(u.bx) + SQR(u.by) + SQR(u.bz);
+          const Real dfloor = fmax(eos.dfloor, b2/eos.sigma_max);
+          if (u.d < dfloor) {
+            u.d = dfloor;
+            dfloor_used = true;
+          }
+          w.d = u.d;
+          const Real di = 1.0/u.d;
+          w.vx = di*u.mx;
+          w.vy = di*u.my;
+          w.vz = di*u.mz;
+          const Real e_k = 0.5*di*(SQR(u.mx) + SQR(u.my) + SQR(u.mz));
+          const Real e_m = 0.5*b2;
+          const Real eint_cons = u.e - e_k - e_m;
+          const Real eint_aux = fmax(cons(m, iion, k, j, i), 0.0) +
+                                fmax(cons(m, iele, k, j, i), 0.0);
+          const bool use_cons_e =
+              (eint_cons > 0.0) &&
+              ((dual_eta1 <= 0.0) ||
+               (eint_cons > dual_eta1*fmax(u.e, 1.0e-18)));
+          w.e = use_cons_e ? eint_cons : eint_aux;
+          w.e = fmax(w.e, BoundaryInternalEnergyFloor(eos, w.d));
         }
 
         // No need to correct conserved state in coarse boundary arrays if floors used

@@ -41,6 +41,34 @@ the correction is equivalently
 This preserves the conservative AthenaK total energy exactly and enforces
 \(\rho e_i+\rho e_e=\rho e_{\rm int}\) after every stage.
 
+## MHD dual energy
+
+For two-temperature MHD, `dual_energy` is enabled by default.  The already evolved sum
+\(\rho e_i+\rho e_e\) acts as the auxiliary internal-energy equation, avoiding a third
+redundant material-energy field.  This protects gas pressure when
+
+\[
+\rho e_{\rm int}=E_{\rm tot}-\frac{|\boldsymbol m|^2}{2\rho}
+                 -\frac{|\boldsymbol B|^2}{2}
+\]
+
+is an ill-conditioned subtraction in a high-Mach or magnetically dominated cell.
+Following AthenaK's Newtonian dual-energy design, the update has four parts:
+
+1. The Riemann-solver mass flux advects both component specific energies.
+2. The upwind face velocity supplies the common-gamma compression update
+   \(e_s\leftarrow e_s\exp[-(\gamma-1)\Delta t\,\nabla\!\cdot\boldsymbol v]\).
+3. The component sum is refreshed from conservative total energy only when
+   \(e_{\rm int,cons}>\eta_2\max_{\rm local}E_{\rm tot}\), retaining conservative shock
+   heating wherever that subtraction is accurate.
+4. Conserved-to-primitive conversion uses total-energy-derived internal energy only when
+   \(e_{\rm int,cons}>\eta_1 E_{\rm tot}\); otherwise it obtains pressure from the
+   independently evolved component sum.
+
+The conservative total-energy field is not replaced when the auxiliary branch is used;
+it is changed only if an EOS floor is required.  Static/adaptive mesh interfaces flux
+correct the face velocity along with the component-energy fluxes.
+
 ## Ion/electron exchange
 
 Heat exchange is operator split and integrated exactly once per complete time step.  The
@@ -80,11 +108,15 @@ t_ei = 0.2
   retaining the total pressure supplied by the problem generator.
 - `t_ei > 0` is the constant FLASH-style electron-ion equilibration time in code units.
   `t_ei = 0` gives immediate equilibrium and `t_ei < 0` disables exchange.
+- In an `<mhd>` block, `dual_energy` defaults to `true` when `two_temperature=true`.
+  `dual_energy_eta1` and `dual_energy_eta2` default to `1.0e-3` and `1.0e-4`.
+  Set `dual_energy=false` only when reproducing the conservative-only method.
 
 Two ready-to-run examples are provided:
 
 - `inputs/hydro/two_temperature_relax.athinput`
 - `inputs/mhd/two_temperature_bw.athinput`
+- `inputs/mhd/two_temperature_dual_energy.athinput` (magnetically dominated SMR test)
 
 For three-temperature ion/electron/thermal-radiation calculations, including multigroup
 flux-limited diffusion, see `THERMAL_RADIATION.md`.
@@ -103,7 +135,11 @@ This implementation supports standalone Newtonian ideal-gas hydro and MHD with a
 gamma and a constant equilibration time.  Optional thermal multigroup radiation is
 documented separately.  Relativistic fluids, ion-neutral two-fluid runs, tabulated
 multitemperature equations of state, a locally calculated Spitzer/Lee--More equilibration
-time, and electron-only thermal conduction are not yet implemented.  The RAGE-like method
+time, and electron-only thermal conduction are not yet implemented.  MHD dual energy is
+currently incompatible with FOFC, viscosity, resistivity, thermal conduction, generic
+MHD source terms, and shearing-box evolution; set `dual_energy=false` to retain the older
+2T path for those combinations.  Thermal multigroup radiation is supported because its
+electron coupling updates the same component-energy reservoir.  The RAGE-like method
 also partitions shock
 heating by pressure; unlike FLASH's entropy-advection alternative, it does not force all
 irreversible shock heating into ions.
@@ -112,3 +148,5 @@ The numerical design follows the FLASH User's Guide sections
 [3T capabilities](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node103.html),
 [multitemperature hydrodynamics](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node105.html),
 and [heat exchange](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node123.html).
+The dual-energy switches and face-velocity compression update follow
+[AthenaK PR #753](https://github.com/IAS-Astrophysics/athenak/pull/753).

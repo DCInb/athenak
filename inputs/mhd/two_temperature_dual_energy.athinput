@@ -1,15 +1,17 @@
-# Brio-Wu shock tube with separate ion/electron internal energies.
+# Uniform, magnetically dominated MHD state used to verify the 2T dual-energy fallback.
+# B^2/2 is large enough that adding the gas internal energy loses it in IEEE double
+# precision; pressure must therefore come from rho*e_i + rho*e_e.
 
 <job>
-basename = two_temperature_mhd
+basename = two_temperature_dual_energy
 
 <mesh>
 nghost = 2
-nx1 = 64
+nx1 = 32
 x1min = -0.5
 x1max = 0.5
-ix1_bc = outflow
-ox1_bc = outflow
+ix1_bc = periodic
+ox1_bc = periodic
 nx2 = 1
 x2min = -0.5
 x2max = 0.5
@@ -22,28 +24,38 @@ ix3_bc = periodic
 ox3_bc = periodic
 
 <meshblock>
-nx1 = 64
+nx1 = 8
 nx2 = 1
 nx3 = 1
+
+<mesh_refinement>
+refinement = static
+
+<refined_region1>
+level = 1
+x1min = -0.15
+x1max = 0.15
 
 <time>
 evolution = dynamic
 integrator = rk2
 cfl_number = 0.3
 nlim = -1
-tlim = 0.02
+tlim = 1.0e-11
 ndiag = 1
 
 <mhd>
 eos = ideal
 reconstruct = plm
-rsolver = hlld
-gamma = 2.0
+rsolver = hlle
+gamma = 1.6666666666666667
 two_temperature = true
 dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
 electron_heat_capacity_fraction = 0.5
-initial_electron_temperature_ratio = 0.2
-t_ei = 0.05
+initial_electron_temperature_ratio = 0.5
+t_ei = -1.0
 
 <problem>
 pgen_name = shock_tube
@@ -54,22 +66,22 @@ pl = 1.0
 ul = 0.0
 vl = 0.0
 wl = 0.0
-bxl = 0.75
-byl = 1.0
+bxl = 1.0e9
+byl = 0.0
 bzl = 0.0
-dr = 0.125
-pr = 0.1
+dr = 1.0
+pr = 1.0
 ur = 0.0
 vr = 0.0
 wr = 0.0
-bxr = 0.75
-byr = -1.0
+bxr = 1.0e9
+byr = 0.0
 bzr = 0.0
 
 <output1>
 file_type = tab
 variable = mhd_2t
 data_format = %20.12e
-dt = 0.02
+dt = 1.0e-11
 slice_x2 = 0.0
 slice_x3 = 0.0

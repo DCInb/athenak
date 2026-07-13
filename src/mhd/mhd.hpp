@@ -53,6 +53,7 @@ struct MHDTaskIDs {
   TaskID sendf;
   TaskID recvf;
   TaskID rkupdt;
+  TaskID duale;
   TaskID srctrms;
   TaskID sendu_oa;
   TaskID recvu_oa;
@@ -99,6 +100,9 @@ class MHD {
   int nmhd;                // number of mhd variables (5/4 for ideal/isothermal EOS)
   int nscalars;            // total number of advected scalars, including 2T energies
   int nuser_scalars;       // number of user-requested passive scalars
+  bool use_dual_energy = false;
+  Real dual_energy_eta1 = 1.0e-3;
+  Real dual_energy_eta2 = 1.0e-4;
   DvceArray5D<Real> u0;    // conserved variables
   DvceArray5D<Real> w0;    // primitive variables
   DvceFaceFld4D<Real> b0;  // face-centered magnetic fields
@@ -130,6 +134,8 @@ class MHD {
   DvceArray5D<Real> u1;       // conserved variables, second register
   DvceFaceFld4D<Real> b1;     // face-centered magnetic fields, second register
   DvceFaceFld5D<Real> uflx;   // fluxes of conserved quantities on cell faces
+  DvceFaceFld5D<Real> dual_vf;  // upwind face velocity for 2T compression work
+  DvceArray4D<Real> dual_etot_max;  // local total-energy scale for dual-energy sync
   DvceEdgeFld4D<Real> efld;   // edge-centered electric fields (fluxes of B)
   // temporary variables used to store face-centered electric fields returned by RS
   DvceArray4D<Real> e3x1, e2x1;
@@ -163,6 +169,7 @@ class MHD {
   TaskStatus SendFlux(Driver *d, int stage);
   TaskStatus RecvFlux(Driver *d, int stage);
   TaskStatus RKUpdate(Driver *d, int stage);
+  TaskStatus DualEnergyStep(Driver *d, int stage);
   TaskStatus MHDSrcTerms(Driver *d, int stage);
   TaskStatus SendU_OA(Driver *d, int stage);
   TaskStatus RecvU_OA(Driver *d, int stage);
@@ -195,6 +202,10 @@ class MHD {
   // CalculateFluxes function templated over Riemann Solvers
   template <MHD_RSolver T>
   void CalculateFluxes(Driver *d, int stage);
+
+  // Two-temperature-backed dual-energy formalism for Newtonian MHD.
+  void ApplyDualEnergyFormalism(Real dt);
+  void SynchronizeDualEnergyFromTotal();
 
   // first-order flux correction
   void FOFC(Driver *d, int stage);

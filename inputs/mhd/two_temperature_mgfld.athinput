@@ -40,6 +40,7 @@ reconstruct = plm
 rsolver = hlld
 gamma = 2.0
 two_temperature = true
+dual_energy = true
 electron_heat_capacity_fraction = 0.5
 initial_electron_temperature_ratio = 0.2
 t_ei = 0.05

@@ -39,6 +39,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     u1("cons1",1,1,1,1,1),
     b1("B_fc1",1,1,1,1),
     uflx("uflx",1,1,1,1,1),
+    dual_vf("dual_vf",1,1,1,1,1),
+    dual_etot_max("dual_etot_max",1,1,1,1),
     efld("efld",1,1,1,1),
     e3x1("e3x1",1,1,1,1),
     e2x1("e2x1",1,1,1,1),
@@ -118,6 +120,26 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
 
+  // In 2T MHD the ion+electron energy sum is the auxiliary internal energy.  Enable
+  // dual energy by default so magnetic-energy subtraction cannot erase the gas pressure.
+  use_dual_energy = pin->GetOrAddBoolean("mhd", "dual_energy", use_two_temperature);
+  if (use_dual_energy) {
+    if (ptwo_temp == nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/dual_energy requires <mhd>/two_temperature=true"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    dual_energy_eta1 = pin->GetOrAddReal("mhd", "dual_energy_eta1", 1.0e-3);
+    dual_energy_eta2 = pin->GetOrAddReal("mhd", "dual_energy_eta2", 1.0e-4);
+    if (dual_energy_eta1 < 0.0 || dual_energy_eta2 < 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/dual_energy_eta1 and dual_energy_eta2 must be "
+                << "non-negative" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
   // Viscosity (only constructed if needed)
   if (pin->DoesParameterExist("mhd","nu_iso") ||
       pin->DoesParameterExist("mhd","nu_aniso")) {
@@ -159,6 +181,22 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   // (3) read time-evolution option [already error checked in driver constructor]
   // Then initialize memory and algorithms for reconstruction and Riemann solvers
   std::string evolution_t = pin->GetString("time","evolution");
+  if (use_dual_energy) {
+    if (evolution_t.compare("dynamic") != 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/dual_energy requires dynamic evolution"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (pvisc != nullptr || presist != nullptr || pcond != nullptr || psrc != nullptr ||
+        pin->DoesBlockExist("shearing_box")) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/dual_energy is not yet compatible with viscosity, "
+                << "resistivity, thermal conduction, MHD source terms, or shearing box"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   // allocate memory for conserved and primitive variables
   // With AMR, maximum size of Views are limited by total device memory through an input
@@ -170,6 +208,9 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
     Kokkos::realloc(u0,   nmb, (nmhd+nscalars), ncells3, ncells2, ncells1);
     Kokkos::realloc(w0,   nmb, (nmhd+nscalars), ncells3, ncells2, ncells1);
+    if (use_dual_energy) {
+      Kokkos::realloc(dual_etot_max, nmb, ncells3, ncells2, ncells1);
+    }
 
     // allocate memory for face-centered and cell-centered magnetic fields
     Kokkos::realloc(bcc0,   nmb, 3, ncells3, ncells2, ncells1);
@@ -193,7 +234,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // allocate boundary buffers for conserved (cell-centered) and face-centered variables
   pbval_u = new MeshBoundaryValuesCC(ppack, pin, false);
-  pbval_u->InitializeBuffers((nmhd+nscalars));
+  pbval_u->InitializeBuffers((nmhd+nscalars),
+      (nmhd+nscalars) + (use_dual_energy ? 1 : 0));
   pbval_b = new MeshBoundaryValuesFC(ppack, pin);
   pbval_b->InitializeBuffers(3);
 
@@ -214,6 +256,12 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("mhd","fofc",false);
+    if (use_dual_energy && use_fofc) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/dual_energy is not yet compatible with FOFC"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
 
     // select reconstruction method (default PLM)
     std::string xorder = pin->GetOrAddString("mhd","reconstruct","plm");
@@ -353,6 +401,11 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(uflx.x1f, nmb, (nmhd+nscalars), ncells3, ncells2, ncells1+1);
       Kokkos::realloc(uflx.x2f, nmb, (nmhd+nscalars), ncells3, ncells2+1, ncells1);
       Kokkos::realloc(uflx.x3f, nmb, (nmhd+nscalars), ncells3+1, ncells2, ncells1);
+      if (use_dual_energy) {
+        Kokkos::realloc(dual_vf.x1f, nmb, 1, ncells3, ncells2, ncells1+1);
+        Kokkos::realloc(dual_vf.x2f, nmb, 1, ncells3, ncells2+1, ncells1);
+        Kokkos::realloc(dual_vf.x3f, nmb, 1, ncells3+1, ncells2, ncells1);
+      }
       Kokkos::realloc(efld.x1e, nmb, ncells3+1, ncells2+1, ncells1);
       Kokkos::realloc(efld.x2e, nmb, ncells3+1, ncells2, ncells1+1);
       Kokkos::realloc(efld.x3e, nmb, ncells3, ncells2+1, ncells1+1);

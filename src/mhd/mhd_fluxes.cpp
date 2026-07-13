@@ -23,6 +23,7 @@
 #include "mhd/rsolvers/llf_mhd.hpp"
 #include "mhd/rsolvers/hlle_mhd.hpp"
 #include "mhd/rsolvers/hlld_mhd.hpp"
+#include "mhd/rsolvers/dual_eint_mhd.hpp"
 #include "mhd/rsolvers/llf_srmhd.hpp"
 #include "mhd/rsolvers/hlle_srmhd.hpp"
 #include "mhd/rsolvers/llf_grmhd.hpp"
@@ -46,6 +47,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
 
   int &nmhd_ = nmhd;
   int nvars = nmhd + nscalars;
+  const bool use_dual_energy_ = use_dual_energy;
   int nmb1 = pmy_pack->nmb_thispack - 1;
   const auto recon_method_ = recon_method;
   bool extrema = false;
@@ -66,6 +68,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
                      ScrArray2D<Real>::shmem_size(3, ncells1)) * 2;
   int scr_level = 0;
   auto &flx1_ = uflx.x1f;
+  auto &vf1_ = dual_vf.x1f;
   auto &e31_ = e3x1;
   auto &e21_ = e2x1;
   auto &bx_ = b0.x1f;
@@ -124,6 +127,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     auto coord = coord_;
     auto bx = bx_;
     auto flx1 = flx1_;
+    auto vf1 = vf1_;
     auto e31 = e31_;
     auto e21 = e21_;
     if constexpr (rsolver_method_ == MHD_RSolver::advect) {
@@ -144,6 +148,10 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
       HLLE_GR(member,eos,indcs,size,coord,m,k,j,il,iu,IVX,wl,wr,bl,br,bx,flx1,e31,e21);
     }
     member.team_barrier();
+    if (use_dual_energy_) {
+      UpwindDualEnergyVelocity(member, eos, m, k, j, il, iu, wl, wr, flx1, vf1);
+      member.team_barrier();
+    }
 
     // calculate fluxes of scalars (if any)
     if (nvars > nmhd_) {
@@ -166,6 +174,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
                 ScrArray2D<Real>::shmem_size(3, ncells1)) * 3;
     auto &flx2_ = uflx.x2f;
+    auto &vf2_ = dual_vf.x2f;
     auto &by_ = b0.x2f;
     auto &e12_ = e1x2;
     auto &e32_ = e3x2;
@@ -238,6 +247,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
           auto coord = coord_;
           auto by = by_;
           auto flx2 = flx2_;
+          auto vf2 = vf2_;
           auto e12 = e12_;
           auto e32 = e32_;
           if constexpr (rsolver_method_ == MHD_RSolver::advect) {
@@ -266,6 +276,11 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
                     m,k,j,is-1,ie+1,IVY,wl,wr,bl,br,by,flx2,e12,e32);
           }
           member.team_barrier();
+          if (use_dual_energy_) {
+            UpwindDualEnergyVelocity(member, eos, m, k, j, is-1, ie+1,
+                                     wl, wr, flx2, vf2);
+            member.team_barrier();
+          }
         }
 
         // calculate fluxes of scalars (if any)
@@ -291,6 +306,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
                 ScrArray2D<Real>::shmem_size(3, ncells1)) * 3;
     auto &flx3_ = uflx.x3f;
+    auto &vf3_ = dual_vf.x3f;
     auto &bz_ = b0.x3f;
     auto &e23_ = e2x3;
     auto &e13_ = e1x3;
@@ -358,6 +374,7 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
           auto coord = coord_;
           auto bz = bz_;
           auto flx3 = flx3_;
+          auto vf3 = vf3_;
           auto e23 = e23_;
           auto e13 = e13_;
           if constexpr (rsolver_method_ == MHD_RSolver::advect) {
@@ -386,6 +403,11 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
                     m,k,j,is-1,ie+1,IVZ,wl,wr,bl,br,bz,flx3,e23,e13);
           }
           member.team_barrier();
+          if (use_dual_energy_) {
+            UpwindDualEnergyVelocity(member, eos, m, k, j, is-1, ie+1,
+                                     wl, wr, flx3, vf3);
+            member.team_barrier();
+          }
         }
 
         // calculate fluxes of scalars (if any)

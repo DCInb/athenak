@@ -57,7 +57,8 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
   id.sendf     = tl["stagen"]->AddTask(&MHD::SendFlux, this, id.flux);
   id.recvf     = tl["stagen"]->AddTask(&MHD::RecvFlux, this, id.sendf);
   id.rkupdt    = tl["stagen"]->AddTask(&MHD::RKUpdate, this, id.recvf);
-  id.srctrms   = tl["stagen"]->AddTask(&MHD::MHDSrcTerms, this, id.rkupdt);
+  id.duale     = tl["stagen"]->AddTask(&MHD::DualEnergyStep, this, id.rkupdt);
+  id.srctrms   = tl["stagen"]->AddTask(&MHD::MHDSrcTerms, this, id.duale);
   id.sendu_oa  = tl["stagen"]->AddTask(&MHD::SendU_OA, this, id.srctrms);
   id.recvu_oa  = tl["stagen"]->AddTask(&MHD::RecvU_OA, this, id.sendu_oa);
   id.restu     = tl["stagen"]->AddTask(&MHD::RestrictU, this, id.recvu_oa);
@@ -123,7 +124,7 @@ TaskStatus MHD::InitRecv(Driver *pdrive, int stage) {
   if (stage >= 0) {
     // with SMR/AMR, post receives for fluxes of U
     if (pmy_pack->pmesh->multilevel) {
-      tstat = pbval_u->InitFluxRecv(nmhd+nscalars);
+      tstat = pbval_u->InitFluxRecv(nmhd+nscalars + (use_dual_energy ? 1 : 0));
       if (tstat != TaskStatus::complete) return tstat;
     }
     // post receives for fluxes of B, which are used even with uniform grids
@@ -236,7 +237,8 @@ TaskStatus MHD::SendFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
   // Only execute BoundaryValues function with SMR/SMR
   if (pmy_pack->pmesh->multilevel)  {
-    tstat = pbval_u->PackAndSendFluxCC(uflx);
+    tstat = pbval_u->PackAndSendFluxCC(uflx,
+        use_dual_energy ? &dual_vf : nullptr);
   }
   return tstat;
 }
@@ -250,7 +252,8 @@ TaskStatus MHD::RecvFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
   // Only execute BoundaryValues function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
-    tstat = pbval_u->RecvAndUnpackFluxCC(uflx);
+    tstat = pbval_u->RecvAndUnpackFluxCC(uflx,
+        use_dual_energy ? &dual_vf : nullptr);
   }
   return tstat;
 }
@@ -559,6 +562,7 @@ TaskStatus MHD::ConToPrim(Driver *pdrive, int stage) {
   int n1m1 = indcs.nx1 + 2*ng - 1;
   int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
   int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
+  SynchronizeDualEnergyFromTotal();
   peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
   if (ptwo_temp != nullptr) {
     ptwo_temp->Sync(u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);

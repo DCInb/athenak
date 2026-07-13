@@ -10,6 +10,24 @@
 #include "mhd/mhd.hpp"
 #include "eos.hpp"
 #include "eos/ideal_c2p_mhd.hpp"
+#include "two_temperature/two_temperature.hpp"
+
+namespace {
+
+KOKKOS_INLINE_FUNCTION
+Real MHDInternalEnergyFloor(const EOS_Data &eos, const Real dens) {
+  Real eint_floor = eos.pfloor/(eos.gamma - 1.0);
+  if (eos.tfloor > 0.0) {
+    eint_floor = fmax(eint_floor, dens*eos.tfloor/(eos.gamma - 1.0));
+  }
+  if (eos.sfloor > 0.0) {
+    eint_floor = fmax(eint_floor, dens*eos.sfloor*pow(dens, eos.gamma - 1.0)/
+                                  (eos.gamma - 1.0));
+  }
+  return eint_floor;
+}
+
+} // namespace
 
 //----------------------------------------------------------------------------------------
 // ctor: also calls EOS base class constructor
@@ -34,6 +52,10 @@ void IdealMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
                           const int kl, const int ku) {
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
+  const bool use_dual = pmy_pack->pmhd->use_dual_energy;
+  const int iion = use_dual ? pmy_pack->pmhd->ptwo_temp->iion : -1;
+  const int iele = use_dual ? pmy_pack->pmhd->ptwo_temp->iele : -1;
+  const Real dual_eta1 = pmy_pack->pmhd->dual_energy_eta1;
   int &nmb = pmy_pack->nmb_thispack;
   auto &eos = eos_data;
   auto &fofc_ = pmy_pack->pmhd->fofc;
@@ -78,7 +100,39 @@ void IdealMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
     // (inline function in ideal_c2p_mhd.hpp file)
     HydPrim1D w;
     bool dfloor_used=false, efloor_used=false, tfloor_used=false;
-    SingleC2P_IdealMHD(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+    if (!use_dual) {
+      SingleC2P_IdealMHD(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+    } else {
+      const Real b2 = SQR(u.bx) + SQR(u.by) + SQR(u.bz);
+      const Real dfloor = fmax(eos.dfloor, b2/eos.sigma_max);
+      if (u.d < dfloor) {
+        u.d = dfloor;
+        dfloor_used = true;
+      }
+      w.d = u.d;
+      const Real di = 1.0/u.d;
+      w.vx = di*u.mx;
+      w.vy = di*u.my;
+      w.vz = di*u.mz;
+      const Real e_k = 0.5*di*(SQR(u.mx) + SQR(u.my) + SQR(u.mz));
+      const Real e_m = 0.5*b2;
+      const Real eint_cons = u.e - e_k - e_m;
+      const Real eint_aux = fmax(cons(m, iion, k, j, i), 0.0) +
+                            fmax(cons(m, iele, k, j, i), 0.0);
+      const Real eint_floor = MHDInternalEnergyFloor(eos, w.d);
+      const bool use_cons_e =
+          (eint_cons > 0.0) &&
+          ((dual_eta1 <= 0.0) ||
+           (eint_cons > dual_eta1*fmax(u.e, 1.0e-18)));
+      w.e = use_cons_e ? eint_cons : eint_aux;
+      if (w.e < eint_floor) {
+        w.e = eint_floor;
+        efloor_used = true;
+      }
+      // Keep conservative total energy unless a physical floor was required.  The
+      // auxiliary energy supplies pressure without sacrificing total-energy conservation.
+      u.e = w.e + e_k + e_m;
+    }
 
     // set FOFC flag and quit loop if this function called only to check floors
     if (only_testfloors) {
