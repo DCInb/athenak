@@ -894,6 +894,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
 
   if (pgen_fun_name.compare("advection") == 0) {
     Advection(pin, is_restart);
+  } else if (pgen_fun_name.compare("biermann_battery") == 0) {
+    BiermannBattery(pin, is_restart);
   } else if (pgen_fun_name.compare("cpaw") == 0) {
     AlfvenWave(pin, is_restart);
   } else if (pgen_fun_name.compare("gr_bondi") == 0) {

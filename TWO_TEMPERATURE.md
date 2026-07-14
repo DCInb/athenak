@@ -69,6 +69,15 @@ The conservative total-energy field is not replaced when the auxiliary branch is
 it is changed only if an EOS floor is required.  Static/adaptive mesh interfaces flux
 correct the face velocity along with the component-energy fluxes.
 
+## Biermann battery
+
+Two-temperature MHD can optionally add the FLASH-style flux formulation of the Biermann
+battery.  It uses electron pressure in the induction equation and transports the full
+electron enthalpy with the electron velocity, allowing electron and magnetic energy to
+exchange while retaining conservative total energy.  The MHD dual-energy protection
+remains active.  See `BIERMANN_BATTERY.md` for equations, stability limits, shock
+suppression, and input parameters.
+
 ## Ion/electron exchange
 
 Heat exchange is operator split and integrated exactly once per complete time step.  The
@@ -112,11 +121,12 @@ t_ei = 0.2
   `dual_energy_eta1` and `dual_energy_eta2` default to `1.0e-3` and `1.0e-4`.
   Set `dual_energy=false` only when reproducing the conservative-only method.
 
-Two ready-to-run examples are provided:
+Ready-to-run examples are provided:
 
 - `inputs/hydro/two_temperature_relax.athinput`
 - `inputs/mhd/two_temperature_bw.athinput`
 - `inputs/mhd/two_temperature_dual_energy.athinput` (magnetically dominated SMR test)
+- `inputs/mhd/two_temperature_biermann.athinput` (crossed-gradient battery test)
 
 For three-temperature ion/electron/thermal-radiation calculations, including multigroup
 flux-limited diffusion, see `THERMAL_RADIATION.md`.
@@ -133,7 +143,8 @@ their conservative energy densities also appear as `eion_d` and `eele_d` in the 
 
 This implementation supports standalone Newtonian ideal-gas hydro and MHD with a common
 gamma and a constant equilibration time.  Optional thermal multigroup radiation is
-documented separately.  Relativistic fluids, ion-neutral two-fluid runs, tabulated
+documented separately.  The optional 2D/3D Cartesian Biermann battery is documented in
+`BIERMANN_BATTERY.md`.  Relativistic fluids, ion-neutral two-fluid runs, tabulated
 multitemperature equations of state, a locally calculated Spitzer/Lee--More equilibration
 time, and electron-only thermal conduction are not yet implemented.  MHD dual energy is
 currently incompatible with FOFC, viscosity, resistivity, thermal conduction, generic

@@ -58,6 +58,7 @@ class ProblemGenerator {
   void CallProblemGenerator(ParameterInput *pin, bool is_restart);
   void Advection(ParameterInput *pin, const bool restart);
   void AlfvenWave(ParameterInput *pin, const bool restart);
+  void BiermannBattery(ParameterInput *pin, const bool restart);
   void BondiAccretion(ParameterInput *pin, const bool restart);
   void CShock(ParameterInput *pin, const bool restart);
   void Diffusion(ParameterInput *pin, const bool restart);

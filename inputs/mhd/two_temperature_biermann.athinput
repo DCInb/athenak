@@ -1,0 +1,81 @@
+# Smooth crossed electron-pressure/electron-density gradients for the flux-form
+# Biermann battery.  At early time, B3 has an analytic cos(2*pi*x)cos(2*pi*y) profile.
+
+<job>
+basename = two_temperature_biermann
+
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 64
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 1
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 1.0e-4
+ndiag = 1
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+two_temperature = true
+dual_energy = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+biermann_battery = true
+biermann_coefficient = 0.1
+biermann_shock_suppression = true
+biermann_shock_threshold = 0.25
+
+<problem>
+pgen_name = biermann_battery
+rho0 = 1.0
+p0 = 1.0
+density_amplitude = 0.2
+pressure_amplitude = 0.2
+
+<output1>
+file_type = hst
+data_format = %20.12e
+dt = 1.0e-4
+
+<output2>
+file_type = tab
+variable = mhd_w_bcc
+id = biermann
+data_format = %20.12e
+dt = 1.0e-4
+slice_x2 = 0.0078125
+slice_x3 = 0.0
+
+<output3>
+file_type = tab
+variable = mhd_2t
+id = two_temperature
+data_format = %20.12e
+dt = 1.0e-4
+slice_x2 = 0.0078125
+slice_x3 = 0.0

@@ -47,6 +47,7 @@ class TwoTemperature {
 
   int NumberOfRadiationGroups() const;
   Real InitialElectronEnergyFraction() const { return initial_e_fraction_; }
+  Real ElectronHeatCapacityFraction() const { return cv_e_fraction_; }
 
   // Set initial component energies from the total internal energy and requested Te/Ti.
   void Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,

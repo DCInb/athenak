@@ -21,6 +21,7 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "bvals/bvals.hpp"
+#include "mhd/biermann_battery.hpp"
 #include "mhd/mhd.hpp"
 #include "two_temperature/two_temperature.hpp"
 
@@ -118,6 +119,33 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
               << std::endl << "<thermal_radiation> requires "
               << "<mhd>/two_temperature=true" << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+
+  // FLASH-style Biermann battery: face-centered Biermann fluxes, CT edge fields,
+  // and the matching electron enthalpy transport are available only with 2T MHD.
+  bool use_biermann = pin->GetOrAddBoolean("mhd", "biermann_battery", false);
+  if (use_biermann) {
+    if (ptwo_temp == nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/biermann_battery requires "
+                << "<mhd>/two_temperature=true" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (!pmy_pack->pmesh->multi_d) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/biermann_battery requires a 2D or 3D mesh"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (pmy_pack->pmesh->mb_indcs.ng < 2) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/biermann_battery requires at least two ghost "
+                << "zones" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    pbiermann = new BiermannBattery(
+        ppack, pin, ptwo_temp->iele, ptwo_temp->ElectronHeatCapacityFraction(),
+        peos->eos_data.gamma, peos->eos_data.dfloor, peos->eos_data.pfloor);
   }
 
   // In 2T MHD the ion+electron energy sum is the auxiliary internal energy.  Enable
@@ -451,6 +479,7 @@ MHD::~MHD() {
   if (pcond != nullptr) {delete pcond;}
   if (presist!= nullptr) {delete presist;}
   if (pvisc != nullptr) {delete pvisc;}
+  if (pbiermann != nullptr) {delete pbiermann;}
   if (ptwo_temp != nullptr) {delete ptwo_temp;}
   delete peos;
 }

@@ -12,6 +12,7 @@
 #include "driver/driver.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
+#include "mhd/biermann_battery.hpp"
 #include "mhd/mhd.hpp"
 #include "two_temperature/two_temperature.hpp"
 
@@ -44,9 +45,12 @@ bool DualEnergySyncEligible(const Real eint_cons, const Real local_etot_max,
 namespace mhd {
 
 TaskStatus MHD::DualEnergyStep(Driver *pdrive, int stage) {
+  const Real beta_dt = pdrive->beta[stage-1]*pmy_pack->pmesh->dt;
   if (use_dual_energy) {
-    const Real beta_dt = pdrive->beta[stage-1]*pmy_pack->pmesh->dt;
     ApplyDualEnergyFormalism(beta_dt);
+  }
+  if (pbiermann != nullptr) {
+    pbiermann->ApplyElectronWork(beta_dt, u0, w0);
   }
   return TaskStatus::complete;
 }

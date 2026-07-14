@@ -25,6 +25,7 @@
 #include "bvals/bvals.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
+#include "mhd/biermann_battery.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "two_temperature/two_temperature.hpp"
@@ -225,6 +226,11 @@ TaskStatus MHD::Fluxes(Driver *pdrive, int stage) {
     }
   }
 
+  // Add the non-ideal face fluxes after FOFC has finished replacing ideal fluxes.
+  if (pbiermann != nullptr) {
+    pbiermann->AddFluxes(w0, bcc0, uflx);
+  }
+
   return TaskStatus::complete;
 }
 
@@ -393,6 +399,9 @@ TaskStatus MHD::EField(Driver *pdrive, int stage) {
   // Add resistive electric field (if needed)
   if (presist != nullptr) {
     presist->AddResistiveEMFs(b0, efld);
+  }
+  if (pbiermann != nullptr) {
+    pbiermann->AddEMFs(efld);
   }
   // TODO(@user): Add more resistive effects here
 

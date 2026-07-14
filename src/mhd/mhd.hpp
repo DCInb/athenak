@@ -33,6 +33,7 @@ namespace two_temperature {class TwoTemperature;}
 
 // function ptr for user-defined MHD boundary functions enrolled in problem generator
 namespace mhd {
+class BiermannBattery;
 using MHDBoundaryFnPtr = void (*)(int m, Mesh* pm, MHD* pmhd, DvceArray5D<Real> &u);
 }
 
@@ -129,6 +130,7 @@ class MHD {
   Conduction *pcond = nullptr;
   SourceTerms *psrc = nullptr;
   two_temperature::TwoTemperature *ptwo_temp = nullptr;
+  BiermannBattery *pbiermann = nullptr;
 
   // following only used for time-evolving flow
   DvceArray5D<Real> u1;       // conserved variables, second register

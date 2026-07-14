@@ -16,6 +16,7 @@
 #include "mesh/mesh.hpp"
 #include "driver/driver.hpp"
 #include "eos/eos.hpp"
+#include "mhd/biermann_battery.hpp"
 #include "mhd.hpp"
 #include "diffusion/conduction.hpp"
 #include "diffusion/viscosity.hpp"
@@ -174,6 +175,10 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   if (ptwo_temp != nullptr && ptwo_temp->pradiation != nullptr) {
     ptwo_temp->RadiationNewTimeStep(w0);
     dtnew = std::min(dtnew, ptwo_temp->pradiation->dtnew);
+  }
+  if (pbiermann != nullptr) {
+    pbiermann->NewTimeStep(w0, bcc0);
+    dtnew = std::min(dtnew, pbiermann->dtnew);
   }
 
   return TaskStatus::complete;

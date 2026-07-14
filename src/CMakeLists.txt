@@ -81,6 +81,7 @@ add_executable(
         mesh/refinement_criteria.cpp
 
         mhd/mhd.cpp
+        mhd/biermann_battery.cpp
         mhd/mhd_corner_e.cpp
         mhd/mhd_ct.cpp
         mhd/mhd_dual_energy.cpp
@@ -113,6 +114,7 @@ add_executable(
 
         pgen/pgen.cpp
         pgen/tests/advection.cpp
+        pgen/tests/biermann_battery.cpp
         pgen/tests/cpaw.cpp
         pgen/tests/cshock.cpp
         pgen/tests/diffusion.cpp
