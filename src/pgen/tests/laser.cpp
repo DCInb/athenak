@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file laser.cpp
-//! \brief Static planar density profiles for laser reflection reference tests.
+//! \brief Static density profiles for laser reflection and refraction reference tests.
 
 #include <cmath>
 #include <cstdlib>
@@ -21,9 +21,9 @@
 #include "pgen/pgen.hpp"
 
 //----------------------------------------------------------------------------------------
-//! Initialize a zero-velocity, zero-field medium with a density profile along x1 and
-//! constant material temperature. The profile is deliberately simple enough to provide
-//! analytic critical-surface locations for laser regression tests.
+//! Initialize a zero-velocity, zero-field medium with an axial profile plus optional
+//! transverse linear and quadratic terms. These profiles provide analytic reference
+//! solutions for planar reflection, constant-gradient bending, and symmetric lenses.
 
 void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
   if (restart) return;
@@ -55,6 +55,14 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
       pin->GetOrAddReal("problem", "density_gradient", 1.0);
   Real density_exponent =
       pin->GetOrAddReal("problem", "density_exponent", std::log(3.0));
+  Real density_gradient_x2 =
+      pin->GetOrAddReal("problem", "density_gradient_x2", 0.0);
+  Real density_gradient_x3 =
+      pin->GetOrAddReal("problem", "density_gradient_x3", 0.0);
+  Real density_curvature_x2 =
+      pin->GetOrAddReal("problem", "density_curvature_x2", 0.0);
+  Real density_curvature_x3 =
+      pin->GetOrAddReal("problem", "density_curvature_x3", 0.0);
   Real temperature = pin->GetOrAddReal("problem", "temperature", 1.0);
   if (!(rho0 > 0.0) || !(temperature > 0.0)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -85,10 +93,16 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real x1 = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
                           size.d_view(m).x1max);
+    Real x2 = CellCenterX(j-js, indcs.nx2, size.d_view(m).x2min,
+                          size.d_view(m).x2max);
+    Real x3 = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                          size.d_view(m).x3max);
     Real distance = x1-x1min;
     Real density = (profile_mode == 0)
         ? rho0 + density_gradient*distance
         : rho0*exp(density_exponent*distance);
+    density += density_gradient_x2*x2 + density_gradient_x3*x3 +
+               density_curvature_x2*x2*x2 + density_curvature_x3*x3*x3;
     density = fmax(density, 1.0e-20);
     w(m, IDN, k, j, i) = density;
     w(m, IVX, k, j, i) = 0.0;

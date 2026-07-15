@@ -62,6 +62,7 @@ initial_electron_temperature_ratio = 1.0
 t_ei = -1.0
 
 <laser>
+model = straight
 deposition_target = electron
 electron_temperature_model = two_temperature
 absorption_model = constant

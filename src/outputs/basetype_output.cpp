@@ -246,6 +246,28 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     if (variable == "laser" || variable == "laser_path") {
       outvars.emplace_back("laser_path", 4, &(pm->pmb_pack->plaser->cell_data));
     }
+    if (variable == "laser" || variable == "laser_dir1") {
+      outvars.emplace_back("laser_dir1", 5, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_dir2") {
+      outvars.emplace_back("laser_dir2", 6, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_dir3") {
+      outvars.emplace_back("laser_dir3", 7, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_dispersion_error") {
+      outvars.emplace_back(
+          "laser_dispersion_error", 8, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_x1_moment") {
+      outvars.emplace_back("laser_x1_moment", 9, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_x2_moment") {
+      outvars.emplace_back("laser_x2_moment", 10, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_x3_moment") {
+      outvars.emplace_back("laser_x3_moment", 11, &(pm->pmb_pack->plaser->cell_data));
+    }
 
     // hydro (lab-frame) density
     if (variable.compare("hydro_u_d") == 0 ||

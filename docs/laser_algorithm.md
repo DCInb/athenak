@@ -2,9 +2,9 @@
 
 ## Supported model and task ordering
 
-The laser module is enabled by the presence of a `<laser>` block. Its initial model is
-Cartesian, Newtonian, ideal-gas, two-temperature MHD on a uniform grid. Each Runge--Kutta
-stage executes
+The laser module is enabled by the presence of a `<laser>` block. It supports Cartesian,
+Newtonian, ideal-gas, two-temperature MHD on uniform, statically refined, and adaptively
+refined meshes. Each Runge--Kutta stage executes
 
 ```text
 MHD finite-volume update
@@ -15,9 +15,10 @@ MHD finite-volume update
 -> ordinary MHD source, boundary, CT, and primitive tasks
 ```
 
-The medium is frozen during a ray trace. Refraction, momentum deposition, ray splitting,
-and frequency groups remain outside the straight-ray layer. Rays transfer directly
-between same-rank MeshBlocks. Across ranks, off-rank rays are compacted by destination
+The medium is frozen during a ray trace. `model=straight` selects DDA transport and
+`model=refractive` selects the Hamiltonian transport described below. Momentum
+deposition, ray splitting, and frequency groups are not implemented. Rays transfer
+directly between same-rank MeshBlocks. Across ranks, off-rank rays are compacted by destination
 into contiguous packets and advanced by a nonblocking composite task. Count exchange,
 packet receives/sends, and global completion are polled with `TaskStatus::incomplete`.
 `gpu_aware_mpi=true` passes device packet buffers directly to MPI; the default uses
@@ -35,6 +36,37 @@ oblique model uses `n_turn=n_c*cos(theta)^2`. The ray is reflected specularly ab
 local density-gradient normal, displaced by `reflection_offset_fraction` of a cell, and
 continues through the ordinary device queue. `max_reflections_per_ray` bounds trapping;
 any power stopped by that bound is reported as remaining rather than discarded.
+
+## Refractive transport
+
+The opt-in refractive model evolves the normalized wave vector
+`q=c*k/omega0` using `ell=c*t`:
+
+```text
+dx/dell = q
+dq/dell = -0.5*grad(ne/nc).
+```
+
+A second-order kick-drift-kick update uses centered grid gradients and a local linear
+density reconstruction. Its step is limited by `refractive_cell_fraction` times the
+smallest cell width, `refractive_curvature_fraction*|q|/|dq/dell|`, the nearest cell
+face, and `refractive_tau_max` per absorbing step. Refraction uses the same exact
+attenuation, electron-energy coupling, MeshBlock queues, MPI packets, and AMR leaf map
+as the straight tracer. It therefore must not be combined with the straight-tracer
+`critical_reflection` switch; a refractive ray turns continuously as `|q|` approaches
+zero.
+
+The runtime monitors the normalized dispersion invariant
+
+```text
+epsilon_omega = abs(ne/nc + |q|^2 - 1).
+```
+
+The maximum error over all rays and MPI ranks is printed as `dispersion` and is fatal
+above `dispersion_tolerance`. Path-weighted cell outputs provide the trajectory needed
+for regression and analysis: `laser_dir1..3`, `laser_dispersion_error`, and
+`laser_x1_moment..laser_x3_moment`. Divide any of these by `laser_path` for a cell-path
+average.
 
 ## Energy convention
 
@@ -105,6 +137,7 @@ used. They can be overridden by `length_scale_cgs`, `density_scale_cgs`,
 
 ```text
 <laser>
+model = straight
 deposition_target = electron
 electron_temperature_model = two_temperature
 absorption_model = constant
@@ -128,6 +161,10 @@ minimum_power_fraction = 1.0e-14
 conservation_tolerance = 1.0e-10
 periodic_transport = false
 report_diagnostics = true
+refractive_cell_fraction = 0.25
+refractive_curvature_fraction = 0.25
+refractive_tau_max = 0.25
+dispersion_tolerance = 1.0e-3
 
 beam0_power = 1.0
 beam0_wavelength = 1.0
@@ -155,7 +192,10 @@ The production structure-of-arrays layout contains position, direction, power, c
 MeshBlock GID, cell indices, and status for every ray. Two integer queues hold current
 and next active ray IDs; queue compaction uses `Kokkos::parallel_scan`. Optional cell
 output contains deposited power density, cumulative deposited energy density, number of
-traced segments, summed optical depth, and summed path length.
+traced segments, summed optical depth, summed path length, path-integrated direction,
+dispersion error, and segment-midpoint position. Ray MPI packets additionally preserve
+the normalized wave vector and maximum dispersion error so refractive paths are
+decomposition independent.
 
 ## References
 

@@ -28,6 +28,7 @@ namespace laser {
 
 enum class DepositionTarget {total, electron};
 enum class AbsorptionModel {constant, inverse_bremsstrahlung};
+enum class PropagationModel {straight, refractive};
 enum class RayStatus : int {inactive = -1, active = 0, escaped = 1, absorbed = 2,
                             off_rank = 3, remaining = 4, failed = 5};
 
@@ -54,7 +55,9 @@ struct LaserBlockInfo {
 struct LaserRayPacket {
   Real x, y, z;
   Real nx, ny, nz;
+  Real kx, ky, kz;
   Real power, path_length;
+  Real dispersion_error;
   int ray, gid, i, j, k;
   int segments, reflections;
 };
@@ -85,6 +88,7 @@ struct LaserDiagnostics {
   int transport_iterations = 0;
   int traced_segments = 0;
   Real total_path_length = 0.0;
+  Real max_dispersion_error = 0.0;
 };
 
 struct LaserTaskIDs {
@@ -100,6 +104,8 @@ struct LaserTaskIDs {
 
 class Laser {
  public:
+  static constexpr int ncell_data = 12;
+
   Laser(MeshBlockPack *ppack, ParameterInput *pin);
   ~Laser();
 
@@ -110,8 +116,9 @@ class Laser {
   TaskStatus ApplySource(Driver *pdrive, int stage);
   TaskStatus ClearBuffers(Driver *pdrive, int stage);
 
-  // Component 0: deposited power density; 1: cumulative deposited energy density;
-  // 2: segment count; 3: optical-depth sum; 4: ray path length.
+  // 0: power density; 1: cumulative energy density; 2: segment count; 3: tau;
+  // 4: path; 5-7: direction*path; 8: dispersion error*path;
+  // 9-11: segment-midpoint position*path.
   DvceArray5D<Real> cell_data;
   DvceArray5D<Real> coarse_cell_data;
 
@@ -131,6 +138,7 @@ class Laser {
   void RefreshGlobalBlockInfo();
   void InitializeRays(Real time);
   void TraceStraightRays(bool preserve_off_rank = false);
+  void TraceRefractiveRays(bool preserve_off_rank = false);
   void CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next);
   void PrepareOutgoingRays();
   void UnpackReceivedRays(int count);
@@ -144,6 +152,7 @@ class Laser {
   std::vector<BeamConfig> beams_;
   DepositionTarget deposition_target_;
   AbsorptionModel absorption_model_;
+  PropagationModel propagation_model_ = PropagationModel::straight;
 
   int nrays_ = 0;
   int electron_index_ = -1;
@@ -168,6 +177,10 @@ class Laser {
   bool gpu_aware_mpi_ = false;
   int max_reflections_per_ray_ = 8;
   Real reflection_offset_fraction_ = 1.0e-10;
+  Real refractive_cell_fraction_ = 0.25;
+  Real refractive_curvature_fraction_ = 0.25;
+  Real refractive_tau_max_ = 0.25;
+  Real dispersion_tolerance_ = 1.0e-3;
 
   DvceArray1D<Real> ray_x0_, ray_y0_, ray_z0_;
   DvceArray1D<Real> ray_nx0_, ray_ny0_, ray_nz0_;
@@ -176,6 +189,7 @@ class Laser {
   DvceArray1D<Real> ray_start_time_, ray_end_time_;
   DvceArray1D<int> ray_beam_, ray_segments_, ray_reflections_;
   DvceArray1D<Real> ray_path_length_;
+  DvceArray1D<Real> ray_kx_, ray_ky_, ray_kz_, ray_dispersion_error_;
   DvceArray1D<int> active_queue_a_, active_queue_b_;
   DvceArray1D<int> ray_destination_rank_;
   DvceArray1D<LaserBlockInfo> global_block_info_;

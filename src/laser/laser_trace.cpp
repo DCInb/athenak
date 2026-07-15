@@ -186,6 +186,8 @@ void Laser::InitializeRays(Real time) {
 
   auto x = ray_x; auto y = ray_y; auto z = ray_z;
   auto nx = ray_nx; auto ny = ray_ny; auto nz = ray_nz;
+  auto wave_x = ray_kx_; auto wave_y = ray_ky_; auto wave_z = ray_kz_;
+  auto dispersion_error = ray_dispersion_error_;
   auto power = ray_power;
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto status = ray_status;
@@ -198,12 +200,20 @@ void Laser::InitializeRays(Real time) {
   auto destination_rank = ray_destination_rank_;
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
   auto diag = device_diagnostics_;
+  auto counters = device_counters_;
+  auto primitive = pmy_pack_->pmhd->w0;
+  auto wavelength = ray_wavelength_;
+  bool refractive = propagation_model_ == PropagationModel::refractive;
+  Real number_scale = density_scale_cgs_*electron_number_per_gram_;
+  Real length_scale = length_scale_cgs_;
 
   Kokkos::parallel_for(
       "laser_initialize_rays", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
       KOKKOS_LAMBDA(int r) {
         x(r) = x0(r); y(r) = y0(r); z(r) = z0(r);
         nx(r) = nx0(r); ny(r) = ny0(r); nz(r) = nz0(r);
+        wave_x(r) = 0.0; wave_y(r) = 0.0; wave_z(r) = 0.0;
+        dispersion_error(r) = 0.0;
         power(r) = (time >= start(r) && time <= end(r)) ? power0(r) : 0.0;
         segments(r) = 0;
         reflections(r) = 0;
@@ -237,6 +247,22 @@ void Laser::InitializeRays(Real time) {
         if (three_d) {
           ck(r) = ActiveCellIndex(pz, sizes(m).x3min, sizes(m).dx3, ks, ke);
         }
+        Real wave_magnitude = 1.0;
+        if (refractive) {
+          Real critical_density = CriticalDensity(wavelength(r)*length_scale);
+          Real electron_density = number_scale*
+              fmax(primitive(m, IDN, ck(r), cj(r), ci(r)), 0.0);
+          Real normalized_density = electron_density/critical_density;
+          if (!(normalized_density >= 0.0 && normalized_density < 1.0)) {
+            status(r) = static_cast<int>(RayStatus::failed);
+            Kokkos::atomic_inc(&counters(3));
+            return;
+          }
+          wave_magnitude = sqrt(1.0-normalized_density);
+        }
+        wave_x(r) = wave_magnitude*nx(r);
+        wave_y(r) = wave_magnitude*ny(r);
+        wave_z(r) = wave_magnitude*nz(r);
         status(r) = static_cast<int>(RayStatus::active);
         queue_a(r) = r;
       });
@@ -465,6 +491,15 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               power(r) = outgoing;
               Kokkos::atomic_add(&data(m, 2, k, j, i), 1.0);
               Kokkos::atomic_add(&data(m, 4, k, j, i), ds);
+              Kokkos::atomic_add(&data(m, 5, k, j, i), nx(r)*ds);
+              Kokkos::atomic_add(&data(m, 6, k, j, i), ny(r)*ds);
+              Kokkos::atomic_add(&data(m, 7, k, j, i), nz(r)*ds);
+              Kokkos::atomic_add(
+                  &data(m, 9, k, j, i), (x(r)+0.5*nx(r)*ds)*ds);
+              Kokkos::atomic_add(
+                  &data(m, 10, k, j, i), (y(r)+0.5*ny(r)*ds)*ds);
+              Kokkos::atomic_add(
+                  &data(m, 11, k, j, i), (z(r)+0.5*nz(r)*ds)*ds);
               path(r) += ds;
               segments(r) += 1;
               x(r) += nx(r)*ds;
@@ -634,22 +669,349 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
 
 //----------------------------------------------------------------------------------------
 
+void Laser::TraceRefractiveRays(bool preserve_off_rank) {
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  int is = indcs.is, ie = indcs.ie;
+  int js = indcs.js, je = indcs.je;
+  int ks = indcs.ks, ke = indcs.ke;
+  int nmb = pmy_pack_->nmb_thispack;
+  int nmb_total = pmy_pack_->pmesh->nmb_total;
+  int first_gid = pmy_pack_->gids;
+  int my_rank = global_variable::my_rank;
+  bool multi_d = pmy_pack_->pmesh->multi_d;
+  bool three_d = pmy_pack_->pmesh->three_d;
+  auto sizes = pmy_pack_->pmb->mb_size.d_view;
+  auto gids = pmy_pack_->pmb->mb_gid.d_view;
+  auto global_blocks = global_block_info_;
+  RegionSize domain = pmy_pack_->pmesh->mesh_size;
+  Real machine_eps = std::numeric_limits<Real>::epsilon();
+  Real infinite = std::numeric_limits<Real>::max();
+
+  auto x = ray_x; auto y = ray_y; auto z = ray_z;
+  auto nx = ray_nx; auto ny = ray_ny; auto nz = ray_nz;
+  auto wave_x = ray_kx_; auto wave_y = ray_ky_; auto wave_z = ray_kz_;
+  auto dispersion_error = ray_dispersion_error_;
+  auto power = ray_power;
+  auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
+  auto status = ray_status; auto destination_rank = ray_destination_rank_;
+  auto segments = ray_segments_; auto path = ray_path_length_;
+  auto data = cell_data;
+  auto diag = device_diagnostics_; auto counters = device_counters_;
+  auto primitive = pmy_pack_->pmhd->w0;
+  auto constant_absorption = ray_constant_absorption_;
+  auto wavelength = ray_wavelength_;
+  auto zeff = ray_zeff_;
+  auto initial_power = ray_power0_;
+  bool periodic = periodic_transport_;
+  int absorption_mode = static_cast<int>(absorption_model_);
+  int inverse_bremsstrahlung =
+      static_cast<int>(AbsorptionModel::inverse_bremsstrahlung);
+  int electron_index = electron_index_;
+  Real gamma_minus_one = gamma_minus_one_;
+  Real electron_heat_capacity_fraction = electron_heat_capacity_fraction_;
+  Real electron_number_per_gram = electron_number_per_gram_;
+  Real density_scale_cgs = density_scale_cgs_;
+  Real temperature_scale_cgs = temperature_scale_cgs_;
+  Real length_scale_cgs = length_scale_cgs_;
+  Real minimum_power_fraction = minimum_power_fraction_;
+  Real cell_fraction = refractive_cell_fraction_;
+  Real curvature_fraction = refractive_curvature_fraction_;
+  Real tau_max = refractive_tau_max_;
+  int seg_per_launch = max_segments_per_launch_;
+
+  for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
+    DvceArray1D<int> current = (iteration % 2 == 0) ? active_queue_a_ : active_queue_b_;
+    DvceArray1D<int> next = (iteration % 2 == 0) ? active_queue_b_ : active_queue_a_;
+    Kokkos::parallel_for(
+        "laser_trace_refractive", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+        KOKKOS_LAMBDA(int queue_index) {
+          int r = current(queue_index);
+          if (r < 0 || status(r) != static_cast<int>(RayStatus::active)) return;
+
+          for (int segment = 0; segment < seg_per_launch; ++segment) {
+            if (status(r) != static_cast<int>(RayStatus::active)) break;
+            int m = gid(r)-first_gid;
+            if (m < 0 || m >= nmb) {
+              status(r) = static_cast<int>(RayStatus::failed);
+              Kokkos::atomic_inc(&counters(3));
+              break;
+            }
+            RegionSize size = sizes(m);
+            int i = ci(r), j = cj(r), k = ck(r);
+            Real scale = fmin(size.dx1, multi_d ? size.dx2 : size.dx1);
+            if (three_d) scale = fmin(scale, size.dx3);
+            Real tolerance = 128.0*machine_eps*fmax(scale, 1.0);
+
+            Real number_scale = density_scale_cgs*electron_number_per_gram;
+            Real critical_density =
+                CriticalDensity(wavelength(r)*length_scale_cgs);
+            Real grad_x = number_scale*
+                (primitive(m, IDN, k, j, i+1) -
+                 primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
+            Real grad_y = 0.0;
+            Real grad_z = 0.0;
+            if (multi_d) {
+              grad_y = number_scale*
+                  (primitive(m, IDN, k, j+1, i) -
+                   primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
+            }
+            if (three_d) {
+              grad_z = number_scale*
+                  (primitive(m, IDN, k+1, j, i) -
+                   primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
+            }
+            Real center_x = size.x1min + (i-is+0.5)*size.dx1;
+            Real center_y = size.x2min + (j-js+0.5)*size.dx2;
+            Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
+            Real electron_density = number_scale*primitive(m, IDN, k, j, i) +
+                                    grad_x*(x(r)-center_x);
+            if (multi_d) electron_density += grad_y*(y(r)-center_y);
+            if (three_d) electron_density += grad_z*(z(r)-center_z);
+            Real normalized_density = electron_density/critical_density;
+            Real normalized_grad_x = grad_x/critical_density;
+            Real normalized_grad_y = grad_y/critical_density;
+            Real normalized_grad_z = grad_z/critical_density;
+
+            Real qx = wave_x(r), qy = wave_y(r), qz = wave_z(r);
+            Real qnorm = sqrt(SQR(qx)+SQR(qy)+SQR(qz));
+            if (!Kokkos::isfinite(qnorm) || !Kokkos::isfinite(normalized_density)) {
+              status(r) = static_cast<int>(RayStatus::failed);
+              Kokkos::atomic_inc(&counters(3));
+              break;
+            }
+            Real local_dispersion = fabs(
+                SQR(qx)+SQR(qy)+SQR(qz)+normalized_density-1.0);
+            dispersion_error(r) = fmax(dispersion_error(r), local_dispersion);
+
+            Real coefficient = constant_absorption(r);
+            if (absorption_mode == inverse_bremsstrahlung) {
+              Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
+              Real electron_energy =
+                  fmax(primitive(m, electron_index, k, j, i), 0.0);
+              Real electron_temperature = gamma_minus_one*electron_energy/
+                  electron_heat_capacity_fraction*temperature_scale_cgs;
+              Real ne = density*density_scale_cgs*electron_number_per_gram;
+              Real wavelength_cgs = wavelength(r)*length_scale_cgs;
+              coefficient = InverseBremsstrahlungCoefficient(
+                  ne, electron_temperature, zeff(r), wavelength_cgs)*
+                  length_scale_cgs;
+            }
+            coefficient = fmax(coefficient, 0.0);
+
+            Real q_floor = sqrt(machine_eps);
+            Real speed = fmax(qnorm, q_floor);
+            Real step = cell_fraction*scale/speed;
+            Real force = 0.5*sqrt(SQR(normalized_grad_x)+
+                                  SQR(normalized_grad_y)+
+                                  SQR(normalized_grad_z));
+            if (force > 0.0) {
+              step = fmin(step, curvature_fraction*speed/force);
+            }
+            if (coefficient > 0.0) {
+              step = fmin(step, tau_max/(coefficient*speed));
+            }
+
+            // Re-evaluate the half-step wave vector after limiting the drift to the
+            // nearest cell face. Two passes account for the step-dependent half kick.
+            Real qhx = qx, qhy = qy, qhz = qz;
+            for (int pass = 0; pass < 2; ++pass) {
+              qhx = qx-0.25*step*normalized_grad_x;
+              qhy = qy-0.25*step*normalized_grad_y;
+              qhz = qz-0.25*step*normalized_grad_z;
+              Real face_step = infinite;
+              if (qhx > 0.0) {
+                Real face = size.x1min + (i-is+1)*size.dx1;
+                face_step = fmin(face_step, (face-x(r))/qhx);
+              } else if (qhx < 0.0) {
+                Real face = size.x1min + (i-is)*size.dx1;
+                face_step = fmin(face_step, (face-x(r))/qhx);
+              }
+              if (multi_d) {
+                if (qhy > 0.0) {
+                  Real face = size.x2min + (j-js+1)*size.dx2;
+                  face_step = fmin(face_step, (face-y(r))/qhy);
+                } else if (qhy < 0.0) {
+                  Real face = size.x2min + (j-js)*size.dx2;
+                  face_step = fmin(face_step, (face-y(r))/qhy);
+                }
+              }
+              if (three_d) {
+                if (qhz > 0.0) {
+                  Real face = size.x3min + (k-ks+1)*size.dx3;
+                  face_step = fmin(face_step, (face-z(r))/qhz);
+                } else if (qhz < 0.0) {
+                  Real face = size.x3min + (k-ks)*size.dx3;
+                  face_step = fmin(face_step, (face-z(r))/qhz);
+                }
+              }
+              if (face_step >= 0.0 && face_step < step) step = face_step;
+            }
+            if (!(step >= 0.0) || !Kokkos::isfinite(step)) {
+              status(r) = static_cast<int>(RayStatus::failed);
+              Kokkos::atomic_inc(&counters(3));
+              break;
+            }
+
+            Real new_qx = qx-0.5*step*normalized_grad_x;
+            Real new_qy = qy-0.5*step*normalized_grad_y;
+            Real new_qz = qz-0.5*step*normalized_grad_z;
+            Real dx = 0.5*step*(qx+new_qx);
+            Real dy = 0.5*step*(qy+new_qy);
+            Real dz = 0.5*step*(qz+new_qz);
+            Real ds = sqrt(SQR(dx)+SQR(dy)+SQR(dz));
+            wave_x(r) = new_qx;
+            wave_y(r) = new_qy;
+            wave_z(r) = new_qz;
+            Real new_qnorm = sqrt(SQR(new_qx)+SQR(new_qy)+SQR(new_qz));
+            if (new_qnorm > q_floor) {
+              nx(r) = new_qx/new_qnorm;
+              ny(r) = new_qy/new_qnorm;
+              nz(r) = new_qz/new_qnorm;
+            }
+            if (ds <= tolerance*machine_eps) continue;
+
+            Real deposited = fmin(
+                DepositedPower(power(r), coefficient, ds), power(r));
+            Real outgoing = fmax(power(r)-deposited, 0.0);
+            bool extinguished = false;
+            if (coefficient > 0.0 &&
+                outgoing <= minimum_power_fraction*initial_power(r)) {
+              deposited += outgoing;
+              outgoing = 0.0;
+              extinguished = true;
+            }
+            Real volume = size.dx1;
+            if (multi_d) volume *= size.dx2;
+            if (three_d) volume *= size.dx3;
+            if (deposited > 0.0) {
+              Kokkos::atomic_add(&data(m, 0, k, j, i), deposited/volume);
+              Kokkos::atomic_add(&diag(1), deposited);
+            }
+            Real optical_depth = coefficient*ds;
+            if (optical_depth > 0.0) {
+              Kokkos::atomic_add(&data(m, 3, k, j, i), optical_depth);
+            }
+            Real tangent_x = dx/ds;
+            Real tangent_y = dy/ds;
+            Real tangent_z = dz/ds;
+            Kokkos::atomic_add(&data(m, 2, k, j, i), 1.0);
+            Kokkos::atomic_add(&data(m, 4, k, j, i), ds);
+            Kokkos::atomic_add(&data(m, 5, k, j, i), tangent_x*ds);
+            Kokkos::atomic_add(&data(m, 6, k, j, i), tangent_y*ds);
+            Kokkos::atomic_add(&data(m, 7, k, j, i), tangent_z*ds);
+            Kokkos::atomic_add(&data(m, 8, k, j, i), local_dispersion*ds);
+            Kokkos::atomic_add(&data(m, 9, k, j, i), (x(r)+0.5*dx)*ds);
+            Kokkos::atomic_add(&data(m, 10, k, j, i), (y(r)+0.5*dy)*ds);
+            Kokkos::atomic_add(&data(m, 11, k, j, i), (z(r)+0.5*dz)*ds);
+            power(r) = outgoing;
+            path(r) += ds;
+            segments(r) += 1;
+            x(r) += dx;
+            y(r) += dy;
+            z(r) += dz;
+            if (extinguished) {
+              status(r) = static_cast<int>(RayStatus::absorbed);
+              break;
+            }
+
+            Real probe = 128.0*machine_eps*fmax(scale, 1.0);
+            Real px = x(r)+probe*nx(r);
+            Real py = y(r)+probe*ny(r);
+            Real pz = z(r)+probe*nz(r);
+            int new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+            if (new_m < 0 && periodic) {
+              if (x(r) <= domain.x1min+tolerance && nx(r) < 0.0) x(r) = domain.x1max;
+              if (x(r) >= domain.x1max-tolerance && nx(r) > 0.0) x(r) = domain.x1min;
+              if (multi_d) {
+                if (y(r) <= domain.x2min+tolerance && ny(r) < 0.0) y(r) = domain.x2max;
+                if (y(r) >= domain.x2max-tolerance && ny(r) > 0.0) y(r) = domain.x2min;
+              }
+              if (three_d) {
+                if (z(r) <= domain.x3min+tolerance && nz(r) < 0.0) z(r) = domain.x3max;
+                if (z(r) >= domain.x3max-tolerance && nz(r) > 0.0) z(r) = domain.x3min;
+              }
+              px = x(r)+probe*nx(r);
+              py = y(r)+probe*ny(r);
+              pz = z(r)+probe*nz(r);
+              new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+            }
+
+            if (new_m >= 0) {
+              gid(r) = gids(new_m);
+              ci(r) = ActiveCellIndex(px, sizes(new_m).x1min,
+                                      sizes(new_m).dx1, is, ie);
+              cj(r) = multi_d ? ActiveCellIndex(
+                  py, sizes(new_m).x2min, sizes(new_m).dx2, js, je) : js;
+              ck(r) = three_d ? ActiveCellIndex(
+                  pz, sizes(new_m).x3min, sizes(new_m).dx3, ks, ke) : ks;
+              continue;
+            }
+
+            int destination_gid = FindGlobalBlock(
+                global_blocks, nmb_total, px, py, pz, multi_d, three_d);
+            if (destination_gid >= 0 &&
+                global_blocks(destination_gid).rank != my_rank) {
+              LaserBlockInfo block = global_blocks(destination_gid);
+              gid(r) = block.gid;
+              destination_rank(r) = block.rank;
+              ci(r) = ActiveCellIndex(px, block.x1min, block.dx1, is, ie);
+              cj(r) = multi_d ? ActiveCellIndex(
+                  py, block.x2min, block.dx2, js, je) : js;
+              ck(r) = three_d ? ActiveCellIndex(
+                  pz, block.x3min, block.dx3, ks, ke) : ks;
+              status(r) = static_cast<int>(RayStatus::off_rank);
+              Kokkos::atomic_inc(&counters(2));
+            } else if (destination_gid < 0) {
+              status(r) = static_cast<int>(RayStatus::escaped);
+              Kokkos::atomic_add(&diag(2), power(r));
+            } else {
+              status(r) = static_cast<int>(RayStatus::failed);
+              Kokkos::atomic_inc(&counters(3));
+            }
+            break;
+          }
+        });
+    CompactActiveQueue(current, next);
+  }
+
+  auto remaining_status = ray_status;
+  auto remaining_power = ray_power;
+  Kokkos::parallel_for(
+      "laser_mark_refractive_remaining",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+      KOKKOS_LAMBDA(int r) {
+        if (remaining_status(r) == static_cast<int>(RayStatus::active) ||
+            (!preserve_off_rank &&
+             remaining_status(r) == static_cast<int>(RayStatus::off_rank))) {
+          remaining_status(r) = static_cast<int>(RayStatus::remaining);
+          Kokkos::atomic_add(&diag(3), remaining_power(r));
+          Kokkos::atomic_inc(&counters(0));
+        }
+      });
+}
+
+//----------------------------------------------------------------------------------------
+
 void Laser::FinalizeDiagnostics() {
   auto host_diag = Kokkos::create_mirror_view(device_diagnostics_);
   auto host_count = Kokkos::create_mirror_view(device_counters_);
   auto host_segments = Kokkos::create_mirror_view(ray_segments_);
   auto host_path = Kokkos::create_mirror_view(ray_path_length_);
+  auto host_dispersion = Kokkos::create_mirror_view(ray_dispersion_error_);
   Kokkos::deep_copy(host_diag, device_diagnostics_);
   Kokkos::deep_copy(host_count, device_counters_);
   Kokkos::deep_copy(host_segments, ray_segments_);
   Kokkos::deep_copy(host_path, ray_path_length_);
+  Kokkos::deep_copy(host_dispersion, ray_dispersion_error_);
   Real global_diag[4] = {host_diag(0), host_diag(1), host_diag(2), host_diag(3)};
   int global_count[4] = {host_count(0), host_count(1), host_count(2), host_count(3)};
   int segment_count = 0;
   Real path_length = 0.0;
+  Real max_dispersion_error = 0.0;
   for (int r = 0; r < nrays_; ++r) {
     segment_count += host_segments(r);
     path_length += host_path(r);
+    max_dispersion_error = fmax(max_dispersion_error, host_dispersion(r));
   }
 
 #if MPI_PARALLEL_ENABLED
@@ -658,6 +1020,7 @@ void Laser::FinalizeDiagnostics() {
     int reduced_count[4] = {0, 0, 0, 0};
     int reduced_segments = 0;
     Real reduced_path = 0.0;
+    Real reduced_dispersion_error = 0.0;
     int ierr = MPI_Allreduce(global_diag, reduced_diag, 4, MPI_ATHENA_REAL,
                              MPI_SUM, mpi_comm_);
     if (ierr == MPI_SUCCESS) {
@@ -672,6 +1035,10 @@ void Laser::FinalizeDiagnostics() {
       ierr = MPI_Allreduce(&path_length, &reduced_path, 1, MPI_ATHENA_REAL,
                            MPI_SUM, mpi_comm_);
     }
+    if (ierr == MPI_SUCCESS) {
+      ierr = MPI_Allreduce(&max_dispersion_error, &reduced_dispersion_error, 1,
+                           MPI_ATHENA_REAL, MPI_MAX, mpi_comm_);
+    }
     if (ierr != MPI_SUCCESS) {
       if (global_variable::my_rank == 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -685,6 +1052,7 @@ void Laser::FinalizeDiagnostics() {
     }
     segment_count = reduced_segments;
     path_length = reduced_path;
+    max_dispersion_error = reduced_dispersion_error;
   }
 #endif
 
@@ -698,6 +1066,7 @@ void Laser::FinalizeDiagnostics() {
   diagnostics_.transport_iterations = max_transport_iterations_*(mpi_wave_+1);
   diagnostics_.traced_segments = segment_count;
   diagnostics_.total_path_length = path_length;
+  diagnostics_.max_dispersion_error = max_dispersion_error;
   Real mismatch = fabs(diagnostics_.launched_power-diagnostics_.deposited_power-
                        diagnostics_.escaped_power-diagnostics_.remaining_power);
   diagnostics_.conservation_residual = (diagnostics_.launched_power > 0.0)
@@ -716,18 +1085,24 @@ void Laser::FinalizeDiagnostics() {
               << " reflected=" << diagnostics_.reflected_rays
               << " transfers=" << diagnostics_.off_rank_transfers
               << " segments=" << diagnostics_.traced_segments
-              << " path=" << diagnostics_.total_path_length << std::endl;
+              << " path=" << diagnostics_.total_path_length
+              << " dispersion=" << diagnostics_.max_dispersion_error << std::endl;
     std::cout.flags(old_flags);
     std::cout.precision(old_precision);
   }
+  bool dispersion_failed = propagation_model_ == PropagationModel::refractive &&
+      diagnostics_.max_dispersion_error > dispersion_tolerance_;
   if (global_count[3] > 0 ||
-      diagnostics_.conservation_residual > conservation_tolerance_) {
+      diagnostics_.conservation_residual > conservation_tolerance_ ||
+      dispersion_failed) {
     if (global_variable::my_rank == 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser transport failed for " << global_count[3]
                 << " rays; conservation residual="
                 << diagnostics_.conservation_residual << " exceeds tolerance="
-                << conservation_tolerance_ << std::endl;
+                << conservation_tolerance_ << "; dispersion error="
+                << diagnostics_.max_dispersion_error << " exceeds tolerance="
+                << dispersion_tolerance_ << std::endl;
     }
     std::exit(EXIT_FAILURE);
   }

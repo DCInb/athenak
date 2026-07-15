@@ -55,6 +55,8 @@ void Laser::PrepareOutgoingRays() {
   auto packets = mpi_send_packets_;
   auto x = ray_x; auto y = ray_y; auto z = ray_z;
   auto nx = ray_nx; auto ny = ray_ny; auto nz = ray_nz;
+  auto wave_x = ray_kx_; auto wave_y = ray_ky_; auto wave_z = ray_kz_;
+  auto dispersion_error = ray_dispersion_error_;
   auto power = ray_power; auto path = ray_path_length_;
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto segments = ray_segments_; auto reflections = ray_reflections_;
@@ -74,7 +76,9 @@ void Laser::PrepareOutgoingRays() {
         LaserRayPacket packet;
         packet.x = x(r); packet.y = y(r); packet.z = z(r);
         packet.nx = nx(r); packet.ny = ny(r); packet.nz = nz(r);
+        packet.kx = wave_x(r); packet.ky = wave_y(r); packet.kz = wave_z(r);
         packet.power = power(r); packet.path_length = path(r);
+        packet.dispersion_error = dispersion_error(r);
         packet.ray = r; packet.gid = gid(r);
         packet.i = ci(r); packet.j = cj(r); packet.k = ck(r);
         packet.segments = segments(r); packet.reflections = reflections(r);
@@ -100,6 +104,8 @@ void Laser::UnpackReceivedRays(int count) {
   auto packets = mpi_recv_packets_;
   auto x = ray_x; auto y = ray_y; auto z = ray_z;
   auto nx = ray_nx; auto ny = ray_ny; auto nz = ray_nz;
+  auto wave_x = ray_kx_; auto wave_y = ray_ky_; auto wave_z = ray_kz_;
+  auto dispersion_error = ray_dispersion_error_;
   auto power = ray_power; auto path = ray_path_length_;
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto status = ray_status; auto destination = ray_destination_rank_;
@@ -119,7 +125,9 @@ void Laser::UnpackReceivedRays(int count) {
         }
         x(r) = packet.x; y(r) = packet.y; z(r) = packet.z;
         nx(r) = packet.nx; ny(r) = packet.ny; nz(r) = packet.nz;
+        wave_x(r) = packet.kx; wave_y(r) = packet.ky; wave_z(r) = packet.kz;
         power(r) = packet.power; path(r) = packet.path_length;
+        dispersion_error(r) = packet.dispersion_error;
         gid(r) = packet.gid;
         ci(r) = packet.i; cj(r) = packet.j; ck(r) = packet.k;
         segments(r) = packet.segments;
@@ -136,14 +144,22 @@ void Laser::UnpackReceivedRays(int count) {
 
 TaskStatus Laser::AdvanceDistributedTransport() {
 #if !MPI_PARALLEL_ENABLED
-  TraceStraightRays();
+  if (propagation_model_ == PropagationModel::refractive) {
+    TraceRefractiveRays();
+  } else {
+    TraceStraightRays();
+  }
   FinalizeDiagnostics();
   transport_state_ = LaserTransportState::finished;
   return TaskStatus::complete;
 #else
   const int nranks = global_variable::nranks;
   if (nranks == 1) {
-    TraceStraightRays();
+    if (propagation_model_ == PropagationModel::refractive) {
+      TraceRefractiveRays();
+    } else {
+      TraceStraightRays();
+    }
     FinalizeDiagnostics();
     transport_state_ = LaserTransportState::finished;
     return TaskStatus::complete;
@@ -155,7 +171,11 @@ TaskStatus Laser::AdvanceDistributedTransport() {
   }
 
   if (transport_state_ == LaserTransportState::trace_local) {
-    TraceStraightRays(true);
+    if (propagation_model_ == PropagationModel::refractive) {
+      TraceRefractiveRays(true);
+    } else {
+      TraceStraightRays(true);
+    }
     transport_state_ = LaserTransportState::count_outgoing;
     return TaskStatus::incomplete;
   }

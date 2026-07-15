@@ -62,6 +62,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_beam_("laser-ray-beam", 1), ray_segments_("laser-ray-segments", 1),
     ray_reflections_("laser-ray-reflections", 1),
     ray_path_length_("laser-ray-path", 1),
+    ray_kx_("laser-ray-kx", 1), ray_ky_("laser-ray-ky", 1),
+    ray_kz_("laser-ray-kz", 1),
+    ray_dispersion_error_("laser-ray-dispersion-error", 1),
     active_queue_a_("laser-active-a", 1), active_queue_b_("laser-active-b", 1),
     ray_destination_rank_("laser-ray-destination-rank", 1),
     global_block_info_("laser-global-block-info", 1),
@@ -111,6 +114,15 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   } else {
     LaserInputError("absorption_model must be 'constant' or "
                     "'inverse_bremsstrahlung'");
+  }
+  std::string propagation =
+      pin->GetOrAddString("laser", "model", "straight");
+  if (propagation == "straight") {
+    propagation_model_ = PropagationModel::straight;
+  } else if (propagation == "refractive") {
+    propagation_model_ = PropagationModel::refractive;
+  } else {
+    LaserInputError("model must be 'straight' or 'refractive'");
   }
 
   std::string unit_system = pin->GetOrAddString("laser", "unit_system", "code");
@@ -164,6 +176,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "gpu_aware_mpi", false);
   critical_reflection_ = pin->GetOrAddBoolean(
       "laser", "critical_reflection",
+      propagation_model_ == PropagationModel::straight &&
       absorption_model_ == AbsorptionModel::inverse_bremsstrahlung);
   oblique_turning_ = pin->GetOrAddBoolean(
       "laser", "oblique_turning", true);
@@ -171,6 +184,14 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "max_reflections_per_ray", 8);
   reflection_offset_fraction_ = pin->GetOrAddReal(
       "laser", "reflection_offset_fraction", 1.0e-10);
+  refractive_cell_fraction_ = pin->GetOrAddReal(
+      "laser", "refractive_cell_fraction", 0.25);
+  refractive_curvature_fraction_ = pin->GetOrAddReal(
+      "laser", "refractive_curvature_fraction", 0.25);
+  refractive_tau_max_ = pin->GetOrAddReal(
+      "laser", "refractive_tau_max", 0.25);
+  dispersion_tolerance_ = pin->GetOrAddReal(
+      "laser", "dispersion_tolerance", 1.0e-3);
   if (max_segments_per_launch_ <= 0 || max_transport_iterations_ <= 0 ||
       max_mpi_waves_ <= 0) {
     LaserInputError("segment, transport iteration, and MPI wave limits must be positive");
@@ -191,6 +212,25 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
        !(electron_number_per_gram_ > 0.0))) {
     LaserInputError("critical reflection requires positive cgs density/length scales "
                     "and electron_number_per_gram");
+  }
+  if (propagation_model_ == PropagationModel::refractive) {
+    if (critical_reflection_) {
+      LaserInputError("refractive model must not also enable critical_reflection");
+    }
+    if (!(length_scale_cgs_ > 0.0) || !(density_scale_cgs_ > 0.0) ||
+        !(electron_number_per_gram_ > 0.0)) {
+      LaserInputError("refractive model requires positive cgs density/length scales "
+                      "and electron_number_per_gram");
+    }
+    if (!Finite(refractive_cell_fraction_) || refractive_cell_fraction_ <= 0.0 ||
+        refractive_cell_fraction_ > 1.0 ||
+        !Finite(refractive_curvature_fraction_) ||
+        refractive_curvature_fraction_ <= 0.0 ||
+        !Finite(refractive_tau_max_) || refractive_tau_max_ <= 0.0 ||
+        !Finite(dispersion_tolerance_) || dispersion_tolerance_ <= 0.0) {
+      LaserInputError("refractive step fractions, tau limit, and dispersion tolerance "
+                      "must be positive (cell fraction must not exceed one)");
+    }
   }
   if (periodic_transport_ && !ppack->pmesh->strictly_periodic) {
     LaserInputError("periodic_transport requires all mesh boundaries to be periodic");
@@ -271,14 +311,14 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   int ncells1 = indcs.nx1 + 2*indcs.ng;
   int ncells2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
-  Kokkos::realloc(cell_data, nmb, 5, ncells3, ncells2, ncells1);
+  Kokkos::realloc(cell_data, nmb, ncell_data, ncells3, ncells2, ncells1);
   Kokkos::realloc(cumulative_energy_start_, nmb, 1, ncells3, ncells2, ncells1);
   if (ppack->pmesh->multilevel) {
     int n_ccells1 = indcs.cnx1 + 2*indcs.ng;
     int n_ccells2 = (indcs.cnx2 > 1) ? indcs.cnx2 + 2*indcs.ng : 1;
     int n_ccells3 = (indcs.cnx3 > 1) ? indcs.cnx3 + 2*indcs.ng : 1;
     Kokkos::realloc(
-        coarse_cell_data, nmb, 5, n_ccells3, n_ccells2, n_ccells1);
+        coarse_cell_data, nmb, ncell_data, n_ccells3, n_ccells2, n_ccells1);
   }
 
   Kokkos::realloc(ray_x, nrays_); Kokkos::realloc(ray_y, nrays_);
@@ -296,6 +336,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_beam_, nrays_); Kokkos::realloc(ray_segments_, nrays_);
   Kokkos::realloc(ray_reflections_, nrays_);
   Kokkos::realloc(ray_path_length_, nrays_);
+  Kokkos::realloc(ray_kx_, nrays_); Kokkos::realloc(ray_ky_, nrays_);
+  Kokkos::realloc(ray_kz_, nrays_);
+  Kokkos::realloc(ray_dispersion_error_, nrays_);
   Kokkos::realloc(active_queue_a_, nrays_); Kokkos::realloc(active_queue_b_, nrays_);
   Kokkos::realloc(ray_destination_rank_, nrays_);
 

@@ -42,12 +42,11 @@ TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
   auto energy_start = cumulative_energy_start_;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int nmb1 = pmy_pack_->nmb_thispack - 1;
-  par_for("laser_clear_stage", DevExeSpace(), 0, nmb1, 0, 3,
+  par_for("laser_clear_stage", DevExeSpace(), 0, nmb1, 0, ncell_data-1,
           indcs.ks, indcs.ke, indcs.js, indcs.je, indcs.is, indcs.ie,
   KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
-    int component = (n == 0) ? 0 : n + 1;
-    data(m, component, k, j, i) = 0.0;
-    if (stage == 1 && n == 0) {
+    if (n != 1) data(m, n, k, j, i) = 0.0;
+    if (stage == 1 && n == 1) {
       energy_start(m, 0, k, j, i) = data(m, 1, k, j, i);
     }
   });
