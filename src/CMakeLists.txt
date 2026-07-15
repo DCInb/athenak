@@ -71,6 +71,11 @@ add_executable(
         ion-neutral/ion-neutral.cpp
         ion-neutral/ion-neutral_tasks.cpp
 
+        laser/laser.cpp
+        laser/laser_physics.cpp
+        laser/laser_tasks.cpp
+        laser/laser_trace.cpp
+
         mesh/build_tree.cpp
         mesh/load_balance.cpp
         mesh/mesh.cpp

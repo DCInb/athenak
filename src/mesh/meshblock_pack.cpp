@@ -29,6 +29,7 @@
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
 #include "particles/particles.hpp"
+#include "laser/laser.hpp"
 #include "units/units.hpp"
 #include "meshblock_pack.hpp"
 
@@ -52,6 +53,7 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
 // MeshBlock destructor
 
 MeshBlockPack::~MeshBlockPack() {
+  if (plaser != nullptr) {delete plaser;}
   if (ppart  != nullptr) {delete ppart;}
   if (pnr    != nullptr) {delete pnr;}
   if (pdyngr != nullptr) {delete pdyngr;}
@@ -237,6 +239,16 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
     nphysics++;
   } else {
     ppart = nullptr;
+  }
+
+  // (10) LASER ENERGY DEPOSITION
+  // Laser is an auxiliary 2T MHD module and inserts its stage tasks between the MHD
+  // dual-energy and ordinary source-term tasks.
+  if (pin->DoesBlockExist("laser")) {
+    plaser = new laser::Laser(this, pin);
+    plaser->AssembleTasks(tl_map);
+  } else {
+    plaser = nullptr;
   }
 
   // Check that at least ONE is requested and initialized.
