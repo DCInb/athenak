@@ -16,9 +16,15 @@ MHD finite-volume update
 ```
 
 The medium is frozen during a ray trace. Refraction, momentum deposition, ray splitting,
-frequency groups, and AMR are deliberately outside the first implementation layer. MPI
-migration and critical-surface reflection are added only after the straight-ray and
-absorption reference tests pass.
+frequency groups, and AMR remain outside the straight-ray layer. Rays transfer directly
+between same-rank MeshBlocks. MPI migration is a later gated layer.
+
+When `critical_reflection=true`, centered electron-density gradients linearly locate a
+turning point inside the current cell. Normal incidence uses `n_turn=n_c`; the reduced
+oblique model uses `n_turn=n_c*cos(theta)^2`. The ray is reflected specularly about the
+local density-gradient normal, displaced by `reflection_offset_fraction` of a cell, and
+continues through the ordinary device queue. `max_reflections_per_ray` bounds trapping;
+any power stopped by that bound is reported as remaining rather than discarded.
 
 ## Energy convention
 
@@ -99,6 +105,10 @@ density_scale_cgs = 1.0
 temperature_scale_cgs = 1.0
 power_scale_cgs = 1.0
 electron_number_per_gram = 1.0
+critical_reflection = false
+oblique_turning = true
+max_reflections_per_ray = 8
+reflection_offset_fraction = 1.0e-10
 nbeams = 1
 max_segments_per_launch = 16
 max_transport_iterations = 64

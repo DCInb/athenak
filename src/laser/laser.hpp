@@ -125,13 +125,17 @@ class Laser {
   bool use_cgs_ = false;
   bool periodic_transport_ = false;
   bool report_diagnostics_ = true;
+  bool critical_reflection_ = false;
+  bool oblique_turning_ = true;
+  int max_reflections_per_ray_ = 8;
+  Real reflection_offset_fraction_ = 1.0e-10;
 
   DvceArray1D<Real> ray_x0_, ray_y0_, ray_z0_;
   DvceArray1D<Real> ray_nx0_, ray_ny0_, ray_nz0_;
   DvceArray1D<Real> ray_power0_, ray_wavelength_;
   DvceArray1D<Real> ray_zeff_, ray_constant_absorption_;
   DvceArray1D<Real> ray_start_time_, ray_end_time_;
-  DvceArray1D<int> ray_beam_, ray_segments_;
+  DvceArray1D<int> ray_beam_, ray_segments_, ray_reflections_;
   DvceArray1D<Real> ray_path_length_;
   DvceArray1D<int> active_queue_a_, active_queue_b_;
   DvceArray1D<Real> device_diagnostics_;

@@ -168,7 +168,8 @@ void Laser::InitializeRays(Real time) {
   auto nx0 = ray_nx0_; auto ny0 = ray_ny0_; auto nz0 = ray_nz0_;
   auto power0 = ray_power0_;
   auto start = ray_start_time_; auto end = ray_end_time_;
-  auto segments = ray_segments_; auto path = ray_path_length_;
+  auto segments = ray_segments_; auto reflections = ray_reflections_;
+  auto path = ray_path_length_;
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
   auto diag = device_diagnostics_;
 
@@ -179,6 +180,7 @@ void Laser::InitializeRays(Real time) {
         nx(r) = nx0(r); ny(r) = ny0(r); nz(r) = nz0(r);
         power(r) = (time >= start(r) && time <= end(r)) ? power0(r) : 0.0;
         segments(r) = 0;
+        reflections(r) = 0;
         path(r) = 0.0;
         gid(r) = -1; ci(r) = is; cj(r) = js; ck(r) = ks;
         queue_a(r) = -1; queue_b(r) = -1;
@@ -249,6 +251,7 @@ void Laser::TraceStraightRays() {
   auto power = ray_power;
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto status = ray_status; auto segments = ray_segments_;
+  auto reflections = ray_reflections_;
   auto path = ray_path_length_; auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
   auto primitive = pmy_pack_->pmhd->w0;
@@ -268,6 +271,10 @@ void Laser::TraceStraightRays() {
   Real temperature_scale_cgs = temperature_scale_cgs_;
   Real length_scale_cgs = length_scale_cgs_;
   Real minimum_power_fraction = minimum_power_fraction_;
+  bool reflect_at_critical = critical_reflection_;
+  bool oblique_turning = oblique_turning_;
+  int max_reflections = max_reflections_per_ray_;
+  Real reflection_offset_fraction = reflection_offset_fraction_;
   int seg_per_launch = max_segments_per_launch_;
 
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
@@ -326,6 +333,63 @@ void Laser::TraceStraightRays() {
               break;
             }
             ds = fmax(ds, 0.0);
+            bool turning_point = false;
+            Real normal_x = 0.0, normal_y = 0.0, normal_z = 0.0;
+            if (reflect_at_critical) {
+              Real number_scale = density_scale_cgs*electron_number_per_gram;
+              Real grad_x = number_scale*
+                  (primitive(m, IDN, k, j, i+1) -
+                   primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
+              Real grad_y = 0.0;
+              Real grad_z = 0.0;
+              if (multi_d) {
+                grad_y = number_scale*
+                    (primitive(m, IDN, k, j+1, i) -
+                     primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
+              }
+              if (three_d) {
+                grad_z = number_scale*
+                    (primitive(m, IDN, k+1, j, i) -
+                     primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
+              }
+              Real grad_norm = sqrt(SQR(grad_x)+SQR(grad_y)+SQR(grad_z));
+              if (grad_norm > 0.0) {
+                normal_x = grad_x/grad_norm;
+                normal_y = grad_y/grad_norm;
+                normal_z = grad_z/grad_norm;
+                Real center_x = size.x1min + (i-is+0.5)*size.dx1;
+                Real center_y = size.x2min + (j-js+0.5)*size.dx2;
+                Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
+                Real electron_density =
+                    number_scale*primitive(m, IDN, k, j, i) +
+                    grad_x*(x(r)-center_x);
+                if (multi_d) electron_density += grad_y*(y(r)-center_y);
+                if (three_d) electron_density += grad_z*(z(r)-center_z);
+                Real approach = grad_x*nx(r) + grad_y*ny(r) + grad_z*nz(r);
+                Real cosine = fabs(nx(r)*normal_x + ny(r)*normal_y +
+                                   nz(r)*normal_z);
+                Real critical_density =
+                    CriticalDensity(wavelength(r)*length_scale_cgs);
+                Real turning_density = critical_density*
+                    (oblique_turning ? SQR(cosine) : 1.0);
+                Real density_tolerance = 128.0*machine_eps*
+                    fmax(turning_density, 1.0);
+                if (approach > 0.0 && turning_density > 0.0) {
+                  Real density_at_face = electron_density + approach*ds;
+                  if (electron_density >= turning_density-density_tolerance) {
+                    ds = 0.0;
+                    turning_point = true;
+                  } else if (density_at_face >=
+                             turning_density-density_tolerance) {
+                    ds = fmin(fmax((turning_density-electron_density)/approach,
+                                   0.0), ds);
+                    turning_point = true;
+                  }
+                }
+              }
+            }
+
+            bool extinguished = false;
             if (ds > 0.0) {
               Real coefficient = constant_absorption(r);
               if (absorption_mode == inverse_bremsstrahlung) {
@@ -346,7 +410,6 @@ void Laser::TraceStraightRays() {
               Real deposited = fmin(
                   DepositedPower(power(r), coefficient, ds), power(r));
               Real outgoing = fmax(power(r)-deposited, 0.0);
-              bool extinguished = false;
               if (coefficient > 0.0 &&
                   outgoing <= minimum_power_fraction*initial_power(r)) {
                 deposited += outgoing;
@@ -371,10 +434,52 @@ void Laser::TraceStraightRays() {
               x(r) += nx(r)*ds;
               y(r) += ny(r)*ds;
               z(r) += nz(r)*ds;
-              if (extinguished) {
-                status(r) = static_cast<int>(RayStatus::absorbed);
+            }
+            if (extinguished) {
+              status(r) = static_cast<int>(RayStatus::absorbed);
+              break;
+            }
+            if (turning_point) {
+              if (reflections(r) >= max_reflections) {
+                status(r) = static_cast<int>(RayStatus::remaining);
+                Kokkos::atomic_add(&diag(3), power(r));
+                Kokkos::atomic_inc(&counters(0));
                 break;
               }
+              Real normal_projection = nx(r)*normal_x + ny(r)*normal_y +
+                                       nz(r)*normal_z;
+              nx(r) -= 2.0*normal_projection*normal_x;
+              ny(r) -= 2.0*normal_projection*normal_y;
+              nz(r) -= 2.0*normal_projection*normal_z;
+              Real direction_norm = sqrt(SQR(nx(r))+SQR(ny(r))+SQR(nz(r)));
+              nx(r) /= direction_norm;
+              ny(r) /= direction_norm;
+              nz(r) /= direction_norm;
+              reflections(r) += 1;
+              Kokkos::atomic_inc(&counters(1));
+
+              Real offset = fmax(reflection_offset_fraction*scale,
+                                  128.0*machine_eps*fmax(scale, 1.0));
+              x(r) += offset*nx(r);
+              y(r) += offset*ny(r);
+              z(r) += offset*nz(r);
+              int reflected_m =
+                  FindLocalBlock(sizes, nmb, x(r), y(r), z(r), multi_d, three_d);
+              if (reflected_m < 0) {
+                status(r) = static_cast<int>(RayStatus::escaped);
+                Kokkos::atomic_add(&diag(2), power(r));
+                break;
+              }
+              gid(r) = gids(reflected_m);
+              ci(r) = ActiveCellIndex(x(r), sizes(reflected_m).x1min,
+                                      sizes(reflected_m).dx1, is, ie);
+              cj(r) = multi_d ? ActiveCellIndex(
+                  y(r), sizes(reflected_m).x2min,
+                  sizes(reflected_m).dx2, js, je) : js;
+              ck(r) = three_d ? ActiveCellIndex(
+                  z(r), sizes(reflected_m).x3min,
+                  sizes(reflected_m).dx3, ks, ke) : ks;
+              continue;
             }
 
             Real tie = 128.0*machine_eps*fmax(ds, 1.0);

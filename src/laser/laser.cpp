@@ -59,6 +59,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_constant_absorption_("laser-ray-constant-k", 1),
     ray_start_time_("laser-ray-start", 1), ray_end_time_("laser-ray-end", 1),
     ray_beam_("laser-ray-beam", 1), ray_segments_("laser-ray-segments", 1),
+    ray_reflections_("laser-ray-reflections", 1),
     ray_path_length_("laser-ray-path", 1),
     active_queue_a_("laser-active-a", 1), active_queue_b_("laser-active-b", 1),
     device_diagnostics_("laser-diagnostics", 4),
@@ -154,6 +155,15 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "periodic_transport", false);
   report_diagnostics_ = pin->GetOrAddBoolean(
       "laser", "report_diagnostics", true);
+  critical_reflection_ = pin->GetOrAddBoolean(
+      "laser", "critical_reflection",
+      absorption_model_ == AbsorptionModel::inverse_bremsstrahlung);
+  oblique_turning_ = pin->GetOrAddBoolean(
+      "laser", "oblique_turning", true);
+  max_reflections_per_ray_ = pin->GetOrAddInteger(
+      "laser", "max_reflections_per_ray", 8);
+  reflection_offset_fraction_ = pin->GetOrAddReal(
+      "laser", "reflection_offset_fraction", 1.0e-10);
   if (max_segments_per_launch_ <= 0 || max_transport_iterations_ <= 0) {
     LaserInputError("segment and transport iteration limits must be positive");
   }
@@ -163,6 +173,16 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (!Finite(conservation_tolerance_) || conservation_tolerance_ <= 0.0) {
     LaserInputError("conservation_tolerance must be positive");
+  }
+  if (max_reflections_per_ray_ < 0 ||
+      !Finite(reflection_offset_fraction_) || reflection_offset_fraction_ <= 0.0) {
+    LaserInputError("reflection limit must be non-negative and offset must be positive");
+  }
+  if (critical_reflection_ &&
+      (!(length_scale_cgs_ > 0.0) || !(density_scale_cgs_ > 0.0) ||
+       !(electron_number_per_gram_ > 0.0))) {
+    LaserInputError("critical reflection requires positive cgs density/length scales "
+                    "and electron_number_per_gram");
   }
   if (periodic_transport_ && !ppack->pmesh->strictly_periodic) {
     LaserInputError("periodic_transport requires all mesh boundaries to be periodic");
@@ -259,6 +279,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_zeff_, nrays_); Kokkos::realloc(ray_constant_absorption_, nrays_);
   Kokkos::realloc(ray_start_time_, nrays_); Kokkos::realloc(ray_end_time_, nrays_);
   Kokkos::realloc(ray_beam_, nrays_); Kokkos::realloc(ray_segments_, nrays_);
+  Kokkos::realloc(ray_reflections_, nrays_);
   Kokkos::realloc(ray_path_length_, nrays_);
   Kokkos::realloc(active_queue_a_, nrays_); Kokkos::realloc(active_queue_b_, nrays_);
 

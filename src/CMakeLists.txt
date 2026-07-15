@@ -126,6 +126,7 @@ add_executable(
         pgen/tests/gr_bondi.cpp
         pgen/tests/gr_monopole.cpp
         pgen/tests/linear_wave.cpp
+        pgen/tests/laser.cpp
         pgen/tests/lw_implode.cpp
         pgen/tests/orszag_tang.cpp
         pgen/tests/mri3d.cpp

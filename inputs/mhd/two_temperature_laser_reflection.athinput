@@ -1,7 +1,7 @@
-# Uniform two-temperature MHD slab heated by a straight laser ray.
+# Planar critical-density reflection test for the two-temperature laser module.
 
 <job>
-basename = two_temperature_laser
+basename = two_temperature_laser_reflection
 
 <mesh>
 nghost = 2
@@ -28,10 +28,10 @@ nx3 = 1
 
 <time>
 evolution = dynamic
-integrator = rk2
+integrator = rk1
 cfl_number = 0.3
 nlim = -1
-tlim = 1.0e-4
+tlim = 1.0e-8
 ndiag = 1
 
 <mhd>
@@ -49,14 +49,14 @@ t_ei = -1.0
 deposition_target = electron
 electron_temperature_model = two_temperature
 absorption_model = constant
-absorption_coefficient = 1.0
+absorption_coefficient = 0.0
 unit_system = code
 length_scale_cgs = 1.0
-density_scale_cgs = 1.0
+density_scale_cgs = 1.0e-13
 temperature_scale_cgs = 1.0
 power_scale_cgs = 1.0
-electron_number_per_gram = 1.0
-critical_reflection = false
+electron_number_per_gram = 1.0e26
+critical_reflection = true
 oblique_turning = true
 max_reflections_per_ray = 8
 reflection_offset_fraction = 1.0e-10
@@ -84,51 +84,15 @@ beam0_start_time = 0.0
 beam0_end_time = 1.0
 
 <problem>
-pgen_name = shock_tube
-shock_dir = 1
-xshock = 0.5
-dl = 1.0
-pl = 1.0
-ul = 0.0
-vl = 0.0
-wl = 0.0
-bxl = 0.0
-byl = 0.0
-bzl = 0.0
-dr = 1.0
-pr = 1.0
-ur = 0.0
-vr = 0.0
-wr = 0.0
-bxr = 0.0
-byr = 0.0
-bzr = 0.0
+pgen_name = laser_profile
+density_profile = linear
+rho0 = 0.5
+density_gradient = 1.0
+density_exponent = 1.0986122886681098
+temperature = 1.0
 
 <output1>
-file_type = hst
-data_format = %20.12e
-dt = 1.0e-4
-
-<output2>
-file_type = tab
-variable = mhd_2t
-id = two_temperature
-data_format = %20.12e
-dt = 1.0e-4
-slice_x2 = 0.0
-slice_x3 = 0.0
-
-<output3>
-file_type = tab
-variable = laser
-id = laser
-data_format = %20.12e
-dt = 1.0e-4
-slice_x2 = 0.0
-slice_x3 = 0.0
-
-<output4>
 file_type = bin
 variable = laser
 id = laser_full
-dt = -1.0
+dt = 1.0e-8

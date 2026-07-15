@@ -10,13 +10,14 @@ import test_suite.testutils as testutils
 
 
 input_file = "../../../inputs/mhd/two_temperature_laser.athinput"
+reflection_input = "../../../inputs/mhd/two_temperature_laser_reflection.athinput"
 SOURCE_DT = 1.0e-6
 
 
-def reference_cell_path(origin, direction, lower, upper):
+def reference_cell_path(origin, direction, lower, upper, max_distance=np.inf):
     """Return the ray length inside one Cartesian cell."""
     enter = 0.0
-    leave = np.inf
+    leave = max_distance
     for x0, ray_dir, cell_lo, cell_hi in zip(
             origin, direction, lower, upper):
         if abs(ray_dir) < 1.0e-15:
@@ -59,6 +60,30 @@ def reference_3d_paths(origin, direction, resolution):
                      -0.5 + k * spacing),
                     ((i + 1) * spacing, -0.5 + (j + 1) * spacing,
                      -0.5 + (k + 1) * spacing))
+    return result
+
+
+def reference_reflected_paths(origin, direction, dimensions, turn_x):
+    ray_dir = np.asarray(direction, dtype=float)
+    ray_dir /= np.linalg.norm(ray_dir)
+    turn_distance = (turn_x - origin[0]) / ray_dir[0]
+    turn_position = np.asarray(origin) + turn_distance * ray_dir
+    reflected_dir = ray_dir.copy()
+    reflected_dir[0] *= -1.0
+    nx, ny, nz = dimensions
+    dx, dy, dz = 1.0 / nx, 1.0 / ny, 1.0 / nz
+    result = np.zeros((nz, ny, nx))
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                lower = (i * dx, -0.5 + j * dy, -0.5 + k * dz)
+                upper = ((i + 1) * dx, -0.5 + (j + 1) * dy,
+                         -0.5 + (k + 1) * dz)
+                inbound = reference_cell_path(
+                    origin, ray_dir, lower, upper, turn_distance)
+                outbound = reference_cell_path(
+                    turn_position, reflected_dir, lower, upper)
+                result[k, j, i] = inbound + outbound
     return result
 
 
@@ -173,6 +198,25 @@ def run_full_transparent_case(basename, origin, direction, resolution=8):
     assert testutils.run(input_file, flags=flags), (
         f"{basename} full-grid laser transport run failed.")
     return read_laser_binary(f"bin/{basename}.laser_full.00001.bin")
+
+
+def run_reflection_case(basename, flags):
+    common = [
+        f"job/basename={basename}",
+        "time/tlim=1.0e-8",
+        "output1/dt=1.0e-8",
+    ]
+    assert testutils.run(reflection_input, flags=common + flags), (
+        f"{basename} critical-reflection run failed.")
+    return read_laser_binary(f"bin/{basename}.laser_full.00001.bin")
+
+
+def critical_density_cgs(wavelength):
+    electron_charge = 4.803204712570263e-10
+    electron_mass = 9.1093837015e-28
+    light_speed = 2.99792458e10
+    return (electron_mass * np.pi * light_speed**2
+            / (electron_charge**2 * wavelength**2))
 
 
 def sorted_tab(filename):
@@ -422,6 +466,98 @@ def test_run():
                            rtol=2.0e-11, atol=2.0e-13)
         assert np.allclose(laser["laser_tau"], coefficient_code * dx,
                            rtol=2.0e-11, atol=2.0e-13)
+
+        # A planar density ramp reflects at nc (normal incidence) or
+        # nc*cos(theta)^2 (the FLASH reduced oblique model).
+        density_to_electrons = 1.0e13
+        rho0 = 0.5
+        rho_turn_normal = critical_density_cgs(1.0) / density_to_electrons
+        turn_x_normal = rho_turn_normal - rho0
+        normal = run_reflection_case("laser_reflect_normal", [])
+        normal_path = assemble_binary_field(normal, "laser_path")
+        normal_expected = reference_reflected_paths(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+            (64, 1, 1), turn_x_normal)
+        assert np.allclose(normal_path, normal_expected,
+                           rtol=2.0e-6, atol=2.0e-7)
+        assert np.count_nonzero(
+            assemble_binary_field(normal, "laser_q")) == 0
+        assert np.isclose(np.sum(normal_path), 2.0 * turn_x_normal,
+                          rtol=2.0e-6, atol=2.0e-7)
+
+        oblique_direction = np.asarray((1.0, 0.2, 0.0))
+        unit_oblique = oblique_direction / np.linalg.norm(oblique_direction)
+        rho_turn_oblique = rho_turn_normal * unit_oblique[0]**2
+        turn_x_oblique = rho_turn_oblique - rho0
+        oblique = run_reflection_case("laser_reflect_oblique", [
+            "mesh/nx2=64", "meshblock/nx2=16",
+            "laser/beam0_origin_x2=-0.25",
+            "laser/beam0_direction_x1=1.0",
+            "laser/beam0_direction_x2=0.2",
+        ])
+        oblique_path = assemble_binary_field(oblique, "laser_path")
+        oblique_expected = reference_reflected_paths(
+            (0.0, -0.25, 0.0), oblique_direction,
+            (64, 64, 1), turn_x_oblique)
+        assert np.allclose(oblique_path, oblique_expected,
+                           rtol=2.0e-6, atol=2.0e-7)
+        expected_round_trip = 2.0 * turn_x_oblique / unit_oblique[0]
+        assert np.isclose(np.sum(oblique_path), expected_round_trip,
+                          rtol=2.0e-6, atol=2.0e-7)
+
+        # Constant absorption integrates over both the inbound and reflected paths.
+        reflection_absorption = 0.5
+        absorbed = run_reflection_case("laser_reflect_absorb", [
+            f"laser/absorption_coefficient={reflection_absorption}",
+        ])
+        absorbed_q = assemble_binary_field(absorbed, "laser_q")
+        deposited = np.sum(absorbed_q) / 64.0
+        expected_deposited = -np.expm1(
+            -reflection_absorption * 2.0 * turn_x_normal)
+        assert np.isclose(deposited, expected_deposited,
+                          rtol=2.0e-6, atol=2.0e-7)
+
+        # A smooth exponential profile converges to its analytic turning point.
+        exact_exponential_turn = (
+            np.log(rho_turn_normal / rho0) / np.log(3.0))
+        resolutions = np.asarray((16, 32, 64, 128))
+        errors = []
+        for resolution in resolutions:
+            reflected = run_reflection_case(
+                f"laser_reflect_converge_{resolution}", [
+                    f"mesh/nx1={resolution}",
+                    "meshblock/nx1=16",
+                    "problem/density_profile=exponential",
+                ])
+            path = assemble_binary_field(reflected, "laser_path")
+            errors.append(abs(0.5 * np.sum(path) - exact_exponential_turn))
+        convergence_order = np.polyfit(
+            np.log(1.0 / resolutions), np.log(errors), 1)[0]
+        assert convergence_order > 1.5
+        assert errors[-1] < errors[0] / 50.0
+
+        # Results are invariant to one, two, four, or eight same-rank MeshBlocks,
+        # including a critical surface placed exactly on the two-block boundary.
+        boundary_gradient = (rho_turn_normal - rho0) / 0.5
+        reference_fields = None
+        for block_size in (64, 32, 16, 8):
+            reflected = run_reflection_case(
+                f"laser_reflect_blocks_{block_size}", [
+                    f"meshblock/nx1={block_size}",
+                    f"problem/density_gradient={boundary_gradient}",
+                    "laser/absorption_coefficient=2.0",
+                ])
+            fields = {
+                name: assemble_binary_field(reflected, name)
+                for name in ("laser_q", "laser_ray_count", "laser_tau",
+                             "laser_path")
+            }
+            if reference_fields is None:
+                reference_fields = fields
+            else:
+                for name in fields:
+                    assert np.allclose(fields[name], reference_fields[name],
+                                       rtol=2.0e-6, atol=2.0e-7)
     except Exception as exc:
         pytest.fail(str(exc))
     finally:
