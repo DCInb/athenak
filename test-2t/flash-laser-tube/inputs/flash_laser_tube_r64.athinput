@@ -1,0 +1,143 @@
+# AthenaK adaptation of the FLASH Energy Deposition Cartesian unit test I.
+# FLASH User Guide 18.4.12; Kaiser, Phys. Rev. E 61, 895 (2000).
+# FLASH coordinates (x,y,z) map to AthenaK (x2,x1,x3).
+# The Hamiltonian group-speed parameterization places the transverse focus at x1=2*pi.
+
+<job>
+basename = flash_laser_tube_r64
+
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = 0.0
+x1max = 6.2831853071795864769
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 64
+x2min = -5.0
+x2max = 5.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 64
+x3min = -5.0
+x3max = 5.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<time>
+evolution = dynamic
+integrator = rk1
+cfl_number = 0.3
+nlim = -1
+tlim = 1.0e-12
+ndiag = 1
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+two_temperature = true
+dual_energy = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+
+<laser>
+model = refractive
+deposition_target = electron
+electron_temperature_model = two_temperature
+absorption_model = inverse_bremsstrahlung
+unit_system = cgs
+length_scale_cgs = 1.0
+density_scale_cgs = 1.1148542167786383e-3
+temperature_scale_cgs = 1.160451812155008e8
+power_scale_cgs = 1.0
+electron_number_per_gram = 1.0e24
+inverse_bremsstrahlung_coulomb_log = 1.0
+critical_reflection = false
+nbeams = 8
+max_segments_per_launch = 128
+max_transport_iterations = 128
+max_mpi_waves = 1024
+gpu_aware_mpi = false
+minimum_power_fraction = 1.0e-16
+conservation_tolerance = 1.0e-10
+periodic_transport = false
+report_diagnostics = true
+refractive_cell_fraction = 0.2
+refractive_curvature_fraction = 0.1
+refractive_tau_max = 0.02
+dispersion_tolerance = 5.0e-3
+
+beam0_power = 1.0
+beam0_wavelength = 1.0e-4
+beam0_nrays = 1
+beam0_origin_x2 = 3.0
+beam0_origin_x3 = 0.0
+
+beam1_power = 1.0
+beam1_wavelength = 1.0e-4
+beam1_nrays = 1
+beam1_origin_x2 = 0.0
+beam1_origin_x3 = 3.0
+
+beam2_power = 1.0
+beam2_wavelength = 1.0e-4
+beam2_nrays = 1
+beam2_origin_x2 = -3.0
+beam2_origin_x3 = 0.0
+
+beam3_power = 1.0
+beam3_wavelength = 1.0e-4
+beam3_nrays = 1
+beam3_origin_x2 = 0.0
+beam3_origin_x3 = -3.0
+
+beam4_power = 1.0
+beam4_wavelength = 1.0e-4
+beam4_nrays = 1
+beam4_origin_x2 = 2.1213203435596426
+beam4_origin_x3 = 2.1213203435596426
+
+beam5_power = 1.0
+beam5_wavelength = 1.0e-4
+beam5_nrays = 1
+beam5_origin_x2 = 2.1213203435596426
+beam5_origin_x3 = -2.1213203435596426
+
+beam6_power = 1.0
+beam6_wavelength = 1.0e-4
+beam6_nrays = 1
+beam6_origin_x2 = -2.1213203435596426
+beam6_origin_x3 = 2.1213203435596426
+
+beam7_power = 1.0
+beam7_wavelength = 1.0e-4
+beam7_nrays = 1
+beam7_origin_x2 = -2.1213203435596426
+beam7_origin_x3 = -2.1213203435596426
+
+<problem>
+pgen_name = laser_profile
+density_profile = linear
+rho0 = 0.5000813802083333
+density_gradient = 0.0
+density_gradient_x2 = 0.0
+density_gradient_x3 = 0.0
+density_curvature_x2 = 0.02
+density_curvature_x3 = 0.02
+temperature = 1.0
+temperature_reference_density = 0.5
+temperature_density_power = 0.6666666666666667
+
+<output1>
+file_type = bin
+variable = laser
+id = flash_tube
+dt = 1.0e-12

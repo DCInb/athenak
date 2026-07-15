@@ -111,7 +111,13 @@ endif()
 
 # add subdirectories for source code and include files
 add_subdirectory(src)
-add_subdirectory(kokkos)
+if (EXISTS ${CMAKE_SOURCE_DIR}/kokkos/CMakeLists.txt)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/kokkos ${CMAKE_BINARY_DIR}/kokkos-build)
+elseif (EXISTS ${CMAKE_SOURCE_DIR}/../athenak/kokkos/CMakeLists.txt)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/../athenak/kokkos ${CMAKE_BINARY_DIR}/kokkos-build)
+else()
+  message(FATAL_ERROR "Unable to locate Kokkos source directory.")
+endif()
 include_directories(${Kokkos_INCLUDE_DIRS_RET})
 
 target_link_libraries(athena PUBLIC Kokkos::kokkos)

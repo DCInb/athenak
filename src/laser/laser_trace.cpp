@@ -249,9 +249,38 @@ void Laser::InitializeRays(Real time) {
         }
         Real wave_magnitude = 1.0;
         if (refractive) {
+          int ii = ci(r), jj = cj(r), kk = ck(r);
+          Real center_x = sizes(m).x1min + (ii-is+0.5)*sizes(m).dx1;
+          Real center_y = sizes(m).x2min + (jj-js+0.5)*sizes(m).dx2;
+          Real center_z = sizes(m).x3min + (kk-ks+0.5)*sizes(m).dx3;
+          Real offset_x = px-center_x;
+          Real offset_y = py-center_y;
+          Real offset_z = pz-center_z;
+          Real density = primitive(m, IDN, kk, jj, ii);
+          Real grad_x = (primitive(m, IDN, kk, jj, ii+1) -
+                         primitive(m, IDN, kk, jj, ii-1))/(2.0*sizes(m).dx1);
+          Real hess_x = (primitive(m, IDN, kk, jj, ii+1) - 2.0*density +
+                         primitive(m, IDN, kk, jj, ii-1))/SQR(sizes(m).dx1);
+          Real reconstructed_density =
+              density + grad_x*offset_x + 0.5*hess_x*SQR(offset_x);
+          if (multi_d) {
+            Real grad_y = (primitive(m, IDN, kk, jj+1, ii) -
+                           primitive(m, IDN, kk, jj-1, ii))/(2.0*sizes(m).dx2);
+            Real hess_y = (primitive(m, IDN, kk, jj+1, ii) - 2.0*density +
+                           primitive(m, IDN, kk, jj-1, ii))/SQR(sizes(m).dx2);
+            reconstructed_density +=
+                grad_y*offset_y + 0.5*hess_y*SQR(offset_y);
+          }
+          if (three_d) {
+            Real grad_z = (primitive(m, IDN, kk+1, jj, ii) -
+                           primitive(m, IDN, kk-1, jj, ii))/(2.0*sizes(m).dx3);
+            Real hess_z = (primitive(m, IDN, kk+1, jj, ii) - 2.0*density +
+                           primitive(m, IDN, kk-1, jj, ii))/SQR(sizes(m).dx3);
+            reconstructed_density +=
+                grad_z*offset_z + 0.5*hess_z*SQR(offset_z);
+          }
           Real critical_density = CriticalDensity(wavelength(r)*length_scale);
-          Real electron_density = number_scale*
-              fmax(primitive(m, IDN, ck(r), cj(r), ci(r)), 0.0);
+          Real electron_density = number_scale*fmax(reconstructed_density, 0.0);
           Real normalized_density = electron_density/critical_density;
           if (!(normalized_density >= 0.0 && normalized_density < 1.0)) {
             status(r) = static_cast<int>(RayStatus::failed);
@@ -332,6 +361,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   Real density_scale_cgs = density_scale_cgs_;
   Real temperature_scale_cgs = temperature_scale_cgs_;
   Real length_scale_cgs = length_scale_cgs_;
+  Real fixed_coulomb_log = inverse_bremsstrahlung_coulomb_log_;
   Real minimum_power_fraction = minimum_power_fraction_;
   bool reflect_at_critical = critical_reflection_;
   bool oblique_turning = oblique_turning_;
@@ -464,8 +494,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                     electron_number_per_gram;
                 Real wavelength_cgs = wavelength(r)*length_scale_cgs;
                 coefficient = InverseBremsstrahlungCoefficient(
-                    electron_density, electron_temperature, zeff(r), wavelength_cgs)*
-                    length_scale_cgs;
+                    electron_density, electron_temperature, zeff(r), wavelength_cgs,
+                    fixed_coulomb_log)*length_scale_cgs;
               }
               coefficient = fmax(coefficient, 0.0);
               Real optical_depth = coefficient*ds;
@@ -713,6 +743,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   Real density_scale_cgs = density_scale_cgs_;
   Real temperature_scale_cgs = temperature_scale_cgs_;
   Real length_scale_cgs = length_scale_cgs_;
+  Real fixed_coulomb_log = inverse_bremsstrahlung_coulomb_log_;
   Real minimum_power_fraction = minimum_power_fraction_;
   Real cell_fraction = refractive_cell_fraction_;
   Real curvature_fraction = refractive_curvature_fraction_;
@@ -745,32 +776,54 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             Real number_scale = density_scale_cgs*electron_number_per_gram;
             Real critical_density =
                 CriticalDensity(wavelength(r)*length_scale_cgs);
+            Real density = primitive(m, IDN, k, j, i);
             Real grad_x = number_scale*
                 (primitive(m, IDN, k, j, i+1) -
                  primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
+            Real hess_x = number_scale*
+                (primitive(m, IDN, k, j, i+1) - 2.0*density +
+                 primitive(m, IDN, k, j, i-1))/SQR(size.dx1);
             Real grad_y = 0.0;
             Real grad_z = 0.0;
+            Real hess_y = 0.0;
+            Real hess_z = 0.0;
             if (multi_d) {
               grad_y = number_scale*
                   (primitive(m, IDN, k, j+1, i) -
                    primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
+              hess_y = number_scale*
+                  (primitive(m, IDN, k, j+1, i) - 2.0*density +
+                   primitive(m, IDN, k, j-1, i))/SQR(size.dx2);
             }
             if (three_d) {
               grad_z = number_scale*
                   (primitive(m, IDN, k+1, j, i) -
                    primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
+              hess_z = number_scale*
+                  (primitive(m, IDN, k+1, j, i) - 2.0*density +
+                   primitive(m, IDN, k-1, j, i))/SQR(size.dx3);
             }
             Real center_x = size.x1min + (i-is+0.5)*size.dx1;
             Real center_y = size.x2min + (j-js+0.5)*size.dx2;
             Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
-            Real electron_density = number_scale*primitive(m, IDN, k, j, i) +
-                                    grad_x*(x(r)-center_x);
-            if (multi_d) electron_density += grad_y*(y(r)-center_y);
-            if (three_d) electron_density += grad_z*(z(r)-center_z);
+            Real offset_x = x(r)-center_x;
+            Real offset_y = y(r)-center_y;
+            Real offset_z = z(r)-center_z;
+            Real electron_density = number_scale*density +
+                                    grad_x*offset_x +
+                                    0.5*hess_x*SQR(offset_x);
+            if (multi_d) {
+              electron_density += grad_y*offset_y +
+                                  0.5*hess_y*SQR(offset_y);
+            }
+            if (three_d) {
+              electron_density += grad_z*offset_z +
+                                  0.5*hess_z*SQR(offset_z);
+            }
             Real normalized_density = electron_density/critical_density;
-            Real normalized_grad_x = grad_x/critical_density;
-            Real normalized_grad_y = grad_y/critical_density;
-            Real normalized_grad_z = grad_z/critical_density;
+            Real normalized_grad_x = (grad_x+hess_x*offset_x)/critical_density;
+            Real normalized_grad_y = (grad_y+hess_y*offset_y)/critical_density;
+            Real normalized_grad_z = (grad_z+hess_z*offset_z)/critical_density;
 
             Real qx = wave_x(r), qy = wave_y(r), qz = wave_z(r);
             Real qnorm = sqrt(SQR(qx)+SQR(qy)+SQR(qz));
@@ -793,8 +846,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               Real ne = density*density_scale_cgs*electron_number_per_gram;
               Real wavelength_cgs = wavelength(r)*length_scale_cgs;
               coefficient = InverseBremsstrahlungCoefficient(
-                  ne, electron_temperature, zeff(r), wavelength_cgs)*
-                  length_scale_cgs;
+                  ne, electron_temperature, zeff(r), wavelength_cgs,
+                  fixed_coulomb_log)*length_scale_cgs;
             }
             coefficient = fmax(coefficient, 0.0);
 

@@ -148,6 +148,7 @@ density_scale_cgs = 1.0
 temperature_scale_cgs = 1.0
 power_scale_cgs = 1.0
 electron_number_per_gram = 1.0
+inverse_bremsstrahlung_coulomb_log = -1.0
 critical_reflection = false
 oblique_turning = true
 max_reflections_per_ray = 8
@@ -181,6 +182,10 @@ beam0_zeff = 1.0
 beam0_start_time = 0.0
 beam0_end_time = 1.0
 ```
+
+For inverse bremsstrahlung, a positive
+`inverse_bremsstrahlung_coulomb_log` fixes the Coulomb logarithm to that value.
+The default non-positive value evaluates the local FLASH Debye-number expression.
 
 Beam parameters repeat as `beam1_*`, `beam2_*`, and so on. Direction vectors are
 normalized during construction. `uniform` and `gaussian` profiles are normalized so the

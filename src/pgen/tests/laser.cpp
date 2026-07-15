@@ -64,9 +64,15 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
   Real density_curvature_x3 =
       pin->GetOrAddReal("problem", "density_curvature_x3", 0.0);
   Real temperature = pin->GetOrAddReal("problem", "temperature", 1.0);
-  if (!(rho0 > 0.0) || !(temperature > 0.0)) {
+  Real temperature_density_power =
+      pin->GetOrAddReal("problem", "temperature_density_power", 0.0);
+  Real temperature_reference_density =
+      pin->GetOrAddReal("problem", "temperature_reference_density", rho0);
+  if (!(rho0 > 0.0) || !(temperature > 0.0) ||
+      !(temperature_reference_density > 0.0)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "Laser profile density and temperature must be positive"
+              << std::endl
+              << "Laser profile density, temperature, and reference density must be positive"
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -104,11 +110,13 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
     density += density_gradient_x2*x2 + density_gradient_x3*x3 +
                density_curvature_x2*x2*x2 + density_curvature_x3*x3*x3;
     density = fmax(density, 1.0e-20);
+    Real local_temperature = temperature*
+        pow(density/temperature_reference_density, temperature_density_power);
     w(m, IDN, k, j, i) = density;
     w(m, IVX, k, j, i) = 0.0;
     w(m, IVY, k, j, i) = 0.0;
     w(m, IVZ, k, j, i) = 0.0;
-    w(m, IEN, k, j, i) = density*temperature/gm1;
+    w(m, IEN, k, j, i) = density*local_temperature/gm1;
   });
 
   pmbp->pmhd->peos->PrimToCons(

@@ -167,6 +167,7 @@ class Laser {
   Real temperature_scale_cgs_ = 1.0;
   Real length_scale_cgs_ = 1.0;
   Real power_scale_cgs_ = 1.0;
+  Real inverse_bremsstrahlung_coulomb_log_ = -1.0;
   Real minimum_power_fraction_ = 1.0e-14;
   Real conservation_tolerance_ = 1.0e-10;
   bool use_cgs_ = false;

@@ -38,7 +38,8 @@ Real CriticalDensity(Real wavelength) {
 
 KOKKOS_INLINE_FUNCTION
 Real InverseBremsstrahlungCoefficient(Real ne, Real te, Real zeff,
-                                      Real wavelength) {
+                                      Real wavelength,
+                                      Real fixed_coulomb_log = -1.0) {
   if (!(ne > 0.0) || !(te > 0.0) || !(zeff > 0.0) ||
       !(wavelength > 0.0)) {
     return 0.0;
@@ -54,7 +55,8 @@ Real InverseBremsstrahlungCoefficient(Real ne, Real te, Real zeff,
       3.0/(2.0*zeff*electron_charge_cgs*electron_charge_cgs*
            electron_charge_cgs)*
       sqrt(SQR(boltzmann_cgs)*boltzmann_cgs*te*te*te/(pi*ne));
-  const Real coulomb_log = fmax(log(fmax(coulomb_argument, 1.0)), 1.0);
+  const Real coulomb_log = (fixed_coulomb_log > 0.0)
+      ? fixed_coulomb_log : fmax(log(fmax(coulomb_argument, 1.0)), 1.0);
   const Real collision_frequency =
       (4.0/3.0)*sqrt(2.0*pi/electron_mass_cgs)*ne*zeff*
       SQR(SQR(electron_charge_cgs))*coulomb_log/
