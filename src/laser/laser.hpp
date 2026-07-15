@@ -51,6 +51,8 @@ struct LaserDiagnostics {
   int reflected_rays = 0;
   int off_rank_transfers = 0;
   int transport_iterations = 0;
+  int traced_segments = 0;
+  Real total_path_length = 0.0;
 };
 
 struct LaserTaskIDs {
@@ -93,6 +95,7 @@ class Laser {
   // Public because CUDA extended device lambdas cannot be instantiated from private
   // member functions on all supported toolchains.
   void BuildInitialRays();
+  void InitializeRays(Real time);
   void TraceStraightRays();
   void CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next);
   void FinalizeDiagnostics();
@@ -127,6 +130,7 @@ class Laser {
   DvceArray1D<Real> ray_nx0_, ray_ny0_, ray_nz0_;
   DvceArray1D<Real> ray_power0_, ray_wavelength_;
   DvceArray1D<Real> ray_zeff_, ray_constant_absorption_;
+  DvceArray1D<Real> ray_start_time_, ray_end_time_;
   DvceArray1D<int> ray_beam_, ray_segments_;
   DvceArray1D<Real> ray_path_length_;
   DvceArray1D<int> active_queue_a_, active_queue_b_;

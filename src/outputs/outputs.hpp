@@ -21,7 +21,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 165
+#define NOUTPUT_CHOICES 171
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -105,7 +105,10 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   "mhd_2t",   "mhd_eion",   "mhd_eele",   "mhd_tion",   "mhd_tele",
 
   // two-temperature matter plus multigroup thermal radiation (163-164)
-  "hydro_3t", "mhd_3t"
+  "hydro_3t", "mhd_3t",
+
+  // laser deposition and ray-path diagnostics (165-170)
+  "laser", "laser_q", "laser_energy", "laser_ray_count", "laser_tau", "laser_path"
 };
 
 

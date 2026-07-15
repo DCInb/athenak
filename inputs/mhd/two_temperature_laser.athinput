@@ -108,3 +108,12 @@ data_format = %20.12e
 dt = 1.0e-4
 slice_x2 = 0.0
 slice_x3 = 0.0
+
+<output3>
+file_type = tab
+variable = laser
+id = laser
+data_format = %20.12e
+dt = 1.0e-4
+slice_x2 = 0.0
+slice_x3 = 0.0

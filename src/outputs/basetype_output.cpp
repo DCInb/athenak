@@ -21,6 +21,7 @@
 #include "eos/eos.hpp"
 #include "globals.hpp"
 #include "hydro/hydro.hpp"
+#include "laser/laser.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
@@ -207,6 +208,13 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl;
     exit(EXIT_FAILURE);
   }
+  if ((ivar >= 165) && (ivar < 171) && pm->pmb_pack->plaser == nullptr) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Laser output requested in <output> block '"
+       << out_params.block_name << "' but no <laser> block is enabled."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
 
   // Now load STL vector of output variables
   outvars.clear();
@@ -223,6 +231,22 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
 
   for (const auto& variable : variables) {
+    if (variable == "laser" || variable == "laser_q") {
+      outvars.emplace_back("laser_q", 0, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_energy") {
+      outvars.emplace_back("laser_energy", 1, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_ray_count") {
+      outvars.emplace_back("laser_ray_count", 2, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_tau") {
+      outvars.emplace_back("laser_tau", 3, &(pm->pmb_pack->plaser->cell_data));
+    }
+    if (variable == "laser" || variable == "laser_path") {
+      outvars.emplace_back("laser_path", 4, &(pm->pmb_pack->plaser->cell_data));
+    }
+
     // hydro (lab-frame) density
     if (variable.compare("hydro_u_d") == 0 ||
         variable.compare("hydro_u") == 0 ||

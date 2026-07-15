@@ -14,6 +14,7 @@
 #include <string>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
 #include "laser/laser.hpp"
@@ -56,6 +57,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_power0_("laser-ray-power0", 1), ray_wavelength_("laser-ray-lambda", 1),
     ray_zeff_("laser-ray-zeff", 1),
     ray_constant_absorption_("laser-ray-constant-k", 1),
+    ray_start_time_("laser-ray-start", 1), ray_end_time_("laser-ray-end", 1),
     ray_beam_("laser-ray-beam", 1), ray_segments_("laser-ray-segments", 1),
     ray_path_length_("laser-ray-path", 1),
     active_queue_a_("laser-active-a", 1), active_queue_b_("laser-active-b", 1),
@@ -71,6 +73,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (ppack->pmesh->multilevel) {
     LaserInputError("initial straight-ray implementation requires a uniform grid");
+  }
+  if (global_variable::nranks > 1) {
+    LaserInputError("MPI ray migration is not enabled in the single-device layer");
   }
 
   electron_index_ = ppack->pmhd->ptwo_temp->iele;
@@ -249,6 +254,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_ny0_, nrays_); Kokkos::realloc(ray_nz0_, nrays_);
   Kokkos::realloc(ray_power0_, nrays_); Kokkos::realloc(ray_wavelength_, nrays_);
   Kokkos::realloc(ray_zeff_, nrays_); Kokkos::realloc(ray_constant_absorption_, nrays_);
+  Kokkos::realloc(ray_start_time_, nrays_); Kokkos::realloc(ray_end_time_, nrays_);
   Kokkos::realloc(ray_beam_, nrays_); Kokkos::realloc(ray_segments_, nrays_);
   Kokkos::realloc(ray_path_length_, nrays_);
   Kokkos::realloc(active_queue_a_, nrays_); Kokkos::realloc(active_queue_b_, nrays_);

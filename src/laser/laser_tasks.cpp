@@ -49,11 +49,13 @@ TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
   Kokkos::deep_copy(device_diagnostics_, 0.0);
   Kokkos::deep_copy(device_counters_, 0);
   diagnostics_ = LaserDiagnostics();
+  InitializeRays(pmy_pack_->pmesh->time);
   return TaskStatus::complete;
 }
 
 TaskStatus Laser::TraceAndDeposit(Driver *pdrive, int stage) {
-  // Straight-ray transport is supplied by laser_trace.cpp in the next gated layer.
+  TraceStraightRays();
+  FinalizeDiagnostics();
   return TaskStatus::complete;
 }
 
