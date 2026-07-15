@@ -62,6 +62,15 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_reflections_("laser-ray-reflections", 1),
     ray_path_length_("laser-ray-path", 1),
     active_queue_a_("laser-active-a", 1), active_queue_b_("laser-active-b", 1),
+    ray_destination_rank_("laser-ray-destination-rank", 1),
+    global_block_info_("laser-global-block-info", 1),
+    mpi_send_counts_("laser-mpi-send-counts", 1),
+    mpi_send_offsets_("laser-mpi-send-offsets", 1),
+    mpi_pack_cursors_("laser-mpi-pack-cursors", 1),
+    mpi_send_packets_("laser-mpi-send-packets", 1),
+    mpi_recv_packets_("laser-mpi-recv-packets", 1),
+    mpi_host_send_packets_("laser-mpi-host-send-packets", 1),
+    mpi_host_recv_packets_("laser-mpi-host-recv-packets", 1),
     device_diagnostics_("laser-diagnostics", 4),
     device_counters_("laser-counters", 4),
     cumulative_energy_start_("laser-energy-start", 1, 1, 1, 1, 1),
@@ -76,9 +85,6 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (ppack->pmesh->multilevel) {
     LaserInputError("initial straight-ray implementation requires a uniform grid");
-  }
-  if (global_variable::nranks > 1) {
-    LaserInputError("MPI ray migration is not enabled in the single-device layer");
   }
 
   electron_index_ = ppack->pmhd->ptwo_temp->iele;
@@ -147,6 +153,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "max_segments_per_launch", 16);
   max_transport_iterations_ = pin->GetOrAddInteger(
       "laser", "max_transport_iterations", 64);
+  max_mpi_waves_ = pin->GetOrAddInteger(
+      "laser", "max_mpi_waves", 1024);
   minimum_power_fraction_ = pin->GetOrAddReal(
       "laser", "minimum_power_fraction", 1.0e-14);
   conservation_tolerance_ = pin->GetOrAddReal(
@@ -155,6 +163,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "periodic_transport", false);
   report_diagnostics_ = pin->GetOrAddBoolean(
       "laser", "report_diagnostics", true);
+  gpu_aware_mpi_ = pin->GetOrAddBoolean(
+      "laser", "gpu_aware_mpi", false);
   critical_reflection_ = pin->GetOrAddBoolean(
       "laser", "critical_reflection",
       absorption_model_ == AbsorptionModel::inverse_bremsstrahlung);
@@ -164,8 +174,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "max_reflections_per_ray", 8);
   reflection_offset_fraction_ = pin->GetOrAddReal(
       "laser", "reflection_offset_fraction", 1.0e-10);
-  if (max_segments_per_launch_ <= 0 || max_transport_iterations_ <= 0) {
-    LaserInputError("segment and transport iteration limits must be positive");
+  if (max_segments_per_launch_ <= 0 || max_transport_iterations_ <= 0 ||
+      max_mpi_waves_ <= 0) {
+    LaserInputError("segment, transport iteration, and MPI wave limits must be positive");
   }
   if (!Finite(minimum_power_fraction_) || minimum_power_fraction_ < 0.0 ||
       minimum_power_fraction_ >= 1.0) {
@@ -282,10 +293,85 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_reflections_, nrays_);
   Kokkos::realloc(ray_path_length_, nrays_);
   Kokkos::realloc(active_queue_a_, nrays_); Kokkos::realloc(active_queue_b_, nrays_);
+  Kokkos::realloc(ray_destination_rank_, nrays_);
+
+  int nranks = global_variable::nranks;
+  int nmb_total = ppack->pmesh->nmb_total;
+  Kokkos::realloc(global_block_info_, nmb_total);
+  Kokkos::realloc(mpi_send_counts_, nranks);
+  Kokkos::realloc(mpi_send_offsets_, nranks);
+  Kokkos::realloc(mpi_pack_cursors_, nranks);
+  Kokkos::realloc(mpi_send_packets_, nrays_);
+  Kokkos::realloc(mpi_recv_packets_, nrays_);
+  Kokkos::realloc(mpi_host_send_packets_, nrays_);
+  Kokkos::realloc(mpi_host_recv_packets_, nrays_);
+  mpi_send_counts_host_.resize(nranks, 0);
+  mpi_recv_counts_host_.resize(nranks, 0);
+  mpi_send_offsets_host_.resize(nranks, 0);
+  mpi_recv_offsets_host_.resize(nranks, 0);
+  if (static_cast<std::size_t>(nrays_) >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())/
+      sizeof(LaserRayPacket)) {
+    LaserInputError("ray packet buffers exceed the MPI byte-count limit");
+  }
+
+  auto host_blocks = Kokkos::create_mirror_view(global_block_info_);
+  const RegionSize &domain = ppack->pmesh->mesh_size;
+  for (int gid = 0; gid < nmb_total; ++gid) {
+    const LogicalLocation &loc = ppack->pmesh->lloc_eachmb[gid];
+    int level_offset = loc.level - ppack->pmesh->root_level;
+    int blocks_x1 = ppack->pmesh->nmb_rootx1 << level_offset;
+    int blocks_x2 = ppack->pmesh->nmb_rootx2 << level_offset;
+    int blocks_x3 = ppack->pmesh->nmb_rootx3 << level_offset;
+    LaserBlockInfo info;
+    info.x1min = domain.x1min + (domain.x1max-domain.x1min)*loc.lx1/blocks_x1;
+    info.x1max = domain.x1min + (domain.x1max-domain.x1min)*(loc.lx1+1)/blocks_x1;
+    info.x2min = domain.x2min;
+    info.x2max = domain.x2max;
+    info.x3min = domain.x3min;
+    info.x3max = domain.x3max;
+    if (ppack->pmesh->multi_d) {
+      info.x2min = domain.x2min + (domain.x2max-domain.x2min)*loc.lx2/blocks_x2;
+      info.x2max = domain.x2min +
+                   (domain.x2max-domain.x2min)*(loc.lx2+1)/blocks_x2;
+    }
+    if (ppack->pmesh->three_d) {
+      info.x3min = domain.x3min + (domain.x3max-domain.x3min)*loc.lx3/blocks_x3;
+      info.x3max = domain.x3min +
+                   (domain.x3max-domain.x3min)*(loc.lx3+1)/blocks_x3;
+    }
+    info.dx1 = (info.x1max-info.x1min)/indcs.nx1;
+    info.dx2 = (info.x2max-info.x2min)/indcs.nx2;
+    info.dx3 = (info.x3max-info.x3min)/indcs.nx3;
+    info.gid = gid;
+    info.rank = ppack->pmesh->rank_eachmb[gid];
+    host_blocks(gid) = info;
+  }
+  Kokkos::deep_copy(global_block_info_, host_blocks);
+
+#if MPI_PARALLEL_ENABLED
+  mpi_send_requests_.reset(new MPI_Request[nranks]);
+  mpi_recv_requests_.reset(new MPI_Request[nranks]);
+  for (int rank = 0; rank < nranks; ++rank) {
+    mpi_send_requests_[rank] = MPI_REQUEST_NULL;
+    mpi_recv_requests_[rank] = MPI_REQUEST_NULL;
+  }
+  if (MPI_Comm_dup(MPI_COMM_WORLD, &mpi_comm_) != MPI_SUCCESS) {
+    LaserInputError("could not create the laser MPI communicator");
+  }
+#endif
 
   BuildInitialRays();
   Kokkos::deep_copy(cell_data, 0.0);
   Kokkos::deep_copy(cumulative_energy_start_, 0.0);
+}
+
+Laser::~Laser() {
+#if MPI_PARALLEL_ENABLED
+  int finalized = 0;
+  MPI_Finalized(&finalized);
+  if (!finalized && mpi_comm_ != MPI_COMM_NULL) MPI_Comm_free(&mpi_comm_);
+#endif
 }
 
 } // namespace laser

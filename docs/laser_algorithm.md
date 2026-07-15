@@ -17,7 +17,11 @@ MHD finite-volume update
 
 The medium is frozen during a ray trace. Refraction, momentum deposition, ray splitting,
 frequency groups, and AMR remain outside the straight-ray layer. Rays transfer directly
-between same-rank MeshBlocks. MPI migration is a later gated layer.
+between same-rank MeshBlocks. Across ranks, off-rank rays are compacted by destination
+into contiguous packets and advanced by a nonblocking composite task. Count exchange,
+packet receives/sends, and global completion are polled with `TaskStatus::incomplete`.
+`gpu_aware_mpi=true` passes device packet buffers directly to MPI; the default uses
+`Kokkos::SharedHostPinnedSpace` staging for MPI implementations without device support.
 
 When `critical_reflection=true`, centered electron-density gradients linearly locate a
 turning point inside the current cell. Normal incidence uses `n_turn=n_c`; the reduced
@@ -112,6 +116,8 @@ reflection_offset_fraction = 1.0e-10
 nbeams = 1
 max_segments_per_launch = 16
 max_transport_iterations = 64
+max_mpi_waves = 1024
+gpu_aware_mpi = false
 minimum_power_fraction = 1.0e-14
 conservation_tolerance = 1.0e-10
 periodic_transport = false

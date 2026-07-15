@@ -21,6 +21,10 @@
 #include "laser/laser_physics.hpp"
 #include "mhd/mhd.hpp"
 
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
+
 namespace {
 
 KOKKOS_INLINE_FUNCTION
@@ -37,6 +41,24 @@ int FindLocalBlock(const DvceArray1D<RegionSize> &sizes, int nmb,
                    Real x, Real y, Real z, bool multi_d, bool three_d) {
   for (int m = 0; m < nmb; ++m) {
     if (ContainsPoint(sizes(m), x, y, z, multi_d, three_d)) return m;
+  }
+  return -1;
+}
+
+KOKKOS_INLINE_FUNCTION
+bool ContainsPoint(const laser::LaserBlockInfo &block, Real x, Real y, Real z,
+                   bool multi_d, bool three_d) {
+  bool inside = (x >= block.x1min && x < block.x1max);
+  if (multi_d) inside = inside && (y >= block.x2min && y < block.x2max);
+  if (three_d) inside = inside && (z >= block.x3min && z < block.x3max);
+  return inside;
+}
+
+KOKKOS_INLINE_FUNCTION
+int FindGlobalBlock(const DvceArray1D<laser::LaserBlockInfo> &blocks, int nmb,
+                    Real x, Real y, Real z, bool multi_d, bool three_d) {
+  for (int gid = 0; gid < nmb; ++gid) {
+    if (ContainsPoint(blocks(gid), x, y, z, multi_d, three_d)) return gid;
   }
   return -1;
 }
@@ -148,8 +170,11 @@ void Laser::BuildInitialRays() {
 void Laser::InitializeRays(Real time) {
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
+  auto global_blocks = global_block_info_;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int nmb = pmy_pack_->nmb_thispack;
+  int nmb_total = pmy_pack_->pmesh->nmb_total;
+  int my_rank = global_variable::my_rank;
   bool multi_d = pmy_pack_->pmesh->multi_d;
   bool three_d = pmy_pack_->pmesh->three_d;
   int is = indcs.is, ie = indcs.ie;
@@ -170,6 +195,7 @@ void Laser::InitializeRays(Real time) {
   auto start = ray_start_time_; auto end = ray_end_time_;
   auto segments = ray_segments_; auto reflections = ray_reflections_;
   auto path = ray_path_length_;
+  auto destination_rank = ray_destination_rank_;
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
   auto diag = device_diagnostics_;
 
@@ -182,21 +208,27 @@ void Laser::InitializeRays(Real time) {
         segments(r) = 0;
         reflections(r) = 0;
         path(r) = 0.0;
+        destination_rank(r) = -1;
         gid(r) = -1; ci(r) = is; cj(r) = js; ck(r) = ks;
         queue_a(r) = -1; queue_b(r) = -1;
         status(r) = static_cast<int>(RayStatus::inactive);
         if (!(power(r) > 0.0)) return;
 
-        Kokkos::atomic_add(&diag(0), power(r));
         Real px = x(r) + probe_eps*nx(r);
         Real py = y(r) + probe_eps*ny(r);
         Real pz = z(r) + probe_eps*nz(r);
         int m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
         if (m < 0) {
-          status(r) = static_cast<int>(RayStatus::escaped);
-          Kokkos::atomic_add(&diag(2), power(r));
+          int global_m = FindGlobalBlock(
+              global_blocks, nmb_total, px, py, pz, multi_d, three_d);
+          if (global_m < 0 && my_rank == 0) {
+            status(r) = static_cast<int>(RayStatus::escaped);
+            Kokkos::atomic_add(&diag(0), power(r));
+            Kokkos::atomic_add(&diag(2), power(r));
+          }
           return;
         }
+        Kokkos::atomic_add(&diag(0), power(r));
         gid(r) = gids(m);
         ci(r) = ActiveCellIndex(px, sizes(m).x1min, sizes(m).dx1, is, ie);
         if (multi_d) {
@@ -231,17 +263,20 @@ void Laser::CompactActiveQueue(DvceArray1D<int> current,
 //----------------------------------------------------------------------------------------
 //! Straight Cartesian DDA. One device thread advances one ray through several cells.
 
-void Laser::TraceStraightRays() {
+void Laser::TraceStraightRays(bool preserve_off_rank) {
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
   int nmb = pmy_pack_->nmb_thispack;
+  int nmb_total = pmy_pack_->pmesh->nmb_total;
   int first_gid = pmy_pack_->gids;
+  int my_rank = global_variable::my_rank;
   bool multi_d = pmy_pack_->pmesh->multi_d;
   bool three_d = pmy_pack_->pmesh->three_d;
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
+  auto global_blocks = global_block_info_;
   RegionSize domain = pmy_pack_->pmesh->mesh_size;
   Real machine_eps = std::numeric_limits<Real>::epsilon();
   Real infinite = std::numeric_limits<Real>::max();
@@ -251,6 +286,7 @@ void Laser::TraceStraightRays() {
   auto power = ray_power;
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto status = ray_status; auto segments = ray_segments_;
+  auto destination_rank = ray_destination_rank_;
   auto reflections = ray_reflections_;
   auto path = ray_path_length_; auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
@@ -466,8 +502,27 @@ void Laser::TraceStraightRays() {
               int reflected_m =
                   FindLocalBlock(sizes, nmb, x(r), y(r), z(r), multi_d, three_d);
               if (reflected_m < 0) {
-                status(r) = static_cast<int>(RayStatus::escaped);
-                Kokkos::atomic_add(&diag(2), power(r));
+                int reflected_gid = FindGlobalBlock(
+                    global_blocks, nmb_total, x(r), y(r), z(r), multi_d, three_d);
+                if (reflected_gid >= 0 &&
+                    global_blocks(reflected_gid).rank != my_rank) {
+                  LaserBlockInfo block = global_blocks(reflected_gid);
+                  gid(r) = block.gid;
+                  destination_rank(r) = block.rank;
+                  ci(r) = ActiveCellIndex(x(r), block.x1min, block.dx1, is, ie);
+                  cj(r) = multi_d ? ActiveCellIndex(
+                      y(r), block.x2min, block.dx2, js, je) : js;
+                  ck(r) = three_d ? ActiveCellIndex(
+                      z(r), block.x3min, block.dx3, ks, ke) : ks;
+                  status(r) = static_cast<int>(RayStatus::off_rank);
+                  Kokkos::atomic_inc(&counters(2));
+                } else if (reflected_gid < 0) {
+                  status(r) = static_cast<int>(RayStatus::escaped);
+                  Kokkos::atomic_add(&diag(2), power(r));
+                } else {
+                  status(r) = static_cast<int>(RayStatus::failed);
+                  Kokkos::atomic_inc(&counters(3));
+                }
                 break;
               }
               gid(r) = gids(reflected_m);
@@ -523,8 +578,24 @@ void Laser::TraceStraightRays() {
               if (three_d) inside_global = inside_global &&
                   pz >= domain.x3min && pz < domain.x3max;
               if (inside_global) {
-                status(r) = static_cast<int>(RayStatus::off_rank);
-                Kokkos::atomic_inc(&counters(2));
+                int destination_gid = FindGlobalBlock(
+                    global_blocks, nmb_total, px, py, pz, multi_d, three_d);
+                if (destination_gid >= 0 &&
+                    global_blocks(destination_gid).rank != my_rank) {
+                  LaserBlockInfo block = global_blocks(destination_gid);
+                  gid(r) = block.gid;
+                  destination_rank(r) = block.rank;
+                  ci(r) = ActiveCellIndex(px, block.x1min, block.dx1, is, ie);
+                  cj(r) = multi_d ? ActiveCellIndex(
+                      py, block.x2min, block.dx2, js, je) : js;
+                  ck(r) = three_d ? ActiveCellIndex(
+                      pz, block.x3min, block.dx3, ks, ke) : ks;
+                  status(r) = static_cast<int>(RayStatus::off_rank);
+                  Kokkos::atomic_inc(&counters(2));
+                } else {
+                  status(r) = static_cast<int>(RayStatus::failed);
+                  Kokkos::atomic_inc(&counters(3));
+                }
               } else {
                 status(r) = static_cast<int>(RayStatus::escaped);
                 Kokkos::atomic_add(&diag(2), power(r));
@@ -552,7 +623,8 @@ void Laser::TraceStraightRays() {
       "laser_mark_remaining", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
       KOKKOS_LAMBDA(int r) {
         if (remaining_status(r) == static_cast<int>(RayStatus::active) ||
-            remaining_status(r) == static_cast<int>(RayStatus::off_rank)) {
+            (!preserve_off_rank &&
+             remaining_status(r) == static_cast<int>(RayStatus::off_rank))) {
           remaining_status(r) = static_cast<int>(RayStatus::remaining);
           Kokkos::atomic_add(&diag(3), remaining_power(r));
           Kokkos::atomic_inc(&counters(0));
@@ -571,18 +643,61 @@ void Laser::FinalizeDiagnostics() {
   Kokkos::deep_copy(host_count, device_counters_);
   Kokkos::deep_copy(host_segments, ray_segments_);
   Kokkos::deep_copy(host_path, ray_path_length_);
-  diagnostics_.launched_power = host_diag(0);
-  diagnostics_.deposited_power = host_diag(1);
-  diagnostics_.escaped_power = host_diag(2);
-  diagnostics_.remaining_power = host_diag(3);
-  diagnostics_.active_rays = host_count(0);
-  diagnostics_.reflected_rays = host_count(1);
-  diagnostics_.off_rank_transfers = host_count(2);
-  diagnostics_.transport_iterations = max_transport_iterations_;
+  Real global_diag[4] = {host_diag(0), host_diag(1), host_diag(2), host_diag(3)};
+  int global_count[4] = {host_count(0), host_count(1), host_count(2), host_count(3)};
+  int segment_count = 0;
+  Real path_length = 0.0;
   for (int r = 0; r < nrays_; ++r) {
-    diagnostics_.traced_segments += host_segments(r);
-    diagnostics_.total_path_length += host_path(r);
+    segment_count += host_segments(r);
+    path_length += host_path(r);
   }
+
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    Real reduced_diag[4] = {0.0, 0.0, 0.0, 0.0};
+    int reduced_count[4] = {0, 0, 0, 0};
+    int reduced_segments = 0;
+    Real reduced_path = 0.0;
+    int ierr = MPI_Allreduce(global_diag, reduced_diag, 4, MPI_ATHENA_REAL,
+                             MPI_SUM, mpi_comm_);
+    if (ierr == MPI_SUCCESS) {
+      ierr = MPI_Allreduce(global_count, reduced_count, 4, MPI_INT,
+                           MPI_SUM, mpi_comm_);
+    }
+    if (ierr == MPI_SUCCESS) {
+      ierr = MPI_Allreduce(&segment_count, &reduced_segments, 1, MPI_INT,
+                           MPI_SUM, mpi_comm_);
+    }
+    if (ierr == MPI_SUCCESS) {
+      ierr = MPI_Allreduce(&path_length, &reduced_path, 1, MPI_ATHENA_REAL,
+                           MPI_SUM, mpi_comm_);
+    }
+    if (ierr != MPI_SUCCESS) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Laser MPI diagnostics reduction failed" << std::endl;
+      }
+      std::exit(EXIT_FAILURE);
+    }
+    for (int n = 0; n < 4; ++n) {
+      global_diag[n] = reduced_diag[n];
+      global_count[n] = reduced_count[n];
+    }
+    segment_count = reduced_segments;
+    path_length = reduced_path;
+  }
+#endif
+
+  diagnostics_.launched_power = global_diag[0];
+  diagnostics_.deposited_power = global_diag[1];
+  diagnostics_.escaped_power = global_diag[2];
+  diagnostics_.remaining_power = global_diag[3];
+  diagnostics_.active_rays = global_count[0];
+  diagnostics_.reflected_rays = global_count[1];
+  diagnostics_.off_rank_transfers = global_count[2];
+  diagnostics_.transport_iterations = max_transport_iterations_*(mpi_wave_+1);
+  diagnostics_.traced_segments = segment_count;
+  diagnostics_.total_path_length = path_length;
   Real mismatch = fabs(diagnostics_.launched_power-diagnostics_.deposited_power-
                        diagnostics_.escaped_power-diagnostics_.remaining_power);
   diagnostics_.conservation_residual = (diagnostics_.launched_power > 0.0)
@@ -605,11 +720,11 @@ void Laser::FinalizeDiagnostics() {
     std::cout.flags(old_flags);
     std::cout.precision(old_precision);
   }
-  if (host_count(3) > 0 ||
+  if (global_count[3] > 0 ||
       diagnostics_.conservation_residual > conservation_tolerance_) {
     if (global_variable::my_rank == 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Laser transport failed for " << host_count(3)
+                << std::endl << "Laser transport failed for " << global_count[3]
                 << " rays; conservation residual="
                 << diagnostics_.conservation_residual << " exceeds tolerance="
                 << conservation_tolerance_ << std::endl;

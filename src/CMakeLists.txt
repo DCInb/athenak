@@ -72,6 +72,7 @@ add_executable(
         ion-neutral/ion-neutral_tasks.cpp
 
         laser/laser.cpp
+        laser/laser_mpi.cpp
         laser/laser_physics.cpp
         laser/laser_tasks.cpp
         laser/laser_trace.cpp
