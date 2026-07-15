@@ -138,6 +138,8 @@ def read_laser_binary(filename):
                 parameters[(block, key.strip())] = value.strip()
 
         result = {
+            "time": float(preheader["time"]),
+            "cycle": int(preheader["cycle"]),
             "Nx1": int(parameters[("<mesh>", "nx1")]),
             "Nx2": int(parameters[("<mesh>", "nx2")]),
             "Nx3": int(parameters[("<mesh>", "nx3")]),

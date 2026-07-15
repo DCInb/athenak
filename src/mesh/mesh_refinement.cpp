@@ -26,6 +26,7 @@
 #include "refinement_criteria.hpp"
 
 #include "hydro/hydro.hpp"
+#include "laser/laser.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
 #include "coordinates/adm.hpp"
@@ -109,6 +110,9 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
   }
   if (pm->pmb_pack->pz4c != nullptr) {
     ncc_tosend += (pm->pmb_pack->pz4c->nz4c);
+  }
+  if (pm->pmb_pack->plaser != nullptr) {
+    ncc_tosend += pm->pmb_pack->plaser->cell_data.extent_int(1);
   }
   int nmb = std::max((pm->pmb_pack->nmb_thispack), (pm->nmb_maxperrank));
   // number of cells per MB, including ghost zones
@@ -492,6 +496,13 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
 
+  // Laser component 1 is a persistent deposited-energy diagnostic. Keep its coarse
+  // representation current so it follows the same AMR redistribution as evolved CC data.
+  if (pm->pmb_pack->plaser != nullptr) {
+    RestrictCC(pm->pmb_pack->plaser->cell_data,
+               pm->pmb_pack->plaser->coarse_cell_data);
+  }
+
   // Step 4.
   // Allocate send/recv buffers for load balancing, post receives.
   // Pack send buffers for load blancing and send data
@@ -510,6 +521,7 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   radiation::Radiation* prad = pm->pmb_pack->prad;
   z4c::Z4c* pz4c = pm->pmb_pack->pz4c;
   adm::ADM* padm = pm->pmb_pack->padm;
+  laser::Laser* plaser = pm->pmb_pack->plaser;
   // derefine (if needed)
   if (ndel > 0) {
     if (phydro != nullptr) {
@@ -524,6 +536,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     }
     if (pz4c != nullptr) {
       DerefineCCSameRank(pz4c->u0, pz4c->coarse_u0);
+    }
+    if (plaser != nullptr) {
+      DerefineCCSameRank(plaser->cell_data, plaser->coarse_cell_data);
     }
   }
 
@@ -545,6 +560,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   } else if (padm != nullptr) {
     CopyCC(padm->u_adm);
   }
+  if (plaser != nullptr) {
+    CopyCC(plaser->cell_data);
+  }
   // Step 7.
   // Copy evolved physics variables for MBs flagged for refinement from source fine array
   // to target coarse array, when both are on same rank.
@@ -561,6 +579,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     }
     if (pz4c != nullptr) {
       CopyForRefinementCC(pz4c->u0, pz4c->coarse_u0);
+    }
+    if (plaser != nullptr) {
+      CopyForRefinementCC(plaser->cell_data, plaser->coarse_cell_data);
     }
   }
 
@@ -596,6 +617,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     }
     if (pz4c != nullptr) {
       RefineCC(new_to_old, pz4c->u0, pz4c->coarse_u0, true);
+    }
+    if (plaser != nullptr) {
+      RefineCC(new_to_old, plaser->cell_data, plaser->coarse_cell_data);
     }
   }
 

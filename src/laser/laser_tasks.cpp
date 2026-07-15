@@ -36,6 +36,7 @@ void Laser::AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) {
 }
 
 TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
+  RefreshGlobalBlockInfo();
   // Keep cumulative deposited energy (component 1), but clear per-stage diagnostics.
   auto data = cell_data;
   auto energy_start = cumulative_energy_start_;

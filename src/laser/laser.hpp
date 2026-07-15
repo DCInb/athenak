@@ -113,6 +113,7 @@ class Laser {
   // Component 0: deposited power density; 1: cumulative deposited energy density;
   // 2: segment count; 3: optical-depth sum; 4: ray path length.
   DvceArray5D<Real> cell_data;
+  DvceArray5D<Real> coarse_cell_data;
 
   // Structure-of-arrays ray state. All tracing kernels operate on these device Views
   // with one thread per active queue entry.
@@ -127,6 +128,7 @@ class Laser {
   // Public because CUDA extended device lambdas cannot be instantiated from private
   // member functions on all supported toolchains.
   void BuildInitialRays();
+  void RefreshGlobalBlockInfo();
   void InitializeRays(Real time);
   void TraceStraightRays(bool preserve_off_rank = false);
   void CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next);

@@ -16,12 +16,18 @@ MHD finite-volume update
 ```
 
 The medium is frozen during a ray trace. Refraction, momentum deposition, ray splitting,
-frequency groups, and AMR remain outside the straight-ray layer. Rays transfer directly
+and frequency groups remain outside the straight-ray layer. Rays transfer directly
 between same-rank MeshBlocks. Across ranks, off-rank rays are compacted by destination
 into contiguous packets and advanced by a nonblocking composite task. Count exchange,
 packet receives/sends, and global completion are polled with `TaskStatus::incomplete`.
 `gpu_aware_mpi=true` passes device packet buffers directly to MPI; the default uses
 `Kokkos::SharedHostPinnedSpace` staging for MPI implementations without device support.
+
+The global leaf-block map is rebuilt at every stage, including after adaptive refinement.
+At coarse/fine interfaces a ray is mapped by its forward-probed physical position into
+the containing leaf block; its power and direction are unchanged and it is not split.
+Laser cell diagnostics use AthenaK's ordinary CC restriction, prolongation, and AMR
+load-balance buffers so cumulative deposited energy follows a changing mesh.
 
 When `critical_reflection=true`, centered electron-density gradients linearly locate a
 turning point inside the current cell. Normal incidence uses `n_turn=n_c`; the reduced

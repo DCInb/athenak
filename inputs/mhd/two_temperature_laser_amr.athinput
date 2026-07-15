@@ -1,0 +1,117 @@
+# Static/adaptive mesh-refinement reference for the two-temperature laser module.
+
+<job>
+basename = two_temperature_laser_amr
+
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = 0.0
+x1max = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 1
+x2min = -0.5
+x2max = 0.5
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 1
+nx3 = 1
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+refinement_interval = 1
+max_nmb_per_rank = 32
+
+<refined_region1>
+level = 1
+x1min = 0.25
+x1max = 0.75
+
+<amr_criterion0>
+method = slope
+variable = mhd_w_d
+value_max = 1.0e-3
+
+<time>
+evolution = dynamic
+integrator = rk1
+cfl_number = 0.3
+nlim = -1
+tlim = 1.0e-8
+ndiag = 1
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+two_temperature = true
+dual_energy = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+
+<laser>
+deposition_target = electron
+electron_temperature_model = two_temperature
+absorption_model = constant
+absorption_coefficient = 0.0
+unit_system = code
+length_scale_cgs = 1.0
+density_scale_cgs = 1.0e-13
+temperature_scale_cgs = 1.0
+power_scale_cgs = 1.0
+electron_number_per_gram = 1.0e26
+critical_reflection = false
+oblique_turning = true
+max_reflections_per_ray = 8
+reflection_offset_fraction = 1.0e-10
+nbeams = 1
+max_segments_per_launch = 8
+max_transport_iterations = 32
+max_mpi_waves = 1024
+gpu_aware_mpi = false
+minimum_power_fraction = 1.0e-14
+conservation_tolerance = 1.0e-10
+periodic_transport = false
+report_diagnostics = true
+
+beam0_power = 1.0
+beam0_wavelength = 1.0
+beam0_nrays = 1
+beam0_origin_x1 = 0.0
+beam0_origin_x2 = 0.0
+beam0_origin_x3 = 0.0
+beam0_direction_x1 = 1.0
+beam0_direction_x2 = 0.0
+beam0_direction_x3 = 0.0
+beam0_radius = 0.0
+beam0_profile = uniform
+beam0_zeff = 1.0
+beam0_start_time = 0.0
+beam0_end_time = 1.0
+
+<problem>
+pgen_name = laser_profile
+density_profile = linear
+rho0 = 0.5
+density_gradient = 1.0
+density_exponent = 1.0986122886681098
+temperature = 1.0
+
+<output1>
+file_type = bin
+variable = laser
+id = laser_amr
+dt = 1.0e-8
+dcycle = 0

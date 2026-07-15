@@ -45,6 +45,7 @@ namespace laser {
 
 Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     cell_data("laser-cell-data", 1, 1, 1, 1, 1),
+    coarse_cell_data("laser-coarse-cell-data", 1, 1, 1, 1, 1),
     ray_x("laser-ray-x", 1), ray_y("laser-ray-y", 1),
     ray_z("laser-ray-z", 1), ray_nx("laser-ray-nx", 1),
     ray_ny("laser-ray-ny", 1), ray_nz("laser-ray-nz", 1),
@@ -83,10 +84,6 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       ppack->pcoord->is_general_relativistic) {
     LaserInputError("currently supports only Newtonian ideal-gas MHD");
   }
-  if (ppack->pmesh->multilevel) {
-    LaserInputError("initial straight-ray implementation requires a uniform grid");
-  }
-
   electron_index_ = ppack->pmhd->ptwo_temp->iele;
   gamma_minus_one_ = ppack->pmhd->peos->eos_data.gamma - 1.0;
   electron_heat_capacity_fraction_ =
@@ -276,6 +273,13 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
   Kokkos::realloc(cell_data, nmb, 5, ncells3, ncells2, ncells1);
   Kokkos::realloc(cumulative_energy_start_, nmb, 1, ncells3, ncells2, ncells1);
+  if (ppack->pmesh->multilevel) {
+    int n_ccells1 = indcs.cnx1 + 2*indcs.ng;
+    int n_ccells2 = (indcs.cnx2 > 1) ? indcs.cnx2 + 2*indcs.ng : 1;
+    int n_ccells3 = (indcs.cnx3 > 1) ? indcs.cnx3 + 2*indcs.ng : 1;
+    Kokkos::realloc(
+        coarse_cell_data, nmb, 5, n_ccells3, n_ccells2, n_ccells1);
+  }
 
   Kokkos::realloc(ray_x, nrays_); Kokkos::realloc(ray_y, nrays_);
   Kokkos::realloc(ray_z, nrays_); Kokkos::realloc(ray_nx, nrays_);
@@ -296,8 +300,6 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_destination_rank_, nrays_);
 
   int nranks = global_variable::nranks;
-  int nmb_total = ppack->pmesh->nmb_total;
-  Kokkos::realloc(global_block_info_, nmb_total);
   Kokkos::realloc(mpi_send_counts_, nranks);
   Kokkos::realloc(mpi_send_offsets_, nranks);
   Kokkos::realloc(mpi_pack_cursors_, nranks);
@@ -315,39 +317,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     LaserInputError("ray packet buffers exceed the MPI byte-count limit");
   }
 
-  auto host_blocks = Kokkos::create_mirror_view(global_block_info_);
-  const RegionSize &domain = ppack->pmesh->mesh_size;
-  for (int gid = 0; gid < nmb_total; ++gid) {
-    const LogicalLocation &loc = ppack->pmesh->lloc_eachmb[gid];
-    int level_offset = loc.level - ppack->pmesh->root_level;
-    int blocks_x1 = ppack->pmesh->nmb_rootx1 << level_offset;
-    int blocks_x2 = ppack->pmesh->nmb_rootx2 << level_offset;
-    int blocks_x3 = ppack->pmesh->nmb_rootx3 << level_offset;
-    LaserBlockInfo info;
-    info.x1min = domain.x1min + (domain.x1max-domain.x1min)*loc.lx1/blocks_x1;
-    info.x1max = domain.x1min + (domain.x1max-domain.x1min)*(loc.lx1+1)/blocks_x1;
-    info.x2min = domain.x2min;
-    info.x2max = domain.x2max;
-    info.x3min = domain.x3min;
-    info.x3max = domain.x3max;
-    if (ppack->pmesh->multi_d) {
-      info.x2min = domain.x2min + (domain.x2max-domain.x2min)*loc.lx2/blocks_x2;
-      info.x2max = domain.x2min +
-                   (domain.x2max-domain.x2min)*(loc.lx2+1)/blocks_x2;
-    }
-    if (ppack->pmesh->three_d) {
-      info.x3min = domain.x3min + (domain.x3max-domain.x3min)*loc.lx3/blocks_x3;
-      info.x3max = domain.x3min +
-                   (domain.x3max-domain.x3min)*(loc.lx3+1)/blocks_x3;
-    }
-    info.dx1 = (info.x1max-info.x1min)/indcs.nx1;
-    info.dx2 = (info.x2max-info.x2min)/indcs.nx2;
-    info.dx3 = (info.x3max-info.x3min)/indcs.nx3;
-    info.gid = gid;
-    info.rank = ppack->pmesh->rank_eachmb[gid];
-    host_blocks(gid) = info;
-  }
-  Kokkos::deep_copy(global_block_info_, host_blocks);
+  RefreshGlobalBlockInfo();
 
 #if MPI_PARALLEL_ENABLED
   mpi_send_requests_.reset(new MPI_Request[nranks]);
@@ -363,7 +333,51 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
 
   BuildInitialRays();
   Kokkos::deep_copy(cell_data, 0.0);
+  if (ppack->pmesh->multilevel) Kokkos::deep_copy(coarse_cell_data, 0.0);
   Kokkos::deep_copy(cumulative_energy_start_, 0.0);
+}
+
+void Laser::RefreshGlobalBlockInfo() {
+  Mesh *mesh = pmy_pack_->pmesh;
+  int nmb_total = mesh->nmb_total;
+  if (global_block_info_.extent_int(0) != nmb_total) {
+    Kokkos::realloc(global_block_info_, nmb_total);
+  }
+  auto host_blocks = Kokkos::create_mirror_view(global_block_info_);
+  const RegionSize &domain = mesh->mesh_size;
+  const RegionIndcs &indcs = mesh->mb_indcs;
+  for (int gid = 0; gid < nmb_total; ++gid) {
+    const LogicalLocation &loc = mesh->lloc_eachmb[gid];
+    int level_offset = loc.level - mesh->root_level;
+    int blocks_x1 = mesh->nmb_rootx1 << level_offset;
+    int blocks_x2 = mesh->nmb_rootx2 << level_offset;
+    int blocks_x3 = mesh->nmb_rootx3 << level_offset;
+    LaserBlockInfo info;
+    info.x1min = domain.x1min + (domain.x1max-domain.x1min)*loc.lx1/blocks_x1;
+    info.x1max = domain.x1min +
+                 (domain.x1max-domain.x1min)*(loc.lx1+1)/blocks_x1;
+    info.x2min = domain.x2min;
+    info.x2max = domain.x2max;
+    info.x3min = domain.x3min;
+    info.x3max = domain.x3max;
+    if (mesh->multi_d) {
+      info.x2min = domain.x2min + (domain.x2max-domain.x2min)*loc.lx2/blocks_x2;
+      info.x2max = domain.x2min +
+                   (domain.x2max-domain.x2min)*(loc.lx2+1)/blocks_x2;
+    }
+    if (mesh->three_d) {
+      info.x3min = domain.x3min + (domain.x3max-domain.x3min)*loc.lx3/blocks_x3;
+      info.x3max = domain.x3min +
+                   (domain.x3max-domain.x3min)*(loc.lx3+1)/blocks_x3;
+    }
+    info.dx1 = (info.x1max-info.x1min)/indcs.nx1;
+    info.dx2 = (info.x2max-info.x2min)/indcs.nx2;
+    info.dx3 = (info.x3max-info.x3min)/indcs.nx3;
+    info.gid = gid;
+    info.rank = mesh->rank_eachmb[gid];
+    host_blocks(gid) = info;
+  }
+  Kokkos::deep_copy(global_block_info_, host_blocks);
 }
 
 Laser::~Laser() {
