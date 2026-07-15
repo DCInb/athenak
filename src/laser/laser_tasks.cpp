@@ -38,6 +38,7 @@ void Laser::AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) {
 TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
   // Keep cumulative deposited energy (component 1), but clear per-stage diagnostics.
   auto data = cell_data;
+  auto energy_start = cumulative_energy_start_;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int nmb1 = pmy_pack_->nmb_thispack - 1;
   par_for("laser_clear_stage", DevExeSpace(), 0, nmb1, 0, 3,
@@ -45,6 +46,9 @@ TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
   KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
     int component = (n == 0) ? 0 : n + 1;
     data(m, component, k, j, i) = 0.0;
+    if (stage == 1 && n == 0) {
+      energy_start(m, 0, k, j, i) = data(m, 1, k, j, i);
+    }
   });
   Kokkos::deep_copy(device_diagnostics_, 0.0);
   Kokkos::deep_copy(device_counters_, 0);
@@ -60,7 +64,26 @@ TaskStatus Laser::TraceAndDeposit(Driver *pdrive, int stage) {
 }
 
 TaskStatus Laser::ApplySource(Driver *pdrive, int stage) {
-  // The skeleton intentionally performs no update; zero-power runs are exactly inert.
+  Real beta_dt = pdrive->beta[stage-1]*pmy_pack_->pmesh->dt;
+  Real gam0 = pdrive->gam0[stage-1];
+  Real gam1 = pdrive->gam1[stage-1];
+  int nmb1 = pmy_pack_->nmb_thispack - 1;
+  int iele = electron_index_;
+  bool heat_electrons = deposition_target_ == DepositionTarget::electron;
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  auto u0 = pmy_pack_->pmhd->u0;
+  auto data = cell_data;
+  auto energy_start = cumulative_energy_start_;
+  par_for("laser_apply_source", DevExeSpace(), 0, nmb1,
+          indcs.ks, indcs.ke, indcs.js, indcs.je, indcs.is, indcs.ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    Real deposited_energy = beta_dt*data(m, 0, k, j, i);
+    u0(m, IEN, k, j, i) += deposited_energy;
+    if (heat_electrons) u0(m, iele, k, j, i) += deposited_energy;
+    data(m, 1, k, j, i) =
+        gam0*data(m, 1, k, j, i) +
+        gam1*energy_start(m, 0, k, j, i) + deposited_energy;
+  });
   return TaskStatus::complete;
 }
 

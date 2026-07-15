@@ -62,7 +62,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_path_length_("laser-ray-path", 1),
     active_queue_a_("laser-active-a", 1), active_queue_b_("laser-active-b", 1),
     device_diagnostics_("laser-diagnostics", 4),
-    device_counters_("laser-counters", 4), pmy_pack_(ppack) {
+    device_counters_("laser-counters", 4),
+    cumulative_energy_start_("laser-energy-start", 1, 1, 1, 1, 1),
+    pmy_pack_(ppack) {
   if (ppack->pmhd == nullptr || ppack->pmhd->ptwo_temp == nullptr) {
     LaserInputError("requires <mhd>/two_temperature=true");
   }
@@ -242,6 +244,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   int ncells2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
   Kokkos::realloc(cell_data, nmb, 5, ncells3, ncells2, ncells1);
+  Kokkos::realloc(cumulative_energy_start_, nmb, 1, ncells3, ncells2, ncells1);
 
   Kokkos::realloc(ray_x, nrays_); Kokkos::realloc(ray_y, nrays_);
   Kokkos::realloc(ray_z, nrays_); Kokkos::realloc(ray_nx, nrays_);
@@ -261,6 +264,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
 
   BuildInitialRays();
   Kokkos::deep_copy(cell_data, 0.0);
+  Kokkos::deep_copy(cumulative_energy_start_, 0.0);
 }
 
 } // namespace laser

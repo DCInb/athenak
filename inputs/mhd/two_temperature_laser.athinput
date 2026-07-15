@@ -51,6 +51,11 @@ electron_temperature_model = two_temperature
 absorption_model = constant
 absorption_coefficient = 1.0
 unit_system = code
+length_scale_cgs = 1.0
+density_scale_cgs = 1.0
+temperature_scale_cgs = 1.0
+power_scale_cgs = 1.0
+electron_number_per_gram = 1.0
 nbeams = 1
 max_segments_per_launch = 16
 max_transport_iterations = 16
@@ -117,3 +122,9 @@ data_format = %20.12e
 dt = 1.0e-4
 slice_x2 = 0.0
 slice_x3 = 0.0
+
+<output4>
+file_type = bin
+variable = laser
+id = laser_full
+dt = -1.0

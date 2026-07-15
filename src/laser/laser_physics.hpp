@@ -70,7 +70,7 @@ KOKKOS_INLINE_FUNCTION
 Real DepositedPower(Real power, Real coefficient, Real path_length) {
   if (!(power > 0.0) || !(coefficient > 0.0) || !(path_length > 0.0)) return 0.0;
   const Real tau = coefficient*path_length;
-  return -power*expm1(-tau);
+  return -power*Kokkos::expm1(-tau);
 }
 
 } // namespace laser

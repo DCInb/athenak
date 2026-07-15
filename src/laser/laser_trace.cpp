@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -18,6 +19,7 @@
 #include "mesh/mesh.hpp"
 #include "laser/laser.hpp"
 #include "laser/laser_physics.hpp"
+#include "mhd/mhd.hpp"
 
 namespace {
 
@@ -249,7 +251,23 @@ void Laser::TraceStraightRays() {
   auto status = ray_status; auto segments = ray_segments_;
   auto path = ray_path_length_; auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
+  auto primitive = pmy_pack_->pmhd->w0;
+  auto constant_absorption = ray_constant_absorption_;
+  auto wavelength = ray_wavelength_;
+  auto zeff = ray_zeff_;
+  auto initial_power = ray_power0_;
   bool periodic = periodic_transport_;
+  int absorption_mode = static_cast<int>(absorption_model_);
+  int inverse_bremsstrahlung =
+      static_cast<int>(AbsorptionModel::inverse_bremsstrahlung);
+  int electron_index = electron_index_;
+  Real gamma_minus_one = gamma_minus_one_;
+  Real electron_heat_capacity_fraction = electron_heat_capacity_fraction_;
+  Real electron_number_per_gram = electron_number_per_gram_;
+  Real density_scale_cgs = density_scale_cgs_;
+  Real temperature_scale_cgs = temperature_scale_cgs_;
+  Real length_scale_cgs = length_scale_cgs_;
+  Real minimum_power_fraction = minimum_power_fraction_;
   int seg_per_launch = max_segments_per_launch_;
 
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
@@ -309,6 +327,43 @@ void Laser::TraceStraightRays() {
             }
             ds = fmax(ds, 0.0);
             if (ds > 0.0) {
+              Real coefficient = constant_absorption(r);
+              if (absorption_mode == inverse_bremsstrahlung) {
+                Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
+                Real electron_energy =
+                    fmax(primitive(m, electron_index, k, j, i), 0.0);
+                Real electron_temperature = gamma_minus_one*electron_energy/
+                    electron_heat_capacity_fraction*temperature_scale_cgs;
+                Real electron_density = density*density_scale_cgs*
+                    electron_number_per_gram;
+                Real wavelength_cgs = wavelength(r)*length_scale_cgs;
+                coefficient = InverseBremsstrahlungCoefficient(
+                    electron_density, electron_temperature, zeff(r), wavelength_cgs)*
+                    length_scale_cgs;
+              }
+              coefficient = fmax(coefficient, 0.0);
+              Real optical_depth = coefficient*ds;
+              Real deposited = fmin(
+                  DepositedPower(power(r), coefficient, ds), power(r));
+              Real outgoing = fmax(power(r)-deposited, 0.0);
+              bool extinguished = false;
+              if (coefficient > 0.0 &&
+                  outgoing <= minimum_power_fraction*initial_power(r)) {
+                deposited += outgoing;
+                outgoing = 0.0;
+                extinguished = true;
+              }
+              Real volume = size.dx1;
+              if (multi_d) volume *= size.dx2;
+              if (three_d) volume *= size.dx3;
+              if (deposited > 0.0) {
+                Kokkos::atomic_add(&data(m, 0, k, j, i), deposited/volume);
+                Kokkos::atomic_add(&diag(1), deposited);
+              }
+              if (optical_depth > 0.0) {
+                Kokkos::atomic_add(&data(m, 3, k, j, i), optical_depth);
+              }
+              power(r) = outgoing;
               Kokkos::atomic_add(&data(m, 2, k, j, i), 1.0);
               Kokkos::atomic_add(&data(m, 4, k, j, i), ds);
               path(r) += ds;
@@ -316,6 +371,10 @@ void Laser::TraceStraightRays() {
               x(r) += nx(r)*ds;
               y(r) += ny(r)*ds;
               z(r) += nz(r)*ds;
+              if (extinguished) {
+                status(r) = static_cast<int>(RayStatus::absorbed);
+                break;
+              }
             }
 
             Real tie = 128.0*machine_eps*fmax(ds, 1.0);
@@ -440,6 +499,17 @@ void Laser::FinalizeDiagnostics() {
               << " path=" << diagnostics_.total_path_length << std::endl;
     std::cout.flags(old_flags);
     std::cout.precision(old_precision);
+  }
+  if (host_count(3) > 0 ||
+      diagnostics_.conservation_residual > conservation_tolerance_) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Laser transport failed for " << host_count(3)
+                << " rays; conservation residual="
+                << diagnostics_.conservation_residual << " exceeds tolerance="
+                << conservation_tolerance_ << std::endl;
+    }
+    std::exit(EXIT_FAILURE);
   }
 }
 

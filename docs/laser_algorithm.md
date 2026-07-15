@@ -43,6 +43,9 @@ electron-energy component. This is not double counting: total energy and the aux
 electron component are separate stored equations, and both must represent the same
 electron heating. For `deposition_target=total`, only conservative total energy is
 incremented and the ordinary 2T synchronization partitions the new internal energy.
+The cumulative `laser_energy` diagnostic follows the same `gam0`, `gam1`, and `beta`
+low-storage Runge--Kutta recurrence as the conserved MHD state, so it records the net
+source contribution rather than the sum of intermediate-stage increments.
 
 The per-stage conservation diagnostic is
 
@@ -91,6 +94,11 @@ electron_temperature_model = two_temperature
 absorption_model = constant
 absorption_coefficient = 1.0
 unit_system = code
+length_scale_cgs = 1.0
+density_scale_cgs = 1.0
+temperature_scale_cgs = 1.0
+power_scale_cgs = 1.0
+electron_number_per_gram = 1.0
 nbeams = 1
 max_segments_per_launch = 16
 max_transport_iterations = 64

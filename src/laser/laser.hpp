@@ -136,6 +136,7 @@ class Laser {
   DvceArray1D<int> active_queue_a_, active_queue_b_;
   DvceArray1D<Real> device_diagnostics_;
   DvceArray1D<int> device_counters_;
+  DvceArray5D<Real> cumulative_energy_start_;
 
   LaserDiagnostics diagnostics_;
 };
