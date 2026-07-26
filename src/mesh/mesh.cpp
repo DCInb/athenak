@@ -228,7 +228,7 @@ Mesh::Mesh(ParameterInput *pin) :
   // error check number of ghost zones
   if (mesh_indcs.ng < 2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-      << "More than 2 ghost zones required, but nghost=" <<mesh_indcs.ng << std::endl;
+      << "At least 2 ghost zones required, but nghost=" <<mesh_indcs.ng << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if ((multilevel) && (mesh_indcs.ng % 2 != 0)) {

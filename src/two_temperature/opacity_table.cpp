@@ -21,6 +21,10 @@
 #include "parameter_input.hpp"
 #include "two_temperature/opacity_table.hpp"
 
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
+
 namespace two_temperature {
 namespace {
 
@@ -114,6 +118,11 @@ class TableTokens {
   std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
             << std::endl << "Opacity table '" << filename << "': " << message
             << std::endl;
+  // A failure here can be rank-local (e.g. file unreadable on one node); abort the
+  // whole job rather than leaving other ranks blocked in collectives.
+#if MPI_PARALLEL_ENABLED
+  MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
   std::exit(EXIT_FAILURE);
 }
 

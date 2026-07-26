@@ -28,6 +28,9 @@
 
 namespace {
 
+// Duplicated in eos/ideal_mhd.cpp and mhd/mhd_dual_energy.cpp
+// (MHDInternalEnergyFloor); keep the three in sync. Unlike the mhd_dual_energy.cpp
+// copy, dens is used as passed (already floored by the caller).
 KOKKOS_INLINE_FUNCTION
 Real BoundaryInternalEnergyFloor(const EOS_Data &eos, const Real dens) {
   Real eint_floor = eos.pfloor/(eos.gamma - 1.0);

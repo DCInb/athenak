@@ -104,6 +104,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   if (use_two_temperature) {
     if (!peos->eos_data.is_ideal || pmy_pack->pcoord->is_special_relativistic ||
         pmy_pack->pcoord->is_general_relativistic ||
+        pmy_pack->pcoord->is_dynamical_relativistic ||
         pin->DoesBlockExist("ion-neutral") || pin->DoesBlockExist("radiation")) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<mhd>/two_temperature currently requires standalone "
@@ -137,12 +138,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (pmy_pack->pmesh->mb_indcs.ng < 2) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<mhd>/biermann_battery requires at least two ghost "
-                << "zones" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
+    // (nghost >= 2, which Biermann requires, is already enforced globally in
+    // Mesh construction — no separate guard is reachable here.)
     pbiermann = new BiermannBattery(
         ppack, pin, ptwo_temp->iele, ptwo_temp->ElectronHeatCapacityFraction(),
         peos->eos_data.gamma, peos->eos_data.dfloor, peos->eos_data.pfloor);
@@ -225,6 +222,15 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
   }
+  // MHD 2T in a shearing box is unvalidated even with dual_energy=false (hydro 2T
+  // scalar advection through the shear boundary is validated; the MHD orbital
+  // remap interplay is not) — forbid until it is tested.
+  if (ptwo_temp != nullptr && pin->DoesBlockExist("shearing_box")) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "<mhd>/two_temperature with a <shearing_box> block "
+              << "is not yet validated" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   // allocate memory for conserved and primitive variables
   // With AMR, maximum size of Views are limited by total device memory through an input
@@ -288,6 +294,13 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<mhd>/dual_energy is not yet compatible with FOFC"
                 << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (use_fofc && ptwo_temp != nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/two_temperature is not yet compatible with "
+                << "FOFC (first-order flux replacement does not include the "
+                << "ion/electron/radiation scalar fluxes)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
 

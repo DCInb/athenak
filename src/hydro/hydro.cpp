@@ -78,6 +78,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (use_two_temperature) {
     if (!peos->eos_data.is_ideal || pmy_pack->pcoord->is_special_relativistic ||
         pmy_pack->pcoord->is_general_relativistic ||
+        pmy_pack->pcoord->is_dynamical_relativistic ||
         pin->DoesBlockExist("ion-neutral") || pin->DoesBlockExist("radiation")) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<hydro>/two_temperature currently requires standalone "
@@ -87,6 +88,15 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     ptwo_temp = new two_temperature::TwoTemperature(
         "hydro", ppack, pin, nhydro + nuser_scalars);
     nscalars += 2 + ptwo_temp->NumberOfRadiationGroups();
+    // 2T scalar advection through the shear boundary is validated, but the FLD
+    // diffusive-flux interplay with the shearing-box remap is not — forbid the
+    // radiation+shear combination until it is tested.
+    if (ptwo_temp->pradiation != nullptr && pin->DoesBlockExist("shearing_box")) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<thermal_radiation> with a <shearing_box> block "
+                << "is not yet validated" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   } else if (pin->DoesBlockExist("thermal_radiation") &&
              pin->GetOrAddBoolean("thermal_radiation", "enabled", true)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -166,6 +176,13 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("hydro","fofc",false);
+    if (use_fofc && ptwo_temp != nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/two_temperature is not yet compatible with "
+                << "FOFC (first-order flux replacement does not include the "
+                << "ion/electron/radiation scalar fluxes)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
 
     // select reconstruction method (default PLM)
     std::string xorder = pin->GetOrAddString("hydro","reconstruct","plm");

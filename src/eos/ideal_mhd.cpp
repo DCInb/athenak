@@ -14,6 +14,10 @@
 
 namespace {
 
+// Duplicated in mhd/mhd_dual_energy.cpp (MHDInternalEnergyFloor) and
+// bvals/prolong_prims.cpp (BoundaryInternalEnergyFloor); keep the three in sync.
+// Unlike the mhd_dual_energy.cpp copy, dens is used as passed (callers here have
+// already applied the density floor).
 KOKKOS_INLINE_FUNCTION
 Real MHDInternalEnergyFloor(const EOS_Data &eos, const Real dens) {
   Real eint_floor = eos.pfloor/(eos.gamma - 1.0);

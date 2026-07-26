@@ -18,6 +18,11 @@
 
 namespace {
 
+// Duplicated in eos/ideal_mhd.cpp (MHDInternalEnergyFloor) and
+// bvals/prolong_prims.cpp (BoundaryInternalEnergyFloor); keep the three in sync.
+// Callers here already clamp dens with dfloor before the call (as in the other two
+// copies); the internal clamp below is redundant defense only, and callers must NOT
+// rely on it (their own clamp also protects later divisions by dens).
 KOKKOS_INLINE_FUNCTION
 Real MHDInternalEnergyFloor(const EOS_Data &eos, const Real dens_in) {
   const Real dens = fmax(dens_in, eos.dfloor);
