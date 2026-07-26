@@ -91,9 +91,14 @@ BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
 
 //----------------------------------------------------------------------------------------
 //! \brief Build a symmetric FLASH-like shock indicator.  Raw grad(p_e)/n_e is
-//! not a convergent Biermann discretization inside a discontinuity, so all
-//! faces adjacent to a cell with a large centered gas-pressure jump are
-//! disabled when requested.
+//! not a convergent Biermann discretization inside a discontinuity, so faces
+//! adjacent to cells with a large centered gas-pressure jump are attenuated
+//! when requested.  The mask ramps linearly from 1 at jump = threshold/2 down
+//! to 0 at jump = threshold (per direction, minimum across directions): a hard
+//! 0/1 edge was measured to inject more spurious B3 at marginally resolved
+//! discontinuities than it suppressed (the one-face E-field cutoff itself acts
+//! as a curl source).  Smooth flow (jump <= threshold/2) keeps mask exactly 1,
+//! so smooth-problem results are unchanged to the bit.
 
 void BiermannBattery::ComputeShockMask(const DvceArray5D<Real> &prim) {
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
@@ -121,7 +126,8 @@ void BiermannBattery::ComputeShockMask(const DvceArray5D<Real> &prim) {
 
   Real gm1 = gamma_minus_one_;
   Real pfloor = fmax(pressure_floor_, 1.0e-30);
-  Real threshold = shock_threshold;
+  Real thr_hi = shock_threshold;
+  Real thr_lo = 0.5 * shock_threshold;
   auto w = prim;
   par_for(
       "biermann_shock_mask", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
@@ -130,21 +136,18 @@ void BiermannBattery::ComputeShockMask(const DvceArray5D<Real> &prim) {
         Real pm = fmax(gm1 * w(m, IEN, k, j, i - 1), pfloor);
         Real pp = fmax(gm1 * w(m, IEN, k, j, i + 1), pfloor);
         Real jump = 2.0 * fabs(pp - pm) / fmax(pp + pm, 2.0 * pfloor);
-        if (jump > threshold)
-          mask = 0.0;
+        mask = fmin(mask, fmin(1.0, fmax(0.0, (thr_hi - jump)/(thr_hi - thr_lo))));
         if (multi_d) {
           pm = fmax(gm1 * w(m, IEN, k, j - 1, i), pfloor);
           pp = fmax(gm1 * w(m, IEN, k, j + 1, i), pfloor);
           jump = 2.0 * fabs(pp - pm) / fmax(pp + pm, 2.0 * pfloor);
-          if (jump > threshold)
-            mask = 0.0;
+          mask = fmin(mask, fmin(1.0, fmax(0.0, (thr_hi - jump)/(thr_hi - thr_lo))));
         }
         if (three_d) {
           pm = fmax(gm1 * w(m, IEN, k - 1, j, i), pfloor);
           pp = fmax(gm1 * w(m, IEN, k + 1, j, i), pfloor);
           jump = 2.0 * fabs(pp - pm) / fmax(pp + pm, 2.0 * pfloor);
-          if (jump > threshold)
-            mask = 0.0;
+          mask = fmin(mask, fmin(1.0, fmax(0.0, (thr_hi - jump)/(thr_hi - thr_lo))));
         }
         smooth(m, k, j, i) = mask;
       });
@@ -437,6 +440,14 @@ void BiermannBattery::AddEMFs(DvceEdgeFld4D<Real> &efld) {
 //! \brief Apply the p_e div(v_e-v) term omitted by conservative advection of
 //! epsilon_e.
 
+// Note: the face drift velocities vd*_ used here are computed per level and are NOT
+// SMR/AMR flux-corrected (unlike dual_vf). Measured consequence: the ion/electron
+// partition at coarse/fine boundaries is perturbed only within the coarse-fine
+// truncation envelope (~6e-6 vs ~1e-5 band over 200 steps on the 2D battery test),
+// with machine-level total-energy conservation and dual-energy closure unaffected
+// (the per-stage sync absorbs the mismatch into the partition). Accepted as a
+// characterized approximation; revisit only if sub-truncation partition accuracy at
+// refinement boundaries becomes a requirement.
 void BiermannBattery::ApplyElectronWork(Real dt, DvceArray5D<Real> &cons,
                                         DvceArray5D<Real> &prim) {
   if (coefficient == 0.0)

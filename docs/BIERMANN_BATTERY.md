@@ -61,6 +61,23 @@ wave speed. FLASH recommends a lower CFL number for this formulation. It also re
 shock detection because a direct pressure-gradient discretization is not convergent
 inside a discontinuity; AthenaK therefore enables symmetric shock suppression by default.
 
+**Mask shape (2026-07 validation):** the suppression mask ramps linearly from 1 at a
+pressure jump of `threshold/2` to 0 at `threshold` (a hard 0/1 edge was measured to
+inject ~4.7× more spurious B3 than it suppressed at a marginally resolved 64²
+discontinuity; the ramp halves that artifact at every tested threshold). Suppression
+still cannot beat the unsuppressed noise floor at marginal resolution with the default
+`threshold=0.25` — a transition in the face E-field is itself a curl source — so near
+marginally resolved shocks either lower the threshold (0.1 reached unsuppressed noise
+levels in testing while still zeroing strong shocks) or verify the mask's effect at
+your resolution. Positivity and energy conservation are unaffected in all cases.
+
+Note the face drift velocities used by the electron-work term are computed per
+refinement level and are not SMR/AMR flux-corrected (unlike the dual-energy face
+velocities); the measured consequence is an ion/electron partition perturbation at
+coarse/fine boundaries bounded by the coarse–fine truncation envelope, with total
+energy and dual-energy closure unaffected (see the comment on
+`BiermannBattery::ApplyElectronWork`).
+
 The implementation requires at least two ghost zones. One-dimensional meshes are
 rejected because crossed gradients cannot generate a Biermann field.
 
