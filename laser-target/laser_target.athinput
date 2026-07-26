@@ -1,0 +1,156 @@
+# Reduced, fast laser--solid benchmark.  The optical scales correspond to a 351 nm beam
+# incident on a fully ionized CH-like target, while the beam power is deliberately below
+# a full experimental shot so this communication/regression test remains inexpensive.
+
+<job>
+basename = laser_target
+
+<mesh>
+nghost = 2
+nx1 = 96
+x1min = -0.8
+x1max = 0.8
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 64
+x2min = -0.5
+x2max = 0.5
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.25
+nlim = -1
+tlim = 2.0e-2
+ndiag = 10
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+density_floor = 1.0e-8
+pressure_floor = 1.0e-10
+two_temperature = true
+dual_energy = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+biermann_battery = true
+biermann_coefficient = 2.0e-2
+biermann_shock_suppression = true
+biermann_shock_threshold = 0.8
+
+<thermal_radiation>
+enabled = true
+n_groups = 3
+arad = 5.0e-2
+c_light = 1.0
+initial_radiation_temperature = 2.0e-2
+flux_limiter = levermore-pomraning
+flux_limit_coefficient = 1.0
+source_cfl = 0.2
+couple_matter = true
+opacity_model = constant
+group_bound_0 = 0.0
+group_bound_1 = 5.0e-2
+group_bound_2 = 5.0e-1
+group_bound_3 = 1.0e2
+kappa_transport_0 = 5.0e4
+kappa_transport_1 = 5.0e4
+kappa_transport_2 = 5.0e4
+kappa_absorption_0 = 2.0e2
+kappa_absorption_1 = 2.0e2
+kappa_absorption_2 = 2.0e2
+kappa_emission_0 = 2.0e2
+kappa_emission_1 = 2.0e2
+kappa_emission_2 = 2.0e2
+
+<laser>
+model = straight
+deposition_target = electron
+electron_temperature_model = two_temperature
+absorption_model = inverse_bremsstrahlung
+unit_system = cgs
+length_scale_cgs = 1.0e-2
+density_scale_cgs = 1.0
+temperature_scale_cgs = 1.160451812155008e7
+power_scale_cgs = 1.0e21
+electron_number_per_gram = 3.2430e23
+inverse_bremsstrahlung_coulomb_log = 5.0
+critical_reflection = true
+oblique_turning = true
+max_reflections_per_ray = 2
+reflection_offset_fraction = 1.0e-10
+nbeams = 1
+max_segments_per_launch = 64
+max_transport_iterations = 128
+max_mpi_waves = 1024
+gpu_aware_mpi = false
+minimum_power_fraction = 1.0e-14
+conservation_tolerance = 1.0e-10
+periodic_transport = false
+report_diagnostics = true
+
+# Positions and radii remain in code length.  Power and wavelength are cgs because
+# unit_system=cgs.  2e19 erg/s is 2 TW and maps to 0.02 code power.
+beam0_power = 2.0e19
+beam0_wavelength = 3.51e-5
+beam0_nrays = 129
+beam0_origin_x1 = -0.8
+beam0_origin_x2 = 0.0
+beam0_origin_x3 = 0.0
+beam0_direction_x1 = 1.0
+beam0_direction_x2 = 0.0
+beam0_direction_x3 = 0.0
+beam0_radius = 0.32
+beam0_profile = gaussian
+beam0_zeff = 3.5
+beam0_start_time = 0.0
+beam0_end_time = 1.2e-2
+
+<problem>
+user_hist = true
+ambient_density = 1.0e-4
+solid_density = 1.0
+temperature = 2.0e-2
+target_surface = 5.0e-2
+transition_width = 6.0e-2
+corrugation_amplitude = 0.0
+corrugation_wavelength = 1.0
+
+<output1>
+file_type = hst
+user_hist_only = true
+data_format = %20.12e
+dt = 2.0e-3
+
+<output2>
+file_type = bin
+variable = mhd_w_bcc
+id = fluid
+dt = 1.0e-2
+
+<output3>
+file_type = bin
+variable = mhd_3t
+id = three_t
+dt = 1.0e-2
+
+<output4>
+file_type = bin
+variable = laser
+id = laser
+dt = 1.0e-2
