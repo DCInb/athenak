@@ -75,6 +75,25 @@ coefficients but solves each group diffusion equation implicitly.  The physical 
 closure and group emission/absorption terms follow FLASH; the current AthenaK transport
 update is explicit and does not require HYPRE.
 
+Two practical consequences of the explicit update (measured in the 2026-07 validation):
+the timestep scales linearly with the transport opacity (`dt` collapses proportionally
+to `kappa_transport` in optically thin regions — a `kappa` of 1e-6 in code units makes
+front-propagation runs infeasible), and in the free-streaming limit the flux limiter
+caps the half-height front at ≲0.9 c_hat while the low-amplitude leading edge shows an
+O(Δx) superluminal precursor (measured 1.14→1.06 c_hat as resolution doubles twice) —
+an inherent, converging artifact of explicit flux-limited diffusion, not an instability.
+The diffusive transport coefficient itself was validated to +0.065% against the
+analytic step-diffusion solution.
+
+Boundary conditions: radiation groups inherit the cell-centered fluid BCs. Note that
+for FLD an `outflow` (zero-gradient) boundary is an *insulated wall* — zero gradient
+means zero diffusive flux, so radiation does not leave the domain. Runs that need
+radiation to escape must use a user boundary that imposes a vacuum/Marshak condition
+on the group energies. `reflect` conserves radiation energy exactly, as expected.
+With inflow BCs the 2T and radiation scalar entries of the inflow state must be
+filled by a user problem generator; the generic inflow BC injects zero-radiation,
+default-partitioned material otherwise.
+
 After a complete fluid step, the source update uses FLASH's time-lagged electron
 temperature and implicit absorption:
 
