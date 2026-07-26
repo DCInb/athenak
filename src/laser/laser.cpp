@@ -149,8 +149,6 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "power_scale_cgs", power_scale_cgs_);
   inverse_bremsstrahlung_coulomb_log_ = pin->GetOrAddReal(
       "laser", "inverse_bremsstrahlung_coulomb_log", -1.0);
-  electron_number_per_density_ = pin->GetOrAddReal(
-      "laser", "electron_number_per_density", 1.0);
   electron_number_per_gram_ = pin->GetOrAddReal(
       "laser", "electron_number_per_gram", 0.0);
   if (absorption_model_ == AbsorptionModel::inverse_bremsstrahlung &&

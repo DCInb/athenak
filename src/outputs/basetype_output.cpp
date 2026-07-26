@@ -208,7 +208,7 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl;
     exit(EXIT_FAILURE);
   }
-  if ((ivar >= 165) && (ivar < 171) && pm->pmb_pack->plaser == nullptr) {
+  if ((ivar >= 165) && (ivar < 178) && pm->pmb_pack->plaser == nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
        << std::endl << "Laser output requested in <output> block '"
        << out_params.block_name << "' but no <laser> block is enabled."

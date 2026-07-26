@@ -316,6 +316,58 @@ void Laser::CompactActiveQueue(DvceArray1D<int> current,
 }
 
 //----------------------------------------------------------------------------------------
+//! Rebuild queue A from ray status. Called at every trace entry so rays that survived
+//! a previous work-capped wave and rays activated by MPI unpack both re-enter the
+//! queue without relying on incremental queue state.
+
+void Laser::SeedActiveQueue() {
+  Kokkos::deep_copy(active_queue_a_, -1);
+  auto status = ray_status;
+  auto queue = active_queue_a_;
+  Kokkos::parallel_scan(
+      "laser_seed_queue", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+      KOKKOS_LAMBDA(int r, int &offset, bool final) {
+        int keep = (status(r) == static_cast<int>(RayStatus::active)) ? 1 : 0;
+        if (final && keep) queue(offset) = r;
+        offset += keep;
+      });
+}
+
+//----------------------------------------------------------------------------------------
+//! Count rays still marked active (host-synchronous device reduction).
+
+int Laser::CountActiveRays() {
+  auto status = ray_status;
+  int count = 0;
+  Kokkos::parallel_reduce(
+      "laser_count_active", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+      KOKKOS_LAMBDA(int r, int &sum) {
+        if (status(r) == static_cast<int>(RayStatus::active)) sum += 1;
+      }, Kokkos::Sum<int>(count));
+  return count;
+}
+
+//----------------------------------------------------------------------------------------
+//! Book rays that exhausted the global wave budget as remaining power.
+
+void Laser::BookRemainingRays() {
+  auto status = ray_status;
+  auto power = ray_power;
+  auto diag = device_diagnostics_;
+  auto counters = device_counters_;
+  Kokkos::parallel_for(
+      "laser_book_remaining", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+      KOKKOS_LAMBDA(int r) {
+        if (status(r) == static_cast<int>(RayStatus::active) ||
+            status(r) == static_cast<int>(RayStatus::off_rank)) {
+          status(r) = static_cast<int>(RayStatus::remaining);
+          Kokkos::atomic_add(&diag(3), power(r));
+          Kokkos::atomic_inc(&counters(0));
+        }
+      });
+}
+
+//----------------------------------------------------------------------------------------
 //! Straight Cartesian DDA. One device thread advances one ray through several cells.
 
 void Laser::TraceStraightRays(bool preserve_off_rank) {
@@ -369,6 +421,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   Real reflection_offset_fraction = reflection_offset_fraction_;
   int seg_per_launch = max_segments_per_launch_;
 
+  SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
     DvceArray1D<int> current = (iteration % 2 == 0) ? active_queue_a_ : active_queue_b_;
     DvceArray1D<int> next = (iteration % 2 == 0) ? active_queue_b_ : active_queue_a_;
@@ -680,21 +733,12 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
     CompactActiveQueue(current, next);
   }
 
-  // A fixed number of launch waves avoids a host synchronization in the propagation
-  // loop. Rays that hit the configured work cap remain explicitly accounted for.
-  auto remaining_status = ray_status;
-  auto remaining_power = ray_power;
-  Kokkos::parallel_for(
-      "laser_mark_remaining", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
-      KOKKOS_LAMBDA(int r) {
-        if (remaining_status(r) == static_cast<int>(RayStatus::active) ||
-            (!preserve_off_rank &&
-             remaining_status(r) == static_cast<int>(RayStatus::off_rank))) {
-          remaining_status(r) = static_cast<int>(RayStatus::remaining);
-          Kokkos::atomic_add(&diag(3), remaining_power(r));
-          Kokkos::atomic_inc(&counters(0));
-        }
-      });
+  // Rays that hit the per-wave work cap stay active: the caller re-traces them in
+  // subsequent waves (serial and MPI alike) so results are independent of the rank
+  // decomposition. Only the final wave books leftovers as remaining power.
+  if (!preserve_off_rank) {
+    BookRemainingRays();
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -750,6 +794,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   Real tau_max = refractive_tau_max_;
   int seg_per_launch = max_segments_per_launch_;
 
+  SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
     DvceArray1D<int> current = (iteration % 2 == 0) ? active_queue_a_ : active_queue_b_;
     DvceArray1D<int> next = (iteration % 2 == 0) ? active_queue_b_ : active_queue_a_;
@@ -905,12 +950,24 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               break;
             }
 
-            Real new_qx = qx-0.5*step*normalized_grad_x;
-            Real new_qy = qy-0.5*step*normalized_grad_y;
-            Real new_qz = qz-0.5*step*normalized_grad_z;
-            Real dx = 0.5*step*(qx+new_qx);
-            Real dy = 0.5*step*(qy+new_qy);
-            Real dz = 0.5*step*(qz+new_qz);
+            // Kick-drift-kick: recompute the half kick with the final face-limited
+            // step, drift, then finish the kick with the cell's quadratic force
+            // model evaluated at the drift endpoint. The endpoint evaluation keeps
+            // the trajectory second order in the step now that the force varies
+            // within a cell (grad + hess*offset); with a constant force it reduces
+            // exactly to the previous update.
+            qhx = qx-0.25*step*normalized_grad_x;
+            qhy = qy-0.25*step*normalized_grad_y;
+            qhz = qz-0.25*step*normalized_grad_z;
+            Real dx = step*qhx;
+            Real dy = step*qhy;
+            Real dz = step*qhz;
+            Real end_grad_x = (grad_x+hess_x*(offset_x+dx))/critical_density;
+            Real end_grad_y = (grad_y+hess_y*(offset_y+dy))/critical_density;
+            Real end_grad_z = (grad_z+hess_z*(offset_z+dz))/critical_density;
+            Real new_qx = qhx-0.25*step*end_grad_x;
+            Real new_qy = qhy-0.25*step*end_grad_y;
+            Real new_qz = qhz-0.25*step*end_grad_z;
             Real ds = sqrt(SQR(dx)+SQR(dy)+SQR(dz));
             wave_x(r) = new_qx;
             wave_y(r) = new_qy;
@@ -1027,20 +1084,12 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
     CompactActiveQueue(current, next);
   }
 
-  auto remaining_status = ray_status;
-  auto remaining_power = ray_power;
-  Kokkos::parallel_for(
-      "laser_mark_refractive_remaining",
-      Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
-      KOKKOS_LAMBDA(int r) {
-        if (remaining_status(r) == static_cast<int>(RayStatus::active) ||
-            (!preserve_off_rank &&
-             remaining_status(r) == static_cast<int>(RayStatus::off_rank))) {
-          remaining_status(r) = static_cast<int>(RayStatus::remaining);
-          Kokkos::atomic_add(&diag(3), remaining_power(r));
-          Kokkos::atomic_inc(&counters(0));
-        }
-      });
+  // Rays that hit the per-wave work cap stay active: the caller re-traces them in
+  // subsequent waves (serial and MPI alike) so results are independent of the rank
+  // decomposition. Only the final wave books leftovers as remaining power.
+  if (!preserve_off_rank) {
+    BookRemainingRays();
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -1093,10 +1142,10 @@ void Laser::FinalizeDiagnostics() {
                            MPI_ATHENA_REAL, MPI_MAX, mpi_comm_);
     }
     if (ierr != MPI_SUCCESS) {
-      if (global_variable::my_rank == 0) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "Laser MPI diagnostics reduction failed" << std::endl;
-      }
+      // print on every rank: this failure can be rank-local
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Laser MPI diagnostics reduction failed" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
     for (int n = 0; n < 4; ++n) {

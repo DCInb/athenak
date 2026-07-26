@@ -144,10 +144,20 @@ void Laser::UnpackReceivedRays(int count) {
 
 TaskStatus Laser::AdvanceDistributedTransport() {
 #if !MPI_PARALLEL_ENABLED
-  if (propagation_model_ == PropagationModel::refractive) {
-    TraceRefractiveRays();
-  } else {
-    TraceStraightRays();
+  // Single-process transport uses the same wave semantics as the distributed path:
+  // rays that hit the per-wave work cap stay active and are re-traced, so results
+  // do not depend on how the work caps interact with the rank decomposition.
+  for (int wave = 0; ; ++wave) {
+    if (propagation_model_ == PropagationModel::refractive) {
+      TraceRefractiveRays(true);
+    } else {
+      TraceStraightRays(true);
+    }
+    if (CountActiveRays() == 0) break;
+    if (wave+1 >= max_mpi_waves_) {
+      BookRemainingRays();
+      break;
+    }
   }
   FinalizeDiagnostics();
   transport_state_ = LaserTransportState::finished;
@@ -155,10 +165,17 @@ TaskStatus Laser::AdvanceDistributedTransport() {
 #else
   const int nranks = global_variable::nranks;
   if (nranks == 1) {
-    if (propagation_model_ == PropagationModel::refractive) {
-      TraceRefractiveRays();
-    } else {
-      TraceStraightRays();
+    for (int wave = 0; ; ++wave) {
+      if (propagation_model_ == PropagationModel::refractive) {
+        TraceRefractiveRays(true);
+      } else {
+        TraceStraightRays(true);
+      }
+      if (CountActiveRays() == 0) break;
+      if (wave+1 >= max_mpi_waves_) {
+        BookRemainingRays();
+        break;
+      }
     }
     FinalizeDiagnostics();
     transport_state_ = LaserTransportState::finished;
@@ -194,6 +211,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
     if (ierr != MPI_SUCCESS) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser MPI count exchange failed" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
     transport_state_ = LaserTransportState::post_receives;
@@ -206,6 +224,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
     if (ierr != MPI_SUCCESS) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser MPI count poll failed" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
     if (!complete) return TaskStatus::incomplete;
@@ -220,6 +239,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
     if (mpi_recv_total_ > nrays_) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser receive queue capacity exceeded" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
 
@@ -240,6 +260,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
         if (ierr != MPI_SUCCESS) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                     << std::endl << "Laser MPI receive post failed" << std::endl;
+          MPI_Abort(MPI_COMM_WORLD, 1);
           std::exit(EXIT_FAILURE);
         }
       }
@@ -254,6 +275,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
         if (ierr != MPI_SUCCESS) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                     << std::endl << "Laser MPI send post failed" << std::endl;
+          MPI_Abort(MPI_COMM_WORLD, 1);
           std::exit(EXIT_FAILURE);
         }
       }
@@ -274,6 +296,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
     if (ierr != MPI_SUCCESS) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser MPI packet poll failed" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
     if (!receives_complete || !sends_complete) return TaskStatus::incomplete;
@@ -284,12 +307,15 @@ TaskStatus Laser::AdvanceDistributedTransport() {
       Kokkos::fence();
     }
     UnpackReceivedRays(mpi_recv_total_);
-    mpi_local_active_ = mpi_recv_total_;
+    // Count all still-active rays (received migrants and rays that hit the local
+    // per-wave work cap) so the wave loop keeps running until every ray finishes.
+    mpi_local_active_ = CountActiveRays();
     ierr = MPI_Iallreduce(&mpi_local_active_, &mpi_global_active_, 1, MPI_INT,
                           MPI_SUM, mpi_comm_, &mpi_completion_request_);
     if (ierr != MPI_SUCCESS) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser MPI completion reduction failed" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
     transport_state_ = LaserTransportState::check_global_completion;
@@ -302,6 +328,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
     if (ierr != MPI_SUCCESS) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Laser MPI completion poll failed" << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
     if (!complete) return TaskStatus::incomplete;

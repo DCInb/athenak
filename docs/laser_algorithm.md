@@ -17,9 +17,17 @@ MHD finite-volume update
 
 The medium is frozen during a ray trace. `model=straight` selects DDA transport and
 `model=refractive` selects the Hamiltonian transport described below. Momentum
-deposition, ray splitting, and frequency groups are not implemented. Rays transfer
+deposition, ray splitting, and frequency groups are not implemented. Laser cell
+diagnostics (`cell_data`, including the cumulative deposited energy density reported
+as `laser_energy`) are not written to restart files: on restart the physical state
+(which already contains all deposited energy) continues exactly, but the cumulative
+diagnostic restarts from zero. Rays transfer
 directly between same-rank MeshBlocks. Across ranks, off-rank rays are compacted by destination
-into contiguous packets and advanced by a nonblocking composite task. Count exchange,
+into contiguous packets and advanced by a nonblocking composite task. Each transport
+wave bounds device work by `max_transport_iterations*max_segments_per_launch` segments
+per ray; rays that hit the cap stay active and are re-traced in subsequent waves (in
+serial exactly as under MPI), so results are independent of the rank decomposition.
+Only after `max_mpi_waves` waves is leftover power booked as remaining. Count exchange,
 packet receives/sends, and global completion are polled with `TaskStatus::incomplete`.
 `gpu_aware_mpi=true` passes device packet buffers directly to MPI; the default uses
 `Kokkos::SharedHostPinnedSpace` staging for MPI implementations without device support.
@@ -36,6 +44,15 @@ oblique model uses `n_turn=n_c*cos(theta)^2`. The ray is reflected specularly ab
 local density-gradient normal, displaced by `reflection_offset_fraction` of a cell, and
 continues through the ordinary device queue. `max_reflections_per_ray` bounds trapping;
 any power stopped by that bound is reported as remaining rather than discarded.
+
+Reflection requires a resolved density gradient: the turning point is located by
+linear interpolation of the cell-centered electron-density gradient, so a ray launched
+into a *uniform* supercritical medium finds no gradient, never turns, and is silently
+absorbed in the first cell even with `critical_reflection=true`. Beams must approach
+critical density through a resolved ramp. Also note that when `max_mpi_waves` is the
+binding limit (absorbing medium, rays still active at the final wave), the amount
+deposited before cutoff depends on the rank decomposition — converged runs
+(`remaining=0`) are decomposition-independent, truncated ones are not.
 
 ## Refractive transport
 

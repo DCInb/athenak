@@ -140,6 +140,9 @@ class Laser {
   void TraceStraightRays(bool preserve_off_rank = false);
   void TraceRefractiveRays(bool preserve_off_rank = false);
   void CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next);
+  void SeedActiveQueue();
+  int CountActiveRays();
+  void BookRemainingRays();
   void PrepareOutgoingRays();
   void UnpackReceivedRays(int count);
   TaskStatus AdvanceDistributedTransport();
@@ -161,7 +164,6 @@ class Laser {
   int max_mpi_waves_ = 1024;
   Real gamma_minus_one_ = 0.0;
   Real electron_heat_capacity_fraction_ = 0.0;
-  Real electron_number_per_density_ = 1.0;
   Real electron_number_per_gram_ = 0.0;
   Real density_scale_cgs_ = 1.0;
   Real temperature_scale_cgs_ = 1.0;

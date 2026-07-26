@@ -319,6 +319,11 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
     if (pmesh->pmb_pack->pmhd != nullptr) {
       pmesh->pmb_pack->pmhd->InitializeTwoTemperature();
     }
+  } else if (pmesh->pmb_pack->plaser != nullptr && global_variable::my_rank == 0) {
+    // Laser cell diagnostics are not stored in restart files; the physical state
+    // (which already contains all deposited energy) continues exactly.
+    std::cout << "# Note: cumulative laser diagnostics (laser_energy etc.) restart "
+              << "from zero; the physical state is unaffected." << std::endl;
   }
 
   //---- Step 1.  Set conserved variables in ghost zones for all physics
