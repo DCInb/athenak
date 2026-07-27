@@ -31,6 +31,17 @@
 #include <mpi.h>
 #endif
 
+namespace {
+
+Real OutputTimeTolerance(const Real time, const Real interval) {
+  const Real spacing = std::nextafter(
+      time, std::numeric_limits<Real>::infinity()) - time;
+  return std::min(static_cast<Real>(2.0)*spacing,
+                  static_cast<Real>(0.25)*std::abs(interval));
+}
+
+} // namespace
+
 //----------------------------------------------------------------------------------------
 // constructor, initializes data structures and parameters
 //
@@ -317,24 +328,23 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
-//! Shorten the next step so time-based outputs represent their requested physical time.
+//! Shorten the next step so time-based outputs land within Real roundoff of schedule.
 //! This is opt-in because exact output alignment can add timesteps to existing problems.
 
 void Driver::LimitTimeStepToNextOutput(Mesh *pm, Outputs *pout) {
   if (!align_outputs || time_evolution == TimeEvolution::tstatic) return;
 
   Real next_event = tlim;
-  const Real tolerance = 16.0*std::numeric_limits<Real>::epsilon()*
-      std::max(std::abs(pm->time), 1.0);
   for (auto &out : pout->pout_list) {
     const auto &params = out->out_params;
     if (!(params.dt > 0.0)) continue;
     const Real candidate = params.last_time + params.dt;
-    if (candidate > pm->time + tolerance) {
+    const Real tolerance = OutputTimeTolerance(pm->time, params.dt);
+    if (candidate - pm->time > tolerance) {
       next_event = std::min(next_event, candidate);
     }
   }
-  if (next_event > pm->time + tolerance && pm->time + pm->dt > next_event) {
+  if (next_event > pm->time && pm->time + pm->dt > next_event) {
     pm->dt = next_event - pm->time;
   }
 }
@@ -508,13 +518,25 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // Test for/make outputs
       for (auto &out : pout->pout_list) {
-        // compare at floating point (32-bit) precision to reduce effect of round off
-        float time_32 = static_cast<float>(pmesh->time);
-        float next_32 = static_cast<float>(out->out_params.last_time+out->out_params.dt);
-        float tlim_32 = static_cast<float>(tlim);
+        const auto &params = out->out_params;
+        bool time_output_due = false;
+        if (params.dt > 0.0) {
+          if (align_outputs) {
+            const Real next_time = params.last_time + params.dt;
+            const Real tolerance = OutputTimeTolerance(pmesh->time, params.dt);
+            time_output_due = ((next_time - pmesh->time <= tolerance) &&
+                               (tlim - next_time > tolerance));
+          } else {
+            // Preserve the legacy float32 comparison for non-aligned runs.
+            const float time_32 = static_cast<float>(pmesh->time);
+            const float next_32 = static_cast<float>(params.last_time + params.dt);
+            const float tlim_32 = static_cast<float>(tlim);
+            time_output_due = ((time_32 >= next_32) && (time_32 < tlim_32));
+          }
+        }
         int &dcycle_ = out->out_params.dcycle;
 
-        if (((out->out_params.dt > 0.0) && ((time_32 >= next_32) && (time_32<tlim_32))) ||
+        if (time_output_due ||
             ((dcycle_ > 0) && ((pmesh->ncycle)%(dcycle_) == 0)) ) {
           out->LoadOutputData(pmesh);
           out->WriteOutputFile(pmesh, pin);

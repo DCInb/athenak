@@ -36,7 +36,7 @@ class Driver {
   Real tlim;      // stopping time
   int nlim;       // cycle-limit
   int ndiag;      // cycles between output of diagnostic information
-  bool align_outputs; // shorten steps to land exactly on scheduled time outputs
+  bool align_outputs; // shorten steps to land on outputs within Real roundoff
   Real initial_dt; // optional first-step cap for stiff startup sources
   // variables for various SSP and ImEx RK integrators
   std::string integrator;          // integrator name (rk1, rk2, rk3)
