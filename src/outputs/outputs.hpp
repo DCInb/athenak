@@ -156,6 +156,9 @@ struct OutputParameters {
   bool logscale=true, logscale2=true;
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
+  // write bin/cbin cell data as 8-byte doubles instead of 4-byte floats
+  // (readers key on the "size of variable" header field and support both)
+  bool double_precision_binary=false;
 };
 
 //----------------------------------------------------------------------------------------

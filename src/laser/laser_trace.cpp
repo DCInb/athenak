@@ -538,6 +538,10 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
             if (ds > 0.0) {
               Real coefficient = constant_absorption(r);
               if (absorption_mode == inverse_bremsstrahlung) {
+                // w0(iele) here is the stage state already updated by the duale
+                // task, so the IB coefficient sees an O(dt) advanced electron
+                // energy in cells with hydro flux — consistent with the overall
+                // first-order operator splitting of the deposition source.
                 Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
                 Real electron_energy =
                     fmax(primitive(m, electron_index, k, j, i), 0.0);
@@ -883,6 +887,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
 
             Real coefficient = constant_absorption(r);
             if (absorption_mode == inverse_bremsstrahlung) {
+              // Same O(dt) state-timing note as in the straight tracer: w0(iele)
+              // is the post-duale stage state.
               Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
               Real electron_energy =
                   fmax(primitive(m, electron_index, k, j, i), 0.0);

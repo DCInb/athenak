@@ -93,12 +93,15 @@ BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
 //! \brief Build a symmetric FLASH-like shock indicator.  Raw grad(p_e)/n_e is
 //! not a convergent Biermann discretization inside a discontinuity, so faces
 //! adjacent to cells with a large centered gas-pressure jump are attenuated
-//! when requested.  The mask ramps linearly from 1 at jump = threshold/2 down
-//! to 0 at jump = threshold (per direction, minimum across directions): a hard
-//! 0/1 edge was measured to inject more spurious B3 at marginally resolved
-//! discontinuities than it suppressed (the one-face E-field cutoff itself acts
-//! as a curl source).  Smooth flow (jump <= threshold/2) keeps mask exactly 1,
-//! so smooth-problem results are unchanged to the bit.
+//! when requested.  The mask ramps linearly from 1 at jump = threshold/5 down
+//! to 0 at jump = threshold (per direction, minimum across directions).  The
+//! wide band is deliberate: the mask edge is itself a curl source with
+//! magnitude set by |E| at the transition contour, so the 1-side of the ramp
+//! must sit in quiet flow well away from the discontinuity (measured on a 64^2
+//! Orszag-Tang shock: band [thr/2,thr] injected ~3x the unsuppressed B3 noise,
+//! band [thr/5,thr] matches the unsuppressed level while still zeroing the
+//! battery inside shocks).  Smooth flow (jump <= threshold/5) keeps mask
+//! exactly 1, so smooth-problem results are unchanged to the bit.
 
 void BiermannBattery::ComputeShockMask(const DvceArray5D<Real> &prim) {
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
@@ -127,7 +130,7 @@ void BiermannBattery::ComputeShockMask(const DvceArray5D<Real> &prim) {
   Real gm1 = gamma_minus_one_;
   Real pfloor = fmax(pressure_floor_, 1.0e-30);
   Real thr_hi = shock_threshold;
-  Real thr_lo = 0.5 * shock_threshold;
+  Real thr_lo = 0.2 * shock_threshold;
   auto w = prim;
   par_for(
       "biermann_shock_mask", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
@@ -184,7 +187,6 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
   Real fe = electron_fraction_;
   Real dfloor = density_floor_;
   int iele = iele_;
-
   // x1-face electric fields, including the transverse halo needed by flux-CT.
   int jl = multi_d ? js - 1 : js;
   int ju = multi_d ? je + 1 : je;
@@ -196,20 +198,18 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         Real dp2 = 0.0;
         Real dp3 = 0.0;
         if (multi_d) {
-          dp2 = 0.25 *
-                (ElectronPressure(w, iele, gm1, m, k, j + 1, i - 1) +
-                 ElectronPressure(w, iele, gm1, m, k, j + 1, i) -
-                 ElectronPressure(w, iele, gm1, m, k, j - 1, i - 1) -
-                 ElectronPressure(w, iele, gm1, m, k, j - 1, i)) /
-                size.d_view(m).dx2;
+          Real pp = ElectronPressure(w, iele, gm1, m, k, j + 1, i - 1) +
+                    ElectronPressure(w, iele, gm1, m, k, j + 1, i);
+          Real pm = ElectronPressure(w, iele, gm1, m, k, j - 1, i - 1) +
+                    ElectronPressure(w, iele, gm1, m, k, j - 1, i);
+          dp2 = 0.25 * (pp - pm) / size.d_view(m).dx2;
         }
         if (three_d) {
-          dp3 = 0.25 *
-                (ElectronPressure(w, iele, gm1, m, k + 1, j, i - 1) +
-                 ElectronPressure(w, iele, gm1, m, k + 1, j, i) -
-                 ElectronPressure(w, iele, gm1, m, k - 1, j, i - 1) -
-                 ElectronPressure(w, iele, gm1, m, k - 1, j, i)) /
-                size.d_view(m).dx3;
+          Real pp = ElectronPressure(w, iele, gm1, m, k + 1, j, i - 1) +
+                    ElectronPressure(w, iele, gm1, m, k + 1, j, i);
+          Real pm = ElectronPressure(w, iele, gm1, m, k - 1, j, i - 1) +
+                    ElectronPressure(w, iele, gm1, m, k - 1, j, i);
+          dp3 = 0.25 * (pp - pm) / size.d_view(m).dx3;
         }
         Real rho =
             fmax(0.5 * (w(m, IDN, k, j, i - 1) + w(m, IDN, k, j, i)), dfloor);
@@ -227,20 +227,18 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         "biermann_face_e2", DevExeSpace(), 0, nmb1, kl, ku, js, je + 1, is - 1,
         ie + 1,
         KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-          Real dp1 = 0.25 *
-                     (ElectronPressure(w, iele, gm1, m, k, j - 1, i + 1) +
-                      ElectronPressure(w, iele, gm1, m, k, j, i + 1) -
-                      ElectronPressure(w, iele, gm1, m, k, j - 1, i - 1) -
-                      ElectronPressure(w, iele, gm1, m, k, j, i - 1)) /
-                     size.d_view(m).dx1;
+          Real pp = ElectronPressure(w, iele, gm1, m, k, j - 1, i + 1) +
+                    ElectronPressure(w, iele, gm1, m, k, j, i + 1);
+          Real pm = ElectronPressure(w, iele, gm1, m, k, j - 1, i - 1) +
+                    ElectronPressure(w, iele, gm1, m, k, j, i - 1);
+          Real dp1 = 0.25 * (pp - pm) / size.d_view(m).dx1;
           Real dp3 = 0.0;
           if (three_d) {
-            dp3 = 0.25 *
-                  (ElectronPressure(w, iele, gm1, m, k + 1, j - 1, i) +
-                   ElectronPressure(w, iele, gm1, m, k + 1, j, i) -
-                   ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) -
-                   ElectronPressure(w, iele, gm1, m, k - 1, j, i)) /
-                  size.d_view(m).dx3;
+            pp = ElectronPressure(w, iele, gm1, m, k + 1, j - 1, i) +
+                 ElectronPressure(w, iele, gm1, m, k + 1, j, i);
+            pm = ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) +
+                 ElectronPressure(w, iele, gm1, m, k - 1, j, i);
+            dp3 = 0.25 * (pp - pm) / size.d_view(m).dx3;
           }
           Real rho =
               fmax(0.5 * (w(m, IDN, k, j - 1, i) + w(m, IDN, k, j, i)), dfloor);
@@ -257,18 +255,16 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         "biermann_face_e3", DevExeSpace(), 0, nmb1, ks, ke + 1, js - 1, je + 1,
         is - 1, ie + 1,
         KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-          Real dp1 = 0.25 *
-                     (ElectronPressure(w, iele, gm1, m, k - 1, j, i + 1) +
-                      ElectronPressure(w, iele, gm1, m, k, j, i + 1) -
-                      ElectronPressure(w, iele, gm1, m, k - 1, j, i - 1) -
-                      ElectronPressure(w, iele, gm1, m, k, j, i - 1)) /
-                     size.d_view(m).dx1;
-          Real dp2 = 0.25 *
-                     (ElectronPressure(w, iele, gm1, m, k - 1, j + 1, i) +
-                      ElectronPressure(w, iele, gm1, m, k, j + 1, i) -
-                      ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) -
-                      ElectronPressure(w, iele, gm1, m, k, j - 1, i)) /
-                     size.d_view(m).dx2;
+          Real pp = ElectronPressure(w, iele, gm1, m, k - 1, j, i + 1) +
+                    ElectronPressure(w, iele, gm1, m, k, j, i + 1);
+          Real pm = ElectronPressure(w, iele, gm1, m, k - 1, j, i - 1) +
+                    ElectronPressure(w, iele, gm1, m, k, j, i - 1);
+          Real dp1 = 0.25 * (pp - pm) / size.d_view(m).dx1;
+          pp = ElectronPressure(w, iele, gm1, m, k - 1, j + 1, i) +
+               ElectronPressure(w, iele, gm1, m, k, j + 1, i);
+          pm = ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) +
+               ElectronPressure(w, iele, gm1, m, k, j - 1, i);
+          Real dp2 = 0.25 * (pp - pm) / size.d_view(m).dx2;
           Real rho =
               fmax(0.5 * (w(m, IDN, k - 1, j, i) + w(m, IDN, k, j, i)), dfloor);
           Real mask = fmin(smooth(m, k - 1, j, i), smooth(m, k, j, i));

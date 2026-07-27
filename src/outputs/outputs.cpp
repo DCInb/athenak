@@ -248,6 +248,8 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       } else if (opar.file_type.compare("cbin") == 0) {
         opar.single_file_per_rank = pin->GetOrAddBoolean(opar.block_name,
           "single_file_per_rank", false);
+        opar.double_precision_binary = pin->GetOrAddBoolean(opar.block_name,
+          "double_precision_binary", false);
         opar.coarsen_factor = pin->GetInteger(opar.block_name,"coarsen_factor");
         opar.compute_moments = pin->GetOrAddBoolean(opar.block_name,
           "compute_moments", false);
@@ -278,6 +280,8 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       } else if (opar.file_type.compare("bin") == 0) {
         opar.single_file_per_rank = pin->GetOrAddBoolean(opar.block_name,
           "single_file_per_rank", false);
+        opar.double_precision_binary = pin->GetOrAddBoolean(opar.block_name,
+          "double_precision_binary", false);
         pnode = new MeshBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("cart") == 0) {

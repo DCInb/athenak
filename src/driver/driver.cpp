@@ -19,6 +19,7 @@
 #include "outputs/outputs.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
+#include "two_temperature/two_temperature.hpp"
 #include "z4c/z4c.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "ion-neutral/ion-neutral.hpp"
@@ -324,6 +325,35 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
     // (which already contains all deposited energy) continues exactly.
     std::cout << "# Note: cumulative laser diagnostics (laser_energy etc.) restart "
               << "from zero; the physical state is unaffected." << std::endl;
+  }
+
+  // Warn when a 2T run uses generic inflow BCs but the ion/electron/radiation
+  // entries of the inflow state were never filled by the problem generator: such
+  // a boundary injects zero-scalar (unpartitioned, radiation-free) material.
+  if (global_variable::my_rank == 0) {
+    hydro::Hydro *ph = pmesh->pmb_pack->phydro;
+    mhd::MHD *pmh = pmesh->pmb_pack->pmhd;
+    two_temperature::TwoTemperature *ptt =
+        (ph != nullptr) ? ph->ptwo_temp : ((pmh != nullptr) ? pmh->ptwo_temp : nullptr);
+    if (ptt != nullptr) {
+      auto &u_in = (ph != nullptr) ? ph->pbval_u->u_in : pmh->pbval_u->u_in;
+      bool warn = false;
+      for (int f=0; f<6; ++f) {
+        if (pmesh->mesh_bcs[f] != BoundaryFlag::inflow) continue;
+        bool all_zero = true;
+        for (int n=ptt->iion; n<=ptt->iele+ptt->NumberOfRadiationGroups(); ++n) {
+          if (u_in.h_view(n,f) != 0.0) all_zero = false;
+        }
+        if (all_zero) warn = true;
+      }
+      if (warn) {
+        std::cout << "# WARNING: an inflow boundary is in use with two_temperature "
+                  << "but the ion/electron/radiation entries of its inflow state "
+                  << "are all zero; the boundary will inject zero-scalar material. "
+                  << "Fill the scalar components of u_in in the problem generator."
+                  << std::endl;
+      }
+    }
   }
 
   //---- Step 1.  Set conserved variables in ghost zones for all physics

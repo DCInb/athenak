@@ -274,5 +274,62 @@ Additional MED/LOW notes: max_mpi_waves-bound truncation is decomposition-depend
 - **P4 baselines confirmed canonical**: all six configs reproduce within ±1.1% (laser 1.79×, radiation 1.65×, laser+radiation 2.27×, refractive 2.36× vs plain 2T MHD at 3.65e7 z-c/s; GPU/CPU 27×).
 - **P3 1/4-GPU confirmed** (4-GPU efficiency 30.5%/32.6% laser/no-laser). **New 8-GPU measurement: strong-scaling ceiling found** — 8 ranks is slower than 4 (0.76–0.81× vs 1 GPU, ~10% efficiency), identically with and without laser: at 15 blocks (0.49M cells)/rank the 3.9M-cell problem is over-decomposed and MHD communication dominates. For this problem size, 4 GPUs is the sweet spot; larger problems are needed to exercise 8. Raw data: scratchpad `phase5/{p4,p3-scaleup}/results_postreboot.csv`.
 
+## Recommendation fixes round (2026-07-27, post-pin)
+
+Implemented the open code-level recommendations from the campaign record:
+
+1. **fp64 binary output option** (`<output>/double_precision_binary=true` for `bin`/`cbin`): writers switch to 8-byte doubles; readers already key on the `size of variable` header field. Validated end-to-end: reader auto-detects float64, fp32↔fp64 delta is exactly float32 rounding (5.6e-8 rel), sub-float32 detail present. Closes the recurring float32-analysis hazard flagged in Phases 3c/3d/4.
+2. **Inflow-BC 2T warning**: rank-0 startup warning when any mesh boundary is `inflow` under 2T and the ion/electron/radiation entries of `u_in` are all zero (the boundary would inject zero-scalar material). No false positives on the suite.
+3. **Biermann pgen guard relaxed**: `pgen_name=biermann_battery` now runs with `biermann_battery=false` as a zero-field control (previously a hard abort; closes the tb3 finding).
+4. **O(dt) state-timing comments** added at both IB electron-temperature sampling sites in `laser_trace.cpp` (post-`duale` stage state; tl4 4d recommendation).
+5. **Closed-box conservation attribution (tl8 MED item) — CLOSED**: periodic-box laser run shows gas-energy gain vs cumulative `laser_energy` mismatch of 4.5e-15 absolute against a ~2e-14 catastrophic-cancellation floor (ΔE ~4e-6 between ~130-magnitude sums) — conservation is exact to round-off; the earlier outflow-deck residual was numerical cancellation, not bookkeeping.
+
+Not implemented (explicitly settled otherwise in the record): per-ray cap budget for `max_mpi_waves`-bound truncation (documented as benign; converged runs unaffected), laser-target deck recalibration (labeled as topology-only by design; consistent recipe published), Marshak/vacuum radiation BC and FOFC scalar support (feature work beyond a fix round), particles AMR dt (upstream scope).
+
+## T-B2 shock mask — second fix round (2026-07-27)
+
+The ramp fix had left suppression-ON still ~2.8× noisier than OFF at default settings. Two candidate mechanisms were built and measured on the 64² Orszag–Tang benchmark (OFF floor: max|B3| 3.30e-6, rms 6.2e-7):
+
+| Scheme | ON@thr=0.25 | thr=0.10 | thr=0.50 |
+|---|---|---|---|
+| Hard 0/1 mask (original) | 1.54e-5 | 7.2e-6 | 2.9e-5 |
+| Narrow ramp [thr/2, thr] | 9.3e-6 | 3.36e-6 | 1.73e-5 |
+| Per-face gradient clamp (no mask) | 1.55e-5 | — | — (worse: capping breaks the quasi-gradient structure of E across the whole shock face) |
+| Ramp + clamp combined | bit-identical to ramp alone (clamp only binds where mask is already 0) |
+| **Wide ramp [thr/5, thr] (adopted)** | **6.5e-6** | **2.13e-6 (below OFF; rms 3.8e-7 also below)** | **1.12e-5** |
+
+Root understanding: the raw discretized E is quasi-gradient (small curl) — *any* per-component modification injects curl; the injection is set by |E| at the mask transition contour, so the fix is to place the contour in quiet flow (wide band), not to reshape the modification. Noise is now monotone in threshold, `threshold=0.1` beats unsuppressed in both metrics, and the default stays 0.25 because the suite's own smooth-rate test (jumps 0.039) requires `thr_lo=thr/5 > 0.039`. The dead-end clamp experiment is documented here and removed from the code. Docs updated with the measured table and threshold guidance. Suite gate green (2D rate test bitwise-unchanged; 3D 16³ variant passes with partial masking).
+
+## Biermann battery: analytic benchmark + FLASH comparison (2026-07-27)
+
+4-agent campaign + adversarial critic (independent re-derivation of the analytic formula, independent re-runs reproducing every tested number to all printed digits).
+
+**Analytic agreement — YES, order ≈ 2.** Exact nonlinear early-time solution derived from the actual pgen/2T init: `dB3/dt = C_B·(fe0/f_e)·(p(x)/ρ(y))·a_p·a_ρ·k²·cos(kx)cos(ky)`. Measured: relL2 1.32e-2 → 3.32e-3 → 8.30e-4 → 2.08e-4 over 32²–256² (orders **1.994/1.998/1.994**); 3D 32³→64³ order 1.994 with bitwise z-invariance; `biermann_coefficient` linearity to |slope−1|~6e-13; amplitude bilinearity resolving the 1.5% nonlinear correction to ~5e-5; sign antisymmetry (as flip⊗x-reflection, bitwise); inert limits bitwise; dt formula transcription-verified ≤1e-13, dt∝1/C_B mantissa-exact over 3 decades; stability at C_B=1000 over 100 cycles (drift ≤5e-13). Qualifiers (critic): 32² at *default* mask settings carries 11% relL2 contamination (jumps 0.078 > thr/5 — under-resolved smooth gradients read as weak shocks; documented with numbers); divB/B1/B2/f_e(r=1) checks are structurally vacuous for this IC; 2D vs 3D flux-CT edge stencils differ at O(h²) (source-verified in AddEMFs, benign — "3D≡2D to round-off" is false).
+
+**FLASH agreement — YES to the released FLASH flux version, three deviations.** Sources actually obtained: FLASH UG Biermann section (fetched; key equations re-fetched independently by the critic) and Graziani et al. 2015 full text (arXiv:1408.4161 — note: not 1408.3455). Correspondence: (a) E = −C_B∇p_e/n_e with C_B ≡ normalized 1/e (1.0364e-4 = c·m_u/e, matches docs/UNITS_2T_LASER.md) — AGREES; (b) face-flux discretization = the UG's "naive" ∇p_e/(e·n_e) form (Graziani Eq. 41) — AGREES with FLASH-as-released; **both codes** deviate from the paper's shock-convergent ln(p_e)∇T_e form (Eq. 40); (c) flux-CT edge construction — mechanism agrees (Lee 2013 exact operator unverified); (d) electron-energy/Poynting coupling — same PDEs, different operator split; (e) v_TM dt limit algebraically identical to the UG formula (ratio 1.0), plus a per-cell |v_d| limiter FLASH lacks (the paper states no timestep analysis was done); (f) shock handling — DELIBERATE deviation: measured wide-band ramp vs hard shockDetect; (g) n_e=f_e·ρ fixed ionization vs 3T EOS Z̄ — RESTRICTION (no ionization-gradient battery, single material); (h) Biermann-catastrophe response consistent with UG practice. Unverified residuals: Lee 2013 edge operator, Fatenejad 2013 full text, UG cfl numeric range. Docs updated (`BIERMANN_BATTERY.md` validation section).
+
+## 3D multi-GPU performance: radiation + laser scaling + load balance (2026-07-27)
+
+97 sequential runs on 1–8 V100s, 3 reps/point, spreads ≤0.5%; critic reproduced the 8-GPU laser headline to 0.2% and recomputed every table from raw logs. (The two disjoint-GPU stage agents returned prematurely; the full-machine agent detected it and reran the complete matrices itself — all numbers below are from the internally consistent full-machine battery, devices 0..N-1.)
+
+**Strong scaling, 256³ = 16.8M cells (64× 64³ blocks), z-c/s medians:**
+
+| GPUs | 2T-MHD ctrl | eff | +laser(64 rays) | eff | laser tax | rad ctrl | +3-group FLD | eff | g3/g0 cost |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 8.12e7 | 100% | 7.66e7 | 100% | +5.9% | 7.82e7 | 3.79e7 | 100% | 2.06× |
+| 2 | 1.51e8 | 93% | 1.39e8 | 90% | +8.7% | 1.34e8 | 6.90e7 | 91% | 1.94× |
+| 4 | 2.39e8 | 74% | 2.09e8 | 68% | +14.1% | 1.87e8 | 1.07e8 | 71% | 1.74× |
+| 8 | 3.51e8 | 54% | 2.75e8 | 45% | +27.8% | 2.52e8 | 1.64e8 | 54% | 1.54× |
+
+- **8 GPUs beat 4 everywhere at 2.1M cells/rank** (1.31–1.52×) — the earlier 8<4 result was purely over-decomposition (0.49M/rank); break-even lies in the unsampled 0.72–2.1M/rank gap.
+- **Laser ray scaling: ray count is free** (16→1024 rays flat within noise at 256³ — cost is per-cycle transport machinery, not per-ray); the tax grows with rank count as the beam crosses ranks (transfers 0@4 → 64@8; fully migrating tilted beam +21.4% at 256 transfers/cycle). Caveat (critic): the laser control uses a different pgen (laser_profile refuses to run laser-less), so the tax carries a small untested state-dependence assumption.
+- **Radiation task scaling: cleanest result** — module-block-only control, equal dt proven; cost exactly linear in groups: **t ≈ 4.6 + 1.67·G ns/cell-cycle** (~31% of baseline per group, 12 groups = 2.1 GB/GPU); radiation *improves* relative scaling with rank count (more local compute per halo byte).
+- **Weak scaling**: 56.6% at matched 2.1M cells + 8 blocks/rank (1→8 GPUs; granularity-matched, not saturation-matched — 8 blocks under-fill one GPU by 19%).
+- **Load balance (adaptive 3D laser, 840 created/728 deleted blocks)**: block-count LB efficiency ≥0.991 in the worst churn phase, 1.000 settled; the real cost is regrid churn — 905 block migrations at 8 ranks with regrid cycles up to 22× a steady cycle (31.5% of wall time in spike cycles vs 8.8% at 4 ranks); settled adaptive tax only +5.8–7.4% over static SMR (the headline +17/+39% includes +4% genuine extra cells from refinement overshoot). Conservation bit-exact through all regrids, zero lost rays. The settled 5.8M-cell mesh over-decomposes at 8 ranks (0.72M/rank) — adaptive runs should size ranks to the *settled* mesh, not the root grid.
+- Device-topology note: devices 4–7 measured 5–7% faster than 0–3 on identical runs — pin device sets when comparing.
+
+**Practical guidance**: ≥2M cells/GPU for strong scaling; laser cost 6–28% depending on rank-crossing geometry (align meshblock decomposition with the beam where possible); radiation budget ~31% of base cost per group; expect regrid-churn spikes at high rank counts.
+
+
 ### B3 — CUDA+MPI build
 - Status: running (`build-gpu/`, logs `build-gpu-config.log`, `build-gpu-make.log`)

@@ -62,14 +62,39 @@ shock detection because a direct pressure-gradient discretization is not converg
 inside a discontinuity; AthenaK therefore enables symmetric shock suppression by default.
 
 **Mask shape (2026-07 validation):** the suppression mask ramps linearly from 1 at a
-pressure jump of `threshold/2` to 0 at `threshold` (a hard 0/1 edge was measured to
-inject ~4.7× more spurious B3 than it suppressed at a marginally resolved 64²
-discontinuity; the ramp halves that artifact at every tested threshold). Suppression
-still cannot beat the unsuppressed noise floor at marginal resolution with the default
-`threshold=0.25` — a transition in the face E-field is itself a curl source — so near
-marginally resolved shocks either lower the threshold (0.1 reached unsuppressed noise
-levels in testing while still zeroing strong shocks) or verify the mask's effect at
-your resolution. Positivity and energy conservation are unaffected in all cases.
+pressure jump of `threshold/5` to 0 at `threshold`. The wide band is deliberate: the
+mask edge is itself a curl source whose magnitude is set by |E| at the transition
+contour, so the 1-side of the ramp must sit in quiet flow well away from the
+discontinuity. Measured on a 64² Orszag–Tang shock (unsuppressed noise floor
+max|B3| = 3.3e-6): the original hard 0/1 edge injected 1.5e-5, a narrow
+[threshold/2, threshold] ramp 9.3e-6, and the current wide band 6.5e-6 at the default
+`threshold = 0.25` — and `threshold = 0.1` drops *below* the unsuppressed floor
+(2.1e-6 max, 3.8e-7 rms) while still zeroing the battery inside shocks. Noise is
+monotone in the threshold. Guidance: at marginal resolution prefer `threshold ≈ 0.1`
+*provided* your smooth-flow battery gradients stay below jump ≈ threshold/5 per two
+cells (the analytic regression setup at 64² has jumps of 0.039, which is why the
+default keeps `threshold = 0.25`, giving a mask that is exactly 1 there; the same
+setup at 32² has jumps of 0.078 and the partially active mask contaminates the
+battery by ~14% — under-resolved smooth gradients look like weak shocks to the
+detector, exactly as in FLASH). Positivity and energy conservation are unaffected
+in all configurations.
+
+**Analytic and FLASH validation (2026-07):** against the exact nonlinear early-time
+solution of the crossed-gradient problem the module converges at order 1.994–1.998
+(2D 32²–256² and 3D, suppression off), with exact `biermann_coefficient` linearity
+and a machine-verified timestep formula (dt ∝ 1/C_B mantissa-exact). Formulation
+comparison against the FLASH User Guide (fetched) and Graziani et al. 2015 (ApJ
+802:43, full text): the E-field convention (`biermann_coefficient` ≡ normalized
+1/e), face-flux discretization, flux-CT edge construction, electron-energy/Poynting
+coupling, and the thermal-magnetic wave-speed dt limit all agree with FLASH's
+released flux version (AthenaK additionally limits on the electron drift speed).
+Note both codes implement the "naive" `∇p_e/(e·n_e)` flux (Graziani Eq. 41), not
+the paper's shock-convergent `ln(p_e)∇T_e` form (Eq. 40). Deliberate deviations:
+the ramped mask above (vs FLASH's hard `shockDetect`) and the fixed-ionization
+`n_e = f_e·ρ` model (vs FLASH's 3T EOS Z̄) — no ionization-gradient battery,
+single-material plasmas only. The 2D and 3D flux-CT edge stencils differ at O(h²)
+(dimensional reduction of the arithmetic average), so z-invariant 3D runs agree
+with 2D runs to truncation, not round-off.
 
 Note the face drift velocities used by the electron-work term are computed per
 refinement level and are not SMR/AMR flux-corrected (unlike the dual-energy face

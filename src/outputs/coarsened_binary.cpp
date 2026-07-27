@@ -336,6 +336,10 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // 2. Current time
   // 3. List of variables in the file
   // 4. Header (input file information)
+  // Cell data is 4-byte floats unless <output>/double_precision_binary=true;
+  // readers key on the "size of variable" header field.
+  const bool cbin_dp = out_params.double_precision_binary;
+  const std::size_t cbin_varsize = cbin_dp ? sizeof(double) : sizeof(float);
   {std::stringstream msg;
   msg << "Athena binary output version=1.1" << std::endl
       // preheader size includes "size of preheader" line up to "number of variables"
@@ -345,7 +349,7 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       << "  number of moments=" << number_of_moments << std::endl
       << "  coarsening factor=" << out_params.coarsen_factor << std::endl
       << "  size of location=" << sizeof(Real) << std::endl
-      << "  size of variable=" << sizeof(float) << std::endl
+      << "  size of variable=" << cbin_varsize << std::endl
       << "  number of variables=" << outvars.size()*number_of_moments << std::endl
       << "  variables:  ";
   if (out_params.compute_moments) {
@@ -398,14 +402,15 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // ois, oie, ojs, oje, oks, oke + il1, il2, il3, level +
   // x1min, x1max, x2min, x2max, x3min, x3max + data
   std::size_t data_size = 10*sizeof(int32_t) + 6*sizeof(Real)
-                        + (cells*nout_vars)*sizeof(float);
+                        + (cells*nout_vars)*cbin_varsize;
 
   int ns_mbs = pm->gids_eachrank[global_variable::my_rank];
   int nb_mbs = pm->nmb_eachrank[global_variable::my_rank];
 
-  // allocate 1D vector of floats used to convert and output data
+  // allocate 1D vector of floats (or doubles) used to convert and output data
   char *data = new char[nb_mbs*data_size];
   float *single_data = new float[cells];
+  double *double_data = cbin_dp ? new double[cells] : nullptr;
 
   // Loop over MeshBlocks
   for (int m=0; m<nout_mbs; ++m) {
@@ -480,20 +485,26 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     pdata+=sizeof(xv);
 
     // output variables
-    float tmp_data;
     for (int n=0; n<nout_vars; n++) {
       int cnt=0;
       for (int k=oks; k<=oke; k++) {
         for (int j=ojs; j<=oje; j++) {
           for (int i=ois; i<=oie; i++) {
-            tmp_data = static_cast<float>(outarray(n,m,k-oks,j-ojs,i-ois));
-            single_data[cnt] = tmp_data;
+            if (cbin_dp) {
+              double_data[cnt] = static_cast<double>(outarray(n,m,k-oks,j-ojs,i-ois));
+            } else {
+              single_data[cnt] = static_cast<float>(outarray(n,m,k-oks,j-ojs,i-ois));
+            }
             cnt++;
           }
         }
       }
-      memcpy(pdata,single_data,cells*sizeof(float));
-      pdata+=cells*sizeof(float);
+      if (cbin_dp) {
+        memcpy(pdata,double_data,cells*sizeof(double));
+      } else {
+        memcpy(pdata,single_data,cells*sizeof(float));
+      }
+      pdata+=cells*cbin_varsize;
     }
   }
 
@@ -559,6 +570,7 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   cbinfile.Close(single_file_per_rank);
   delete [] data;
   delete [] single_data;
+  delete [] double_data;
 
   // increment counters
   out_params.file_number++;

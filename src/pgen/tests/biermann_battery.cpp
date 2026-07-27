@@ -32,11 +32,12 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
     return;
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
-  if (pmbp->pmhd == nullptr || pmbp->pmhd->pbiermann == nullptr) {
+  if (pmbp->pmhd == nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
-              << "Biermann battery test requires <mhd>/biermann_battery=true"
-              << std::endl;
+              << "Biermann battery test requires <mhd> (the initial state does not "
+              << "depend on the battery, so <mhd>/biermann_battery=false is allowed "
+              << "as a zero-field control)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 

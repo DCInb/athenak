@@ -83,6 +83,10 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // 2. Current time
   // 3. List of variables in the file
   // 4. Header (input file information)
+  // Cell data is 4-byte floats unless <output>/double_precision_binary=true;
+  // readers key on the "size of variable" header field.
+  const bool dp = out_params.double_precision_binary;
+  const std::size_t varsize = dp ? sizeof(double) : sizeof(float);
   {
     std::stringstream msg;
     const int time_precision = std::numeric_limits<Real>::max_digits10 - 1;
@@ -93,7 +97,7 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
         << "  time=" << pm->time << std::endl
         << "  cycle=" << pm->ncycle << std::endl
         << "  size of location=" << sizeof(Real) << std::endl
-        << "  size of variable=" << sizeof(float) << std::endl
+        << "  size of variable=" << varsize << std::endl
         << "  number of variables=" << outvars.size() << std::endl
         << "  variables:  ";
     for (size_t n=0; n<outvars.size(); n++) {
@@ -138,14 +142,15 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // ois, oie, ojs, oje, oks, oke + il1, il2, il3, level +
   // x1min, x1max, x2min, x2max, x3min, x3max + data
   std::size_t data_size = 10*sizeof(int32_t) + 6*sizeof(Real)
-                        + (cells*nout_vars)*sizeof(float);
+                        + (cells*nout_vars)*varsize;
 
   int ns_mbs = pm->gids_eachrank[global_variable::my_rank];
   int nb_mbs = pm->nmb_eachrank[global_variable::my_rank];
 
-  // allocate 1D vector of floats used to convert and output data
+  // allocate 1D vector of floats (or doubles) used to convert and output data
   char *data = new char[nb_mbs*data_size];
   float *single_data = new float[cells];
+  double *double_data = dp ? new double[cells] : nullptr;
 
   // Loop over MeshBlocks
   for (int m=0; m<nout_mbs; ++m) {
@@ -215,20 +220,26 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     pdata+=sizeof(xv);
 
     // output variables
-    float tmp_data;
     for (int n=0; n<nout_vars; n++) {
       int cnt=0;
       for (int k=oks; k<=oke; k++) {
         for (int j=ojs; j<=oje; j++) {
           for (int i=ois; i<=oie; i++) {
-            tmp_data = static_cast<float>(outarray(n,m,k-oks,j-ojs,i-ois));
-            single_data[cnt] = tmp_data;
+            if (dp) {
+              double_data[cnt] = static_cast<double>(outarray(n,m,k-oks,j-ojs,i-ois));
+            } else {
+              single_data[cnt] = static_cast<float>(outarray(n,m,k-oks,j-ojs,i-ois));
+            }
             cnt++;
           }
         }
       }
-      memcpy(pdata,single_data,cells*sizeof(float));
-      pdata+=cells*sizeof(float);
+      if (dp) {
+        memcpy(pdata,double_data,cells*sizeof(double));
+      } else {
+        memcpy(pdata,single_data,cells*sizeof(float));
+      }
+      pdata+=cells*varsize;
     }
   }
 
@@ -304,6 +315,7 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   binfile.Close(single_file_per_rank);
   delete [] data;
   delete [] single_data;
+  delete [] double_data;
 
   // increment counters
   out_params.file_number++;
