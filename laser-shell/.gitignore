@@ -1,0 +1,7 @@
+build/
+run/
+logs/
+plots/
+diagnostics.md
+results.json
+run_status.json

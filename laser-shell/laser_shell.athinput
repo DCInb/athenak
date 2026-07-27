@@ -1,0 +1,136 @@
+# Physically normalized 3D laser drive of an open spherical-cap CH shell.
+# Code length = 1 mm and code time = 1 ns. The base run stops at the 5 ns pulse edge;
+# run_case.py restarts laser-off and advances the same state to 10 ns.
+
+<job>
+basename = laser_shell
+
+<units>
+length_cgs = 1.0e-1
+mass_cgs = 1.1e-3
+time_cgs = 1.0e-9
+mu = 1.4444444444444444
+
+<mesh>
+nghost = 2
+nx1 = 140
+x1min = -1.5
+x1max = 2.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 80
+x2min = -1.0
+x2max = 1.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 80
+x3min = -1.0
+x3max = 1.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 20
+nx2 = 20
+nx3 = 20
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 5.0
+ndiag = 10
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+density_floor = 1.0e-8
+pressure_floor = 1.0e-12
+two_temperature = true
+dual_energy = true
+electron_heat_capacity_fraction = 0.7777777777777778
+initial_electron_temperature_ratio = 1.0
+t_ei = 0.0
+
+<laser>
+model = straight
+deposition_target = electron
+electron_temperature_model = two_temperature
+absorption_model = inverse_bremsstrahlung
+unit_system = cgs
+electron_number_per_gram = 3.242691463909014e23
+inverse_bremsstrahlung_coulomb_log = 5.0
+critical_reflection = true
+oblique_turning = true
+max_reflections_per_ray = 8
+reflection_offset_fraction = 1.0e-3
+nbeams = 1
+max_segments_per_launch = 64
+max_transport_iterations = 256
+max_mpi_waves = 2048
+gpu_aware_mpi = false
+minimum_power_fraction = 1.0e-14
+conservation_tolerance = 1.0e-10
+periodic_transport = false
+report_diagnostics = true
+
+# A 2 TW square pulse lasting 5 ns carries exactly 10 kJ. For AthenaK's Gaussian
+# profile, radius is both the hard aperture radius and the 1/e^2 intensity radius.
+beam0_power = 2.0e19
+beam0_wavelength = 1.053e-4
+beam0_nrays = 1024
+beam0_origin_x1 = -1.5
+beam0_origin_x2 = 0.0
+beam0_origin_x3 = 0.0
+beam0_direction_x1 = 1.0
+beam0_direction_x2 = 0.0
+beam0_direction_x3 = 0.0
+beam0_radius = 0.32
+beam0_profile = gaussian
+beam0_zeff = 5.285714285714286
+beam0_start_time = 0.0
+beam0_end_time = 5.0
+
+<problem>
+user_hist = true
+ambient_density = 1.0e-6
+solid_density = 1.0
+# 1 keV initial ion/electron temperature in the unit system above.
+temperature = 6.679753382762792e-2
+inner_radius = 0.8
+outer_radius = 1.0
+# The requested 50 degree opening is treated as a full included angle.
+opening_half_angle_deg = 25.0
+transition_width = 2.0e-2
+angular_transition = 1.0e-2
+
+<output1>
+file_type = hst
+user_hist_only = true
+data_format = %20.12e
+dt = 2.5e-1
+
+<output2>
+file_type = bin
+variable = mhd_w_bcc
+id = fluid
+dt = 2.5
+
+<output3>
+file_type = bin
+variable = mhd_2t
+id = two_temperature
+dt = 2.5
+
+<output4>
+file_type = bin
+variable = laser
+id = laser
+dt = 2.5
+
+<output5>
+file_type = rst
+dt = 5.0
