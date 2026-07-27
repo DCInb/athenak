@@ -6,6 +6,7 @@
 //! \file driver.cpp
 //  \brief implementation of functions in class Driver
 
+#include <cmath>
 #include <iostream>
 #include <iomanip>    // std::setprecision()
 #include <limits>
@@ -61,6 +62,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   tlim(-1.0),
   nlim(-1),
   ndiag(1),
+  align_outputs(false),
+  initial_dt(-1.0),
   pwall_clock_(ptimer),
   wall_time(wtlim),
   nmb_updated_(0),
@@ -88,6 +91,14 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
     tlim = pin->GetReal("time", "tlim");
     nlim = pin->GetOrAddInteger("time", "nlim", -1);
     ndiag = pin->GetOrAddInteger("time", "ndiag", 1);
+    align_outputs = pin->GetOrAddBoolean("time", "align_outputs", false);
+    initial_dt = pin->GetOrAddReal("time", "initial_dt", -1.0);
+    if (initial_dt == 0.0 || !std::isfinite(initial_dt)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<time>/initial_dt must be positive or omitted"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
 
     if (integrator == "rk1") {
       // RK1: first-order Runge-Kutta / the forward Euler (FE) method
@@ -306,6 +317,29 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
+//! Shorten the next step so time-based outputs represent their requested physical time.
+//! This is opt-in because exact output alignment can add timesteps to existing problems.
+
+void Driver::LimitTimeStepToNextOutput(Mesh *pm, Outputs *pout) {
+  if (!align_outputs || time_evolution == TimeEvolution::tstatic) return;
+
+  Real next_event = tlim;
+  const Real tolerance = 16.0*std::numeric_limits<Real>::epsilon()*
+      std::max(std::abs(pm->time), 1.0);
+  for (auto &out : pout->pout_list) {
+    const auto &params = out->out_params;
+    if (!(params.dt > 0.0)) continue;
+    const Real candidate = params.last_time + params.dt;
+    if (candidate > pm->time + tolerance) {
+      next_event = std::min(next_event, candidate);
+    }
+  }
+  if (next_event > pm->time + tolerance && pm->time + pm->dt > next_event) {
+    pm->dt = next_event - pm->time;
+  }
+}
+
+//----------------------------------------------------------------------------------------
 // Driver::Initialize()
 // Tasks to be performed before execution of Driver, such as setting ghost zones (BCs),
 //  outputting ICs, and computing initial time step
@@ -379,6 +413,9 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
     }
 
     pmesh->NewTimeStep(tlim);
+    if (!res_flag && initial_dt > 0.0) {
+      pmesh->dt = std::min(pmesh->dt, initial_dt);
+    }
   }
 
   //---- Step 3.  Cycle through output Types and load data / write files.
@@ -388,6 +425,7 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
       out->WriteOutputFile(pmesh, pin);
     }
   }
+  LimitTimeStepToNextOutput(pmesh, pout);
 
   //---- Step 4.  Initialize various counters, timers, etc.
   run_time_.reset();
@@ -487,6 +525,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
       // compute new timestep AFTER all Meshblocks refined/derefined
       pmesh->NewTimeStep(tlim);
+      LimitTimeStepToNextOutput(pmesh, pout);
 
       // Update wall clock time if needed.
       if (wall_time > 0.) {

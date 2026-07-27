@@ -36,6 +36,8 @@ class Driver {
   Real tlim;      // stopping time
   int nlim;       // cycle-limit
   int ndiag;      // cycles between output of diagnostic information
+  bool align_outputs; // shorten steps to land exactly on scheduled time outputs
+  Real initial_dt; // optional first-step cap for stiff startup sources
   // variables for various SSP and ImEx RK integrators
   std::string integrator;          // integrator name (rk1, rk2, rk3)
   int nimp_stages;                 // number of implicit stages (ImEx only)
@@ -61,6 +63,7 @@ class Driver {
   std::uint64_t npart_updated_; // running total of particles updated during run
   float lb_efficiency_;         // measure of how efficient was load balancing
   void OutputCycleDiagnostics(Mesh *pm);
+  void LimitTimeStepToNextOutput(Mesh *pm, Outputs *pout);
   Real UpdateWallClock();
 };
 #endif // DRIVER_DRIVER_HPP_

@@ -149,6 +149,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "power_scale_cgs", power_scale_cgs_);
   inverse_bremsstrahlung_coulomb_log_ = pin->GetOrAddReal(
       "laser", "inverse_bremsstrahlung_coulomb_log", -1.0);
+  inverse_bremsstrahlung_temperature_floor_ = pin->GetOrAddReal(
+      "laser", "inverse_bremsstrahlung_temperature_floor", 0.0);
   electron_number_per_gram_ = pin->GetOrAddReal(
       "laser", "electron_number_per_gram", 0.0);
   if (absorption_model_ == AbsorptionModel::inverse_bremsstrahlung &&
@@ -159,6 +161,11 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (!Finite(inverse_bremsstrahlung_coulomb_log_)) {
     LaserInputError("inverse_bremsstrahlung_coulomb_log must be finite");
+  }
+  if (!Finite(inverse_bremsstrahlung_temperature_floor_) ||
+      inverse_bremsstrahlung_temperature_floor_ < 0.0) {
+    LaserInputError("inverse_bremsstrahlung_temperature_floor must be finite and "
+                    "non-negative");
   }
 
   max_segments_per_launch_ = pin->GetOrAddInteger(

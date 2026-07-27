@@ -414,6 +414,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   Real temperature_scale_cgs = temperature_scale_cgs_;
   Real length_scale_cgs = length_scale_cgs_;
   Real fixed_coulomb_log = inverse_bremsstrahlung_coulomb_log_;
+  Real ib_temperature_floor = inverse_bremsstrahlung_temperature_floor_;
   Real minimum_power_fraction = minimum_power_fraction_;
   bool reflect_at_critical = critical_reflection_;
   bool oblique_turning = oblique_turning_;
@@ -545,8 +546,10 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
                 Real electron_energy =
                     fmax(primitive(m, electron_index, k, j, i), 0.0);
-                Real electron_temperature = gamma_minus_one*electron_energy/
-                    electron_heat_capacity_fraction*temperature_scale_cgs;
+                Real electron_temperature = fmax(
+                    gamma_minus_one*electron_energy/
+                    electron_heat_capacity_fraction*temperature_scale_cgs,
+                    ib_temperature_floor);
                 Real electron_density = density*density_scale_cgs*
                     electron_number_per_gram;
                 Real wavelength_cgs = wavelength(r)*length_scale_cgs;
@@ -792,6 +795,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   Real temperature_scale_cgs = temperature_scale_cgs_;
   Real length_scale_cgs = length_scale_cgs_;
   Real fixed_coulomb_log = inverse_bremsstrahlung_coulomb_log_;
+  Real ib_temperature_floor = inverse_bremsstrahlung_temperature_floor_;
   Real minimum_power_fraction = minimum_power_fraction_;
   Real cell_fraction = refractive_cell_fraction_;
   Real curvature_fraction = refractive_curvature_fraction_;
@@ -892,8 +896,10 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
               Real electron_energy =
                   fmax(primitive(m, electron_index, k, j, i), 0.0);
-              Real electron_temperature = gamma_minus_one*electron_energy/
-                  electron_heat_capacity_fraction*temperature_scale_cgs;
+              Real electron_temperature = fmax(
+                  gamma_minus_one*electron_energy/
+                  electron_heat_capacity_fraction*temperature_scale_cgs,
+                  ib_temperature_floor);
               Real ne = density*density_scale_cgs*electron_number_per_gram;
               Real wavelength_cgs = wavelength(r)*length_scale_cgs;
               coefficient = InverseBremsstrahlungCoefficient(

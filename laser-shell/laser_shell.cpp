@@ -34,8 +34,8 @@ void LaserShellHistory(HistoryData *pdata, Mesh *pm);
 } // namespace
 
 //----------------------------------------------------------------------------------------
-//! Initialize a spherical shell cap centered on the +x1 axis. The laser enters from
-//! negative x1, crosses the open side, and illuminates the concave inner shell surface.
+//! Initialize a spherical shell cap centered on the -x1 axis. The laser enters from
+//! positive x1, crosses the open side, and illuminates the concave inner shell surface.
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   user_hist_func = LaserShellHistory;
@@ -53,11 +53,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
 
   const Real ambient_density =
-      pin->GetOrAddReal("problem", "ambient_density", 1.0e-6);
+      pin->GetOrAddReal("problem", "ambient_density", 1.0e-8);
   const Real solid_density =
       pin->GetOrAddReal("problem", "solid_density", 1.0);
   const Real temperature =
-      pin->GetOrAddReal("problem", "temperature", 6.679753382762792e-2);
+      pin->GetOrAddReal("problem", "temperature", 1.7268498302462577e-6);
   const Real inner_radius =
       pin->GetOrAddReal("problem", "inner_radius", 0.8);
   const Real outer_radius =
@@ -87,6 +87,23 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const Real gm1 = pmbp->pmhd->peos->eos_data.gamma - 1.0;
   const Real pi = std::acos(-1.0);
   const Real cos_half_angle = std::cos(opening_half_angle_deg*pi/180.0);
+  const Real beam_origin_x1 = pin->GetReal("laser", "beam0_origin_x1");
+  const Real beam_direction_x1 = pin->GetReal("laser", "beam0_direction_x1");
+  const Real beam_direction_x2 = pin->GetReal("laser", "beam0_direction_x2");
+  const Real beam_direction_x3 = pin->GetReal("laser", "beam0_direction_x3");
+  const Real beam_radius = pin->GetReal("laser", "beam0_radius");
+  const Real origin_tolerance = 1.0e-12*
+      std::fmax(std::abs(pmy_mesh_->mesh_size.x1max), 1.0);
+  const Real projected_inner_radius =
+      inner_radius*std::sin(opening_half_angle_deg*pi/180.0);
+  if (std::abs(beam_origin_x1-pmy_mesh_->mesh_size.x1max) > origin_tolerance ||
+      std::abs(beam_direction_x1+1.0) > origin_tolerance ||
+      std::abs(beam_direction_x2) > origin_tolerance ||
+      std::abs(beam_direction_x3) > origin_tolerance ||
+      !(beam_radius > 0.0) || beam_radius > projected_inner_radius) {
+    ProblemError("laser_shell requires a -x1 beam launched from the right boundary "
+                 "with an aperture no larger than the projected inner cap");
+  }
 
   Kokkos::deep_copy(w0, 0.0);
   Kokkos::deep_copy(bcc0, 0.0);
@@ -104,7 +121,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real x3 = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                 size.d_view(m).x3max);
     const Real radius = sqrt(x1*x1 + x2*x2 + x3*x3);
-    const Real axis_cosine = (radius > 0.0) ? x1/radius : -1.0;
+    const Real axis_cosine = (radius > 0.0) ? -x1/radius : -1.0;
 
     const Real inside_outer =
         0.5*(1.0 - tanh((radius-outer_radius)/transition_width));
