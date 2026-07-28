@@ -10,6 +10,8 @@
 
 #include "athena.hpp"
 
+#include <string>
+
 class ParameterInput;
 
 namespace two_temperature {
@@ -31,6 +33,8 @@ struct OpacityTableDevice {
   int ndensity = 0;
   int ntemperature = 0;
   bool log_interpolation = false;
+  bool geometric_interpolation = false;
+  bool log_coordinates = false;
   Real density_scale = 1.0;
   Real temperature_scale = 1.0;
   Real transport_scale = 1.0;
@@ -60,7 +64,12 @@ struct OpacityTableDevice {
           }
         }
         id0 = lower;
-        fd = (d-density(lower))/(density(upper)-density(lower));
+        if (log_coordinates) {
+          fd = (log(d)-log(density(lower)))/
+               (log(density(upper))-log(density(lower)));
+        } else {
+          fd = (d-density(lower))/(density(upper)-density(lower));
+        }
       }
     }
 
@@ -82,18 +91,33 @@ struct OpacityTableDevice {
           }
         }
         it0 = lower;
-        ft = (t-temperature(lower))/(temperature(upper)-temperature(lower));
+        if (log_coordinates) {
+          ft = (log(t)-log(temperature(lower)))/
+               (log(temperature(upper))-log(temperature(lower)));
+        } else {
+          ft = (t-temperature(lower))/(temperature(upper)-temperature(lower));
+        }
       }
     }
 
     int id1 = (ndensity > 1) ? id0+1 : id0;
     int it1 = (ntemperature > 1) ? it0+1 : it0;
-    Real lower = (1.0-ft)*values(kind, group, id0, it0)
-                 + ft*values(kind, group, id0, it1);
-    Real upper = (1.0-ft)*values(kind, group, id1, it0)
-                 + ft*values(kind, group, id1, it1);
-    Real result = (1.0-fd)*lower + fd*upper;
-    if (log_interpolation) result = exp(result);
+    const Real v00 = values(kind, group, id0, it0);
+    const Real v01 = values(kind, group, id0, it1);
+    const Real v10 = values(kind, group, id1, it0);
+    const Real v11 = values(kind, group, id1, it1);
+    Real result;
+    if (geometric_interpolation && v00 > 0.0 && v01 > 0.0 &&
+        v10 > 0.0 && v11 > 0.0) {
+      const Real lower = (1.0-ft)*log(v00)+ft*log(v01);
+      const Real upper = (1.0-ft)*log(v10)+ft*log(v11);
+      result = exp((1.0-fd)*lower+fd*upper);
+    } else {
+      const Real lower = (1.0-ft)*v00+ft*v01;
+      const Real upper = (1.0-ft)*v10+ft*v11;
+      result = (1.0-fd)*lower+fd*upper;
+      if (log_interpolation) result = exp(result);
+    }
 
     if (kind == opacity_transport) return result*transport_scale;
     if (kind == opacity_absorption) return result*absorption_scale;
@@ -109,6 +133,9 @@ class OpacityTable {
  public:
   OpacityTable(ParameterInput *pin, int expected_groups,
                const DualArray1D<Real> &expected_group_bounds);
+  OpacityTable(ParameterInput *pin, int expected_groups,
+               const DualArray1D<Real> &expected_group_bounds,
+               const std::string &input_block, const std::string &parameter_prefix);
   ~OpacityTable() = default;
 
   OpacityTableDevice DeviceData() const;
@@ -118,6 +145,8 @@ class OpacityTable {
   int ntemperature_;
   int ngroups_;
   bool log_interpolation_;
+  bool geometric_interpolation_;
+  bool log_coordinates_;
   Real density_scale_;
   Real temperature_scale_;
   Real transport_scale_;
@@ -127,6 +156,40 @@ class OpacityTable {
   DualArray1D<Real> density_;
   DualArray1D<Real> temperature_;
   DualArray4D<Real> values_;
+};
+
+//----------------------------------------------------------------------------------------
+//! \struct MixedOpacityTableDevice
+//! \brief Partial-density, mass-weighted additive two-material opacity closure.
+
+struct MixedOpacityTableDevice {
+  OpacityTableDevice material0;
+  OpacityTableDevice material1;
+
+  KOKKOS_INLINE_FUNCTION
+  Real Get(int kind, int group, Real density, Real temperature, Real y0_in) const {
+    const Real y0 = fmin(fmax(y0_in, 0.0), 1.0);
+    Real result = 0.0;
+    if (y0 > 0.0) result += y0*material0.Get(kind, group, density*y0, temperature);
+    if (y0 < 1.0) {
+      result += (1.0-y0)*material1.Get(
+          kind, group, density*(1.0-y0), temperature);
+    }
+    return result;
+  }
+};
+
+class MixedOpacityTable {
+ public:
+  MixedOpacityTable(ParameterInput *pin, int expected_groups,
+                    const DualArray1D<Real> &expected_group_bounds);
+  ~MixedOpacityTable() = default;
+
+  MixedOpacityTableDevice DeviceData() const;
+
+ private:
+  OpacityTable material0_;
+  OpacityTable material1_;
 };
 
 } // namespace two_temperature

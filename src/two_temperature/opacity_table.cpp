@@ -145,44 +145,68 @@ std::size_t TableValueIndex(int kind, int group, int density, int temperature,
 
 OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
     const DualArray1D<Real> &expected_group_bounds) :
+    OpacityTable(pin, expected_groups, expected_group_bounds,
+                 "thermal_radiation", "opacity") {}
+
+OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
+    const DualArray1D<Real> &expected_group_bounds,
+    const std::string &input_block, const std::string &parameter_prefix) :
     ndensity_(0),
     ntemperature_(0),
     ngroups_(expected_groups),
     log_interpolation_(false),
+    geometric_interpolation_(false),
+    log_coordinates_(false),
     density_scale_(1.0),
     temperature_scale_(1.0),
     transport_scale_(1.0),
     absorption_scale_(1.0),
     emission_scale_(1.0),
-    density_("opacity-table-density", 1),
-    temperature_("opacity-table-temperature", 1),
-    values_("opacity-table-values", 1, 1, 1, 1) {
-  std::string filename =
-      pin->GetString("thermal_radiation", "opacity_table_file");
+    density_(parameter_prefix + "-table-density", 1),
+    temperature_(parameter_prefix + "-table-temperature", 1),
+    values_(parameter_prefix + "-table-values", 1, 1, 1, 1) {
+  const auto key = [&parameter_prefix](const std::string &suffix) {
+    return parameter_prefix + "_" + suffix;
+  };
+  std::string filename = pin->GetString(input_block, key("table_file"));
   std::string interpolation = pin->GetOrAddString(
-      "thermal_radiation", "opacity_interpolation", "linear");
+      input_block, key("interpolation"), "linear");
   if (interpolation == "linear") {
     log_interpolation_ = false;
   } else if (interpolation == "log") {
     log_interpolation_ = true;
+  } else if (interpolation == "geometric" || interpolation == "hybrid") {
+    geometric_interpolation_ = true;
   } else {
-    OpacityTableError(filename, "opacity_interpolation must be 'linear' or 'log'");
+    OpacityTableError(filename, key("interpolation")+
+                      " must be 'linear', 'log', or 'geometric'");
+  }
+
+  const std::string coordinate_interpolation = pin->GetOrAddString(
+      input_block, key("coordinate_interpolation"), "linear");
+  if (coordinate_interpolation == "linear") {
+    log_coordinates_ = false;
+  } else if (coordinate_interpolation == "log") {
+    log_coordinates_ = true;
+  } else {
+    OpacityTableError(filename, key("coordinate_interpolation")+
+                      " must be 'linear' or 'log'");
   }
 
   density_scale_ = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_density_scale", 1.0);
+      input_block, key("density_scale"), 1.0);
   temperature_scale_ = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_temperature_scale", 1.0);
+      input_block, key("temperature_scale"), 1.0);
   Real group_scale = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_group_bound_scale", 1.0);
+      input_block, key("group_bound_scale"), 1.0);
   Real opacity_scale = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_value_scale", 1.0);
+      input_block, key("value_scale"), 1.0);
   transport_scale_ = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_transport_scale", opacity_scale);
+      input_block, key("transport_scale"), opacity_scale);
   absorption_scale_ = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_absorption_scale", opacity_scale);
+      input_block, key("absorption_scale"), opacity_scale);
   emission_scale_ = pin->GetOrAddReal(
-      "thermal_radiation", "opacity_emission_scale", opacity_scale);
+      input_block, key("emission_scale"), opacity_scale);
   if (!std::isfinite(density_scale_) || !std::isfinite(temperature_scale_) ||
       !std::isfinite(group_scale) || !std::isfinite(opacity_scale) ||
       !std::isfinite(transport_scale_) || !std::isfinite(absorption_scale_) ||
@@ -248,9 +272,14 @@ OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
       tokens.Expect("temperature");
       for (int it = 0; it < ntemperature_; ++it) {
         Real value = tokens.Number("electron-temperature coordinate");
-        if (value < 0.0 || (it > 0 && value <= temperature_values[it-1])) {
+        if (value < 0.0 || (log_coordinates_ && value <= 0.0) ||
+            (it > 0 && value <= temperature_values[it-1])) {
           throw std::runtime_error(
-              "electron-temperature coordinates must be non-negative and increasing");
+              log_coordinates_
+                  ? "log-interpolated temperature coordinates must be positive and "
+                    "increasing"
+                  : "electron-temperature coordinates must be non-negative and "
+                    "increasing");
         }
         temperature_values[it] = value;
       }
@@ -382,8 +411,12 @@ OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
   values_.sync_device();
 
   if (global_variable::my_rank == 0) {
-    std::cout << "Loaded " << (log_interpolation_ ? "log-interpolated" : "linearly "
-              "interpolated") << " opacity table " << filename << std::endl
+    const char *value_mode = log_interpolation_ ? "log-interpolated" :
+        (geometric_interpolation_ ? "zero-safe geometrically interpolated" :
+         "linearly interpolated");
+    std::cout << "Loaded " << value_mode << " opacity table " << filename
+              << " with " << (log_coordinates_ ? "log" : "linear")
+              << " coordinates" << std::endl
               << "  density = [" << density_.h_view(0) << ", "
               << density_.h_view(ndensity_-1) << "]" << std::endl
               << "  electron temperature = [" << temperature_.h_view(0) << ", "
@@ -402,11 +435,30 @@ OpacityTableDevice OpacityTable::DeviceData() const {
   result.ndensity = ndensity_;
   result.ntemperature = ntemperature_;
   result.log_interpolation = log_interpolation_;
+  result.geometric_interpolation = geometric_interpolation_;
+  result.log_coordinates = log_coordinates_;
   result.density_scale = density_scale_;
   result.temperature_scale = temperature_scale_;
   result.transport_scale = transport_scale_;
   result.absorption_scale = absorption_scale_;
   result.emission_scale = emission_scale_;
+  return result;
+}
+
+//----------------------------------------------------------------------------------------
+
+MixedOpacityTable::MixedOpacityTable(
+    ParameterInput *pin, int expected_groups,
+    const DualArray1D<Real> &expected_group_bounds) :
+    material0_(pin, expected_groups, expected_group_bounds,
+               "materials", "material0_opacity"),
+    material1_(pin, expected_groups, expected_group_bounds,
+               "materials", "material1_opacity") {}
+
+MixedOpacityTableDevice MixedOpacityTable::DeviceData() const {
+  MixedOpacityTableDevice result;
+  result.material0 = material0_.DeviceData();
+  result.material1 = material1_.DeviceData();
   return result;
 }
 

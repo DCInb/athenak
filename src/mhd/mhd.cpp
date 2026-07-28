@@ -21,6 +21,7 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "bvals/bvals.hpp"
+#include "materials/material_mixture.hpp"
 #include "mhd/biermann_battery.hpp"
 #include "mhd/mhd.hpp"
 #include "two_temperature/two_temperature.hpp"
@@ -105,6 +106,19 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   // (2) Initialize scalars, two-temperature model, diffusion, and source terms
   nuser_scalars = pin->GetOrAddInteger("mhd", "nscalars", 0);
   nscalars = nuser_scalars;
+  if (pin->DoesBlockExist("materials")) {
+    if (!peos->eos_data.is_gamma_law ||
+        pmy_pack->pcoord->is_special_relativistic ||
+        pmy_pack->pcoord->is_general_relativistic ||
+        pmy_pack->pcoord->is_dynamical_relativistic) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<materials> currently requires Newtonian ideal-gas MHD"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    pmaterials = new materials::MaterialMixture(
+        pin, nmhd, nuser_scalars, peos->eos_data.gamma);
+  }
   bool use_two_temperature = pin->GetOrAddBoolean("mhd", "two_temperature", false);
   if (use_two_temperature) {
     if (!peos->eos_data.is_gamma_law || pmy_pack->pcoord->is_special_relativistic ||
@@ -117,7 +131,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
     ptwo_temp = new two_temperature::TwoTemperature(
-        "mhd", ppack, pin, nmhd + nuser_scalars);
+        "mhd", ppack, pin, nmhd + nuser_scalars, pmaterials);
     nscalars += 2 + ptwo_temp->NumberOfRadiationGroups();
   } else if (pin->DoesBlockExist("thermal_radiation") &&
              pin->GetOrAddBoolean("thermal_radiation", "enabled", true)) {
@@ -147,7 +161,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     // Mesh construction — no separate guard is reachable here.)
     pbiermann = new BiermannBattery(
         ppack, pin, ptwo_temp->iele, ptwo_temp->ElectronHeatCapacityFraction(),
-        peos->eos_data.gamma, peos->eos_data.dfloor, peos->eos_data.pfloor);
+        peos->eos_data.gamma, peos->eos_data.dfloor, peos->eos_data.pfloor,
+        pmaterials);
   }
 
   // In 2T MHD the ion+electron energy sum is the auxiliary internal energy.  Enable
@@ -513,6 +528,7 @@ MHD::~MHD() {
   if (pvisc != nullptr) {delete pvisc;}
   if (pbiermann != nullptr) {delete pbiermann;}
   if (ptwo_temp != nullptr) {delete ptwo_temp;}
+  if (pmaterials != nullptr) {delete pmaterials;}
   delete peos;
 }
 

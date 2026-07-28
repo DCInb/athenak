@@ -8,8 +8,10 @@ g/cm^3, K, erg/cm^3, and erg/g.
 
 The IONMIX4 ion and electron pressure/energy blocks are summed to construct a
 single-temperature EOS.  Sound speed, Gamma_1, and Gamma_3 - 1 are derived
-from finite differences of that total EOS surface.  Opacity blocks are parsed
-to validate the CN4 layout but are not written to the EOS table.
+from finite differences of that total EOS surface.  ``--two-temperature-output``
+preserves the separate ion/electron pressure and caloric surfaces, while
+``--opacity-output`` writes the Rosseland transport and Planck
+absorption/emission payloads in AthenaK's native multigroup-opacity format.
 
 The manual/log choice describes only how the two axes are encoded.  EOS and
 opacity payload fields must contain linear values; log-transformed payloads
@@ -21,7 +23,7 @@ from __future__ import annotations
 import argparse
 from array import array
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
@@ -110,6 +112,8 @@ class IonmixTable:
     temperature_ev: List[float]
     number_density_cm3: List[float]
     fields: Dict[str, List[List[float]]]
+    opacity_group_bounds_ev: List[float] = field(default_factory=list)
+    opacities: Dict[str, List[List[List[float]]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,6 +128,26 @@ class AthenaKTable:
     zbar: List[List[float]]
     abar: List[List[float]]
     energy_offset_erg_g: float
+
+
+@dataclass
+class AthenaKOpacityTable:
+    density: List[float]
+    temperature: List[float]
+    group_bounds: List[float]
+    opacities: Dict[str, List[List[List[float]]]]
+
+
+@dataclass
+class AthenaKTwoTemperatureTable:
+    density: List[float]
+    temperature: List[float]
+    abar: float
+    ion_pressure: List[List[float]]
+    electron_pressure: List[List[float]]
+    ion_specific_energy: List[List[float]]
+    electron_specific_energy: List[List[float]]
+    mean_ionization: List[List[float]]
 
 
 def _parse_header_integer(text: str, label: str) -> int:
@@ -294,6 +318,29 @@ def _take_matrix(
     return matrix, end
 
 
+def _take_cube(
+    tokens: FixedTokens,
+    start: int,
+    ngroups: int,
+    ndensity: int,
+    ntemperature: int,
+    label: str,
+) -> Tuple[List[List[List[float]]], int]:
+    """Read a group-density-temperature block with temperature varying fastest."""
+    cube: List[List[List[float]]] = []
+    cursor = start
+    for group in range(ngroups):
+        matrix, cursor = _take_matrix(
+            tokens,
+            cursor,
+            ndensity,
+            ntemperature,
+            f"{label} group {group}",
+        )
+        cube.append(matrix)
+    return cube, cursor
+
+
 def _validate_float_block(
     tokens: FixedTokens, start: int, count: int, label: str
 ) -> int:
@@ -450,17 +497,23 @@ def _parse_grid_candidate(
             tokens, cursor, table_size, "electron entropy"
         )
 
-    cursor = _validate_float_block(
+    opacity_group_bounds_ev, cursor = _take_floats(
         tokens, cursor, opacity_bound_count, "opacity group boundary"
     )
-    opacity_values = table_size * ngroups
-    cursor = _validate_float_block(tokens, cursor, opacity_values, "Rosseland opacity")
-    cursor = _validate_float_block(
-        tokens, cursor, opacity_values, "Planck absorption opacity"
-    )
-    cursor = _validate_float_block(
-        tokens, cursor, opacity_values, "Planck emission opacity"
-    )
+    opacities: Dict[str, List[List[List[float]]]] = {}
+    for name, label in (
+        ("transport", "Rosseland opacity"),
+        ("absorption", "Planck absorption opacity"),
+        ("emission", "Planck emission opacity"),
+    ):
+        opacities[name], cursor = _take_cube(
+            tokens,
+            cursor,
+            ngroups,
+            ndensity,
+            ntemperature,
+            label,
+        )
     if cursor != len(tokens):
         raise ConversionError(
             f"internal layout error: {len(tokens) - cursor} unconsumed payload fields"
@@ -475,6 +528,8 @@ def _parse_grid_candidate(
         temperature_ev=temperature_ev,
         number_density_cm3=number_density_cm3,
         fields=fields,
+        opacity_group_bounds_ev=opacity_group_bounds_ev,
+        opacities=opacities,
     )
 
 
@@ -564,6 +619,10 @@ def _with_increasing_axes(table: IonmixTable) -> IonmixTable:
         name: [list(row) for row in matrix]
         for name, matrix in table.fields.items()
     }
+    opacities = {
+        name: [[list(row) for row in matrix] for matrix in cube]
+        for name, cube in table.opacities.items()
+    }
     temperature_direction = _axis_direction(temperature_ev, "temperature")
     density_direction = _axis_direction(number_density_cm3, "ion number density")
 
@@ -572,10 +631,17 @@ def _with_increasing_axes(table: IonmixTable) -> IonmixTable:
         for matrix in fields.values():
             for row in matrix:
                 row.reverse()
+        for cube in opacities.values():
+            for matrix in cube:
+                for row in matrix:
+                    row.reverse()
     if density_direction < 0:
         number_density_cm3.reverse()
         for matrix in fields.values():
             matrix.reverse()
+        for cube in opacities.values():
+            for matrix in cube:
+                matrix.reverse()
     return IonmixTable(
         ntemperature=table.ntemperature,
         ndensity=table.ndensity,
@@ -585,6 +651,8 @@ def _with_increasing_axes(table: IonmixTable) -> IonmixTable:
         temperature_ev=temperature_ev,
         number_density_cm3=number_density_cm3,
         fields=fields,
+        opacity_group_bounds_ev=list(table.opacity_group_bounds_ev),
+        opacities=opacities,
     )
 
 
@@ -854,6 +922,141 @@ def convert_to_athenak(
     )
 
 
+def convert_opacity_to_athenak(
+    table: IonmixTable,
+    mass_per_ion_g: float,
+) -> AthenaKOpacityTable:
+    """Convert IONMIX opacity coordinates to CGS while preserving cm^2/g values."""
+    if not math.isfinite(mass_per_ion_g) or mass_per_ion_g <= 0.0:
+        raise ConversionError("mass per ion must be finite and positive")
+    if table.ngroups <= 0:
+        raise ConversionError("CN4 table has no opacity groups to export")
+
+    table = _with_increasing_axes(table)
+    if len(table.opacity_group_bounds_ev) != table.ngroups + 1:
+        raise ConversionError(
+            "CN4 opacity boundary count does not equal group count plus one"
+        )
+    required = ("transport", "absorption", "emission")
+    if any(name not in table.opacities for name in required):
+        raise ConversionError("CN4 opacity payload is incomplete")
+
+    density = [value * mass_per_ion_g for value in table.number_density_cm3]
+    temperature = [value * EV_TO_K for value in table.temperature_ev]
+    group_bounds = [value * EV_TO_K for value in table.opacity_group_bounds_ev]
+    _validate_increasing_axis(density, "converted opacity mass density", True)
+    _validate_increasing_axis(temperature, "converted opacity temperature", True)
+    _validate_increasing_axis(group_bounds, "converted opacity group boundary", False)
+    if group_bounds[0] < 0.0:
+        raise ConversionError("opacity group boundaries must be non-negative")
+
+    opacities = {
+        name: [[list(row) for row in matrix] for matrix in table.opacities[name]]
+        for name in required
+    }
+    for name, cube in opacities.items():
+        if len(cube) != table.ngroups:
+            raise ConversionError(f"{name} opacity group dimension is inconsistent")
+        for group, matrix in enumerate(cube):
+            if len(matrix) != table.ndensity:
+                raise ConversionError(
+                    f"{name} opacity density dimension is inconsistent in group {group}"
+                )
+            for density_index, row in enumerate(matrix):
+                if len(row) != table.ntemperature:
+                    raise ConversionError(
+                        f"{name} opacity temperature dimension is inconsistent in "
+                        f"group {group}, density {density_index}"
+                    )
+                for temperature_index, value in enumerate(row):
+                    valid = math.isfinite(value) and (
+                        value > 0.0 if name == "transport" else value >= 0.0
+                    )
+                    if not valid:
+                        requirement = "positive" if name == "transport" else "non-negative"
+                        raise ConversionError(
+                            f"{name} opacity[group={group}, density={density_index}, "
+                            f"temperature={temperature_index}] must be finite and "
+                            f"{requirement}, found {value!r}"
+                        )
+
+    return AthenaKOpacityTable(
+        density=density,
+        temperature=temperature,
+        group_bounds=group_bounds,
+        opacities=opacities,
+    )
+
+
+def convert_two_temperature_to_athenak(
+    table: IonmixTable,
+    mass_per_ion_g: float,
+) -> AthenaKTwoTemperatureTable:
+    """Preserve separate IONMIX ion/electron caloric and pressure surfaces."""
+    if not math.isfinite(mass_per_ion_g) or mass_per_ion_g <= 0.0:
+        raise ConversionError("mass per ion must be finite and positive")
+    table = _with_increasing_axes(table)
+    density = [value * mass_per_ion_g for value in table.number_density_cm3]
+    temperature = [value * EV_TO_K for value in table.temperature_ev]
+    _validate_increasing_axis(density, "converted 2T mass density", True)
+    _validate_increasing_axis(temperature, "converted 2T temperature", True)
+
+    converted_fields = {
+        "ion_pressure": [
+            [JOULE_TO_ERG * value for value in row]
+            for row in table.fields["pion"]
+        ],
+        "electron_pressure": [
+            [JOULE_TO_ERG * value for value in row]
+            for row in table.fields["pele"]
+        ],
+        "ion_specific_energy": [
+            [JOULE_TO_ERG * value for value in row]
+            for row in table.fields["eion"]
+        ],
+        "electron_specific_energy": [
+            [JOULE_TO_ERG * value for value in row]
+            for row in table.fields["eele"]
+        ],
+        "mean_ionization": [list(row) for row in table.fields["zbar"]],
+    }
+    for name, matrix in converted_fields.items():
+        for density_index, row in enumerate(matrix):
+            for temperature_index, value in enumerate(row):
+                positive = name != "mean_ionization"
+                valid = math.isfinite(value) and (
+                    value > 0.0 if positive else value >= 0.0
+                )
+                if not valid:
+                    requirement = "positive" if positive else "non-negative"
+                    raise ConversionError(
+                        f"{name}[density={density_index}, "
+                        f"temperature={temperature_index}] must be finite and "
+                        f"{requirement}, found {value!r}"
+                    )
+            if name in ("ion_specific_energy", "electron_specific_energy"):
+                for temperature_index in range(len(row) - 1):
+                    if row[temperature_index + 1] < row[temperature_index]:
+                        raise ConversionError(
+                            f"{name} must be non-decreasing with temperature; "
+                            f"density row {density_index}, temperature indices "
+                            f"{temperature_index} and {temperature_index + 1} "
+                            "decrease"
+                        )
+
+    abar = mass_per_ion_g / ATOMIC_MASS_UNIT_G
+    return AthenaKTwoTemperatureTable(
+        density=density,
+        temperature=temperature,
+        abar=abar,
+        ion_pressure=converted_fields["ion_pressure"],
+        electron_pressure=converted_fields["electron_pressure"],
+        ion_specific_energy=converted_fields["ion_specific_energy"],
+        electron_specific_energy=converted_fields["electron_specific_energy"],
+        mean_ionization=converted_fields["mean_ionization"],
+    )
+
+
 def _format_float(value: float) -> str:
     return f"{value:.17e}"
 
@@ -964,6 +1167,158 @@ def write_native_v2(path: Path, table: AthenaKTable, force: bool = False) -> Non
                 pass
 
 
+def _write_opacity_stream(output: TextIO, table: AthenaKOpacityTable) -> None:
+    ndensity = len(table.density)
+    ntemperature = len(table.temperature)
+    ngroups = len(table.group_bounds) - 1
+    output.write("# Converted from a FLASH IONMIX4/CN4 opacity payload.\n")
+    output.write("# Units: density g/cm^3, temperature and group bounds K,\n")
+    output.write("#        transport/absorption/emission mass opacity cm^2/g.\n")
+    output.write("# Stored order: group, density, temperature (temperature fastest).\n")
+    output.write("athenak_opacity_table 1\n")
+    output.write(f"dimensions {ndensity} {ntemperature} {ngroups}\n")
+    output.write("density\n")
+    _write_values(output, table.density)
+    output.write("temperature\n")
+    _write_values(output, table.temperature)
+    output.write("group_bound\n")
+    _write_values(output, table.group_bounds)
+    for name in ("transport", "absorption", "emission"):
+        output.write(f"\n{name}\n")
+        for group, matrix in enumerate(table.opacities[name]):
+            output.write(f"# group {group}\n")
+            _write_matrix(output, matrix)
+    output.write("end\n")
+
+
+def write_opacity_v1(
+    path: Path,
+    table: AthenaKOpacityTable,
+    force: bool = False,
+) -> None:
+    """Atomically write an AthenaK native-v1 multigroup opacity table."""
+    parent = path.parent
+    if not parent.is_dir():
+        raise ConversionError(f"output directory does not exist: {parent}")
+    output_exists = os.path.lexists(path)
+    if output_exists and not force:
+        raise ConversionError(
+            f"output already exists: {path} (use --force to replace it)"
+        )
+    if output_exists and path.exists():
+        output_mode = path.stat().st_mode & 0o777
+    else:
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        output_mode = 0o666 & ~current_umask
+
+    temporary_name = ""
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
+        )
+        with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as output:
+            _write_opacity_stream(output, table)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary_name, output_mode)
+        if force:
+            os.replace(temporary_name, path)
+        else:
+            os.link(temporary_name, path)
+            os.unlink(temporary_name)
+        temporary_name = ""
+    except FileExistsError as exc:
+        raise ConversionError(
+            f"output already exists: {path} (use --force to replace it)"
+        ) from exc
+    except OSError as exc:
+        raise ConversionError(f"cannot write opacity output {path}: {exc}") from exc
+    finally:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+def _write_two_temperature_stream(
+    output: TextIO,
+    table: AthenaKTwoTemperatureTable,
+) -> None:
+    output.write("# Separate ion/electron FLASH IONMIX4/CN4 EOS surfaces.\n")
+    output.write("# Units: density g/cm^3, temperature K, pressure erg/cm^3,\n")
+    output.write("#        specific internal energy erg/g.\n")
+    output.write("athenak_two_temperature_eos 1\n")
+    output.write(f"dimensions {len(table.density)} {len(table.temperature)}\n")
+    output.write(f"abar {_format_float(table.abar)}\n")
+    output.write("density\n")
+    _write_values(output, table.density)
+    output.write("temperature\n")
+    _write_values(output, table.temperature)
+    for name, matrix in (
+        ("ion_pressure", table.ion_pressure),
+        ("electron_pressure", table.electron_pressure),
+        ("ion_specific_internal_energy", table.ion_specific_energy),
+        ("electron_specific_internal_energy", table.electron_specific_energy),
+        ("mean_ionization", table.mean_ionization),
+    ):
+        output.write(f"\n{name}\n")
+        _write_matrix(output, matrix)
+    output.write("end\n")
+
+
+def write_two_temperature_v1(
+    path: Path,
+    table: AthenaKTwoTemperatureTable,
+    force: bool = False,
+) -> None:
+    """Atomically write separate ion/electron IONMIX surfaces."""
+    parent = path.parent
+    if not parent.is_dir():
+        raise ConversionError(f"output directory does not exist: {parent}")
+    output_exists = os.path.lexists(path)
+    if output_exists and not force:
+        raise ConversionError(
+            f"output already exists: {path} (use --force to replace it)"
+        )
+    if output_exists and path.exists():
+        output_mode = path.stat().st_mode & 0o777
+    else:
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        output_mode = 0o666 & ~current_umask
+
+    temporary_name = ""
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
+        )
+        with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as output:
+            _write_two_temperature_stream(output, table)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary_name, output_mode)
+        if force:
+            os.replace(temporary_name, path)
+        else:
+            os.link(temporary_name, path)
+            os.unlink(temporary_name)
+        temporary_name = ""
+    except FileExistsError as exc:
+        raise ConversionError(
+            f"output already exists: {path} (use --force to replace it)"
+        ) from exc
+    except OSError as exc:
+        raise ConversionError(f"cannot write 2T output {path}: {exc}") from exc
+    finally:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
 def _positive_finite_argument(text: str) -> float:
     try:
         value = float(text)
@@ -991,8 +1346,9 @@ def _build_argument_parser() -> argparse.ArgumentParser:
             "AthenaK native ASCII v2 in CGS units."
         ),
         epilog=(
-            "CN4 opacity data are validated but not copied. Configure AthenaK with "
-            "table_unit_system=cgs when using the output. The log grid mode "
+            "Configure AthenaK EOS with table_unit_system=cgs. Native opacity "
+            "output uses CGS axes and values and therefore requires the matching "
+            "code-unit scales in <thermal_radiation>. The log grid mode "
             "controls only axis encoding; it does not mean payload fields are "
             "log-transformed. Only linear EOS and opacity payload values are "
             "supported."
@@ -1003,7 +1359,20 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "output",
         type=Path,
         nargs="?",
-        help="output AthenaK native-v2 EOS table (omit with --validate-only)",
+        help=(
+            "output AthenaK native-v2 EOS table (omit with --validate-only or "
+            "when exporting only a separate 2T/opacity output)"
+        ),
+    )
+    parser.add_argument(
+        "--opacity-output",
+        type=Path,
+        help="also write the CN4 opacity payload as AthenaK native-v1",
+    )
+    parser.add_argument(
+        "--two-temperature-output",
+        type=Path,
+        help="also preserve separate ion/electron IONMIX EOS surfaces",
     )
     mass_group = parser.add_mutually_exclusive_group(required=True)
     mass_group.add_argument(
@@ -1066,17 +1435,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_argument_parser()
     arguments = parser.parse_args(argv)
     try:
-        if not arguments.validate_only and arguments.output is None:
-            raise ConversionError(
-                "output path is required unless --validate-only is used"
-            )
-        if arguments.validate_only and arguments.output is not None:
-            raise ConversionError("omit the output path when using --validate-only")
         if (
-            arguments.output is not None
-            and arguments.input.resolve() == arguments.output.resolve()
+            not arguments.validate_only
+            and arguments.output is None
+            and arguments.opacity_output is None
+            and arguments.two_temperature_output is None
         ):
+            raise ConversionError(
+                "an EOS, --two-temperature-output, or --opacity-output is "
+                "required unless --validate-only is used"
+            )
+        if arguments.validate_only and (
+            arguments.output is not None
+            or arguments.opacity_output is not None
+            or arguments.two_temperature_output is not None
+        ):
+            raise ConversionError("omit all output paths when using --validate-only")
+        outputs = [
+            path for path in (
+                arguments.output,
+                arguments.two_temperature_output,
+                arguments.opacity_output,
+            )
+            if path is not None
+        ]
+        if any(arguments.input.resolve() == path.resolve() for path in outputs):
             raise ConversionError("input and output paths must be different")
+        if len({path.resolve() for path in outputs}) != len(outputs):
+            raise ConversionError("all output paths must be different files")
         if arguments.abar is not None:
             mass_per_ion_g = arguments.abar * ATOMIC_MASS_UNIT_G
         else:
@@ -1087,13 +1473,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             grid_mode=arguments.grid_mode,
             electron_entropy=arguments.electron_entropy,
         )
-        converted = convert_to_athenak(
-            ionmix,
-            mass_per_ion_g,
-            energy_offset_erg_g=arguments.energy_offset_erg_g,
-        )
-        if not arguments.validate_only:
+        converted = None
+        if arguments.output is not None or arguments.validate_only:
+            converted = convert_to_athenak(
+                ionmix,
+                mass_per_ion_g,
+                energy_offset_erg_g=arguments.energy_offset_erg_g,
+            )
+        opacity_converted = None
+        if arguments.opacity_output is not None or (
+            arguments.validate_only and ionmix.ngroups > 0
+        ):
+            opacity_converted = convert_opacity_to_athenak(
+                ionmix, mass_per_ion_g
+            )
+        two_temperature_converted = None
+        if arguments.two_temperature_output is not None:
+            two_temperature_converted = convert_two_temperature_to_athenak(
+                ionmix, mass_per_ion_g
+            )
+        if arguments.output is not None:
+            assert converted is not None
             write_native_v2(arguments.output, converted, force=arguments.force)
+        if arguments.opacity_output is not None:
+            assert opacity_converted is not None
+            write_opacity_v1(
+                arguments.opacity_output,
+                opacity_converted,
+                force=arguments.force,
+            )
+        if arguments.two_temperature_output is not None:
+            assert two_temperature_converted is not None
+            write_two_temperature_v1(
+                arguments.two_temperature_output,
+                two_temperature_converted,
+                force=arguments.force,
+            )
     except (ConversionError, OSError) as exc:
         print(f"{parser.prog}: error: {exc}", file=sys.stderr)
         return 2
@@ -1101,11 +1516,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not arguments.quiet:
         entropy = "with" if ionmix.has_electron_entropy else "without"
         abar_value = mass_per_ion_g / ATOMIC_MASS_UNIT_G
-        action = (
-            f"validated {arguments.input}"
-            if arguments.validate_only
-            else f"wrote {arguments.output}"
-        )
+        if arguments.validate_only:
+            action = f"validated {arguments.input}"
+        else:
+            action = "wrote " + " and ".join(str(path) for path in outputs)
         print(
             f"{action}: {ionmix.ndensity} densities x "
             f"{ionmix.ntemperature} temperatures, {ionmix.grid_mode} grid, "

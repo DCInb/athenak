@@ -21,6 +21,7 @@
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
 #include "laser/laser.hpp"
+#include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
 #include "two_temperature/two_temperature.hpp"
@@ -176,6 +177,10 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   gamma_minus_one_ = ppack->pmhd->peos->eos_data.gamma - 1.0;
   electron_heat_capacity_fraction_ =
       ppack->pmhd->ptwo_temp->ElectronHeatCapacityFraction();
+  use_material_mixture_ = ppack->pmhd->pmaterials != nullptr;
+  if (use_material_mixture_) {
+    material_mixture_ = ppack->pmhd->pmaterials->DeviceData();
+  }
 
   std::string target = pin->GetOrAddString("laser", "deposition_target", "electron");
   if (target == "electron") {
@@ -222,6 +227,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     length_scale_cgs_ = ppack->punit->length_cgs();
     density_scale_cgs_ = ppack->punit->density_cgs();
     temperature_scale_cgs_ = ppack->punit->temperature_cgs();
+    unit_mean_molecular_weight_ = ppack->punit->mu();
     power_scale_cgs_ = ppack->punit->energy_cgs()/ppack->punit->time_cgs();
   }
   length_scale_cgs_ = pin->GetOrAddReal(
@@ -230,6 +236,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "density_scale_cgs", density_scale_cgs_);
   temperature_scale_cgs_ = pin->GetOrAddReal(
       "laser", "temperature_scale_cgs", temperature_scale_cgs_);
+  unit_mean_molecular_weight_ = pin->GetOrAddReal(
+      "laser", "temperature_mean_molecular_weight", unit_mean_molecular_weight_);
   power_scale_cgs_ = pin->GetOrAddReal(
       "laser", "power_scale_cgs", power_scale_cgs_);
   if (use_cgs_ &&
@@ -247,9 +255,13 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
        !Finite(density_scale_cgs_) || !(density_scale_cgs_ > 0.0) ||
        !Finite(temperature_scale_cgs_) || !(temperature_scale_cgs_ > 0.0) ||
-       !Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0))) {
+       (use_material_mixture_ &&
+        (!Finite(unit_mean_molecular_weight_) ||
+         !(unit_mean_molecular_weight_ > 0.0))) ||
+       (!use_material_mixture_ &&
+        (!Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0))))) {
     LaserInputError("inverse_bremsstrahlung requires finite positive cgs scales and "
-                    "electron_number_per_gram");
+                    "electron_number_per_gram when <materials> is absent");
   }
   if (!Finite(inverse_bremsstrahlung_coulomb_log_)) {
     LaserInputError("inverse_bremsstrahlung_coulomb_log must be finite");
@@ -315,9 +327,10 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   if (critical_reflection_ &&
       (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
        !Finite(density_scale_cgs_) || !(density_scale_cgs_ > 0.0) ||
-       !Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0))) {
+       (!use_material_mixture_ &&
+        (!Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0))))) {
     LaserInputError("critical reflection requires finite positive cgs density/length "
-                    "scales and electron_number_per_gram");
+                    "scales and electron_number_per_gram when <materials> is absent");
   }
   if (propagation_model_ == PropagationModel::refractive) {
     if (critical_reflection_) {
@@ -325,9 +338,10 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     }
     if (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
         !Finite(density_scale_cgs_) || !(density_scale_cgs_ > 0.0) ||
-        !Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0)) {
+        (!use_material_mixture_ &&
+         (!Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0)))) {
       LaserInputError("refractive model requires finite positive cgs density/length "
-                      "scales and electron_number_per_gram");
+                      "scales and electron_number_per_gram when <materials> is absent");
     }
     if (!Finite(refractive_cell_fraction_) || refractive_cell_fraction_ <= 0.0 ||
         refractive_cell_fraction_ > 1.0 ||

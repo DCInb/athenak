@@ -13,10 +13,41 @@
 #include <string>
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
 #include "two_temperature/thermal_radiation.hpp"
 #include "two_temperature/two_temperature.hpp"
+#include "units/units.hpp"
+
+namespace {
+
+// Electron temperature-relaxation time from the classical Spitzer binary-collision
+// result.  The mixture identity n_i Z^2 = n_e Z_eff avoids inventing a single ion charge.
+KOKKOS_INLINE_FUNCTION
+Real SpitzerExchangeTime(const Real electron_density_cgs,
+                         const Real ion_temperature_kelvin,
+                         const Real electron_temperature_kelvin,
+                         const Real mean_atomic_mass,
+                         const Real effective_charge,
+                         const Real coulomb_log) {
+  constexpr Real electron_mass_cgs = 9.1093837015e-28;
+  constexpr Real electron_charge_cgs = 4.803204712570263e-10;
+  constexpr Real atomic_mass_unit_cgs = 1.660538921e-24;
+  constexpr Real boltzmann_cgs = 1.3806488e-16;
+  constexpr Real pi = 3.141592653589793238462643383279502884;
+  const Real ion_mass_cgs = mean_atomic_mass*atomic_mass_unit_cgs;
+  const Real thermal_speed_squared =
+      boltzmann_cgs*electron_temperature_kelvin/electron_mass_cgs+
+      boltzmann_cgs*ion_temperature_kelvin/ion_mass_cgs;
+  const Real numerator = 3.0*electron_mass_cgs*ion_mass_cgs*
+                         pow(thermal_speed_squared, 1.5);
+  const Real denominator = 8.0*sqrt(2.0*pi)*electron_density_cgs*
+      effective_charge*pow(electron_charge_cgs, 4)*coulomb_log;
+  return numerator/denominator;
+}
+
+} // namespace
 
 namespace two_temperature {
 
@@ -24,18 +55,71 @@ namespace two_temperature {
 // Constructor.  Heat capacities are normalized so cv_i + cv_e = 1/(gamma - 1).
 
 TwoTemperature::TwoTemperature(const std::string &block, MeshBlockPack *ppack,
-                               ParameterInput *pin, int first_component_index) :
+                               ParameterInput *pin, int first_component_index,
+                               materials::MaterialMixture *material_mixture) :
     iion(first_component_index),
     iele(first_component_index + 1),
     temperature("two-temperature", 1, 1, 1, 1, 1),
-    pmy_pack_(ppack) {
+    pmy_pack_(ppack),
+    use_material_mixture_(material_mixture != nullptr) {
   Real gamma = pin->GetReal(block, "gamma");
   gamma_minus_one_ = gamma - 1.0;
   cv_e_fraction_ = pin->GetOrAddReal(block, "electron_heat_capacity_fraction", 0.5);
   cv_i_fraction_ = 1.0 - cv_e_fraction_;
-  Real initial_temperature_ratio =
+  initial_temperature_ratio_ =
       pin->GetOrAddReal(block, "initial_electron_temperature_ratio", 1.0);
   t_ei_ = pin->GetOrAddReal(block, "t_ei", -1.0);
+  if (use_material_mixture_) material_mixture_ = material_mixture->DeviceData();
+  const std::string exchange_model =
+      pin->GetOrAddString(block, "t_ei_model", "constant");
+  if (exchange_model == "constant") {
+    use_spitzer_exchange_ = false;
+  } else if (exchange_model == "spitzer") {
+    use_spitzer_exchange_ = true;
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "<" << block
+              << "> t_ei_model must be 'constant' or 'spitzer'" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (use_spitzer_exchange_) {
+    if (!use_material_mixture_ || ppack->punit == nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<" << block
+                << "> t_ei_model=spitzer requires <materials> and <units>"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    spitzer_coulomb_log_ =
+        pin->GetOrAddReal(block, "t_ei_coulomb_log", 10.0);
+    spitzer_multiplier_ =
+        pin->GetOrAddReal(block, "t_ei_spitzer_multiplier", 1.0);
+    spitzer_temperature_floor_ =
+        pin->GetOrAddReal(block, "t_ei_temperature_floor_kelvin", 1.0);
+    if (!std::isfinite(spitzer_coulomb_log_) || spitzer_coulomb_log_ <= 0.0 ||
+        !std::isfinite(spitzer_multiplier_) || spitzer_multiplier_ <= 0.0 ||
+        !std::isfinite(spitzer_temperature_floor_) ||
+        spitzer_temperature_floor_ < 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<" << block
+                << "> Spitzer Coulomb log and multiplier must be positive and the "
+                << "temperature floor non-negative" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    density_scale_cgs_ = ppack->punit->density_cgs();
+    const Real velocity_cgs = ppack->punit->velocity_cgs();
+    velocity_squared_cgs_ = velocity_cgs*velocity_cgs;
+    time_scale_cgs_ = ppack->punit->time_cgs();
+    if (!std::isfinite(density_scale_cgs_) || density_scale_cgs_ <= 0.0 ||
+        !std::isfinite(velocity_squared_cgs_) || velocity_squared_cgs_ <= 0.0 ||
+        !std::isfinite(time_scale_cgs_) || time_scale_cgs_ <= 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<" << block
+                << "> t_ei_model=spitzer requires finite positive physical units"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   if (cv_e_fraction_ <= 0.0 || cv_e_fraction_ >= 1.0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -44,7 +128,7 @@ TwoTemperature::TwoTemperature(const std::string &block, MeshBlockPack *ppack,
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (initial_temperature_ratio < 0.0) {
+  if (initial_temperature_ratio_ < 0.0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "<" << block
               << "> initial_electron_temperature_ratio must be non-negative"
@@ -53,8 +137,8 @@ TwoTemperature::TwoTemperature(const std::string &block, MeshBlockPack *ppack,
   }
 
   // At fixed total internal energy, e_e/e_tot follows from cv_e*Te and cv_i*Ti.
-  Real denominator = cv_i_fraction_ + cv_e_fraction_*initial_temperature_ratio;
-  initial_e_fraction_ = cv_e_fraction_*initial_temperature_ratio/denominator;
+  Real denominator = cv_i_fraction_ + cv_e_fraction_*initial_temperature_ratio_;
+  initial_e_fraction_ = cv_e_fraction_*initial_temperature_ratio_/denominator;
 
   int nmb = std::max(ppack->nmb_thispack, ppack->pmesh->nmb_maxperrank);
   auto &indcs = ppack->pmesh->mb_indcs;
@@ -96,20 +180,47 @@ void TwoTemperature::Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim
   Real fe0 = initial_e_fraction_;
   auto temp = temperature;
 
-  par_for("two_temp_init", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    Real density = prim(m, IDN, k, j, i);
-    Real eint = prim(m, IEN, k, j, i);
-    Real eele = fe0*eint;
-    Real eion = eint - eele;
+  if (!use_material_mixture_) {
+    // Keep the legacy path separate so decks without <materials> retain their exact
+    // arithmetic and results.
+    par_for("two_temp_init", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real density = prim(m, IDN, k, j, i);
+      Real eint = prim(m, IEN, k, j, i);
+      Real eele = fe0*eint;
+      Real eion = eint - eele;
 
-    cons(m, iion_, k, j, i) = eion;
-    cons(m, iele_, k, j, i) = eele;
-    prim(m, iion_, k, j, i) = eion/density;
-    prim(m, iele_, k, j, i) = eele/density;
-    temp(m, 0, k, j, i) = gm1*eion/(density*fi);
-    temp(m, 1, k, j, i) = gm1*eele/(density*fe);
-  });
+      cons(m, iion_, k, j, i) = eion;
+      cons(m, iele_, k, j, i) = eele;
+      prim(m, iion_, k, j, i) = eion/density;
+      prim(m, iele_, k, j, i) = eele/density;
+      temp(m, 0, k, j, i) = gm1*eion/(density*fi);
+      temp(m, 1, k, j, i) = gm1*eele/(density*fe);
+    });
+  } else {
+    auto mixture = material_mixture_;
+    Real initial_ratio = initial_temperature_ratio_;
+    par_for("two_temp_material_init", DevExeSpace(), 0, nmb1, kl, ku, jl, ju,
+            il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real density = prim(m, IDN, k, j, i);
+      const Real eint = prim(m, IEN, k, j, i);
+      const Real y0 = mixture.Material0MassFractionFromPrimitive(prim, m, k, j, i);
+      const Real local_fe = mixture.ElectronHeatCapacityFraction(y0);
+      const Real local_fi = 1.0-local_fe;
+      const Real local_fe0 =
+          mixture.InitialElectronEnergyFraction(y0, initial_ratio);
+      const Real eele = local_fe0*eint;
+      const Real eion = eint-eele;
+
+      cons(m, iion_, k, j, i) = eion;
+      cons(m, iele_, k, j, i) = eele;
+      prim(m, iion_, k, j, i) = eion/density;
+      prim(m, iele_, k, j, i) = eele/density;
+      temp(m, 0, k, j, i) = gm1*eion/(density*local_fi);
+      temp(m, 1, k, j, i) = gm1*eele/(density*local_fe);
+    });
+  }
   if (pradiation != nullptr) {
     pradiation->Initialize(cons, prim, il, iu, jl, ju, kl, ku);
   }
@@ -129,31 +240,64 @@ void TwoTemperature::Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
   Real fe0 = initial_e_fraction_;
   auto temp = temperature;
 
-  par_for("two_temp_sync", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    Real density = prim(m, IDN, k, j, i);
-    Real eint = prim(m, IEN, k, j, i);
-    Real eion_adv = fmax(cons(m, iion_, k, j, i), 0.0);
-    Real eele_adv = fmax(cons(m, iele_, k, j, i), 0.0);
-    Real component_sum = eion_adv + eele_adv;
+  if (!use_material_mixture_) {
+    par_for("two_temp_sync", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real density = prim(m, IDN, k, j, i);
+      Real eint = prim(m, IEN, k, j, i);
+      Real eion_adv = fmax(cons(m, iion_, k, j, i), 0.0);
+      Real eele_adv = fmax(cons(m, iele_, k, j, i), 0.0);
+      Real component_sum = eion_adv + eele_adv;
 
-    Real eele;
-    if (component_sum > 0.0) {
-      // With a common gamma, partial pressure is proportional to energy density.
-      eele = eint*(eele_adv/component_sum);
-    } else {
-      eele = fe0*eint;
-    }
-    eele = fmin(fmax(eele, 0.0), eint);
-    Real eion = eint - eele;  // assign the remainder for round-off-level conservation
+      Real eele;
+      if (component_sum > 0.0) {
+        // With a common gamma, partial pressure is proportional to energy density.
+        eele = eint*(eele_adv/component_sum);
+      } else {
+        eele = fe0*eint;
+      }
+      eele = fmin(fmax(eele, 0.0), eint);
+      Real eion = eint - eele;
 
-    cons(m, iion_, k, j, i) = eion;
-    cons(m, iele_, k, j, i) = eele;
-    prim(m, iion_, k, j, i) = eion/density;
-    prim(m, iele_, k, j, i) = eele/density;
-    temp(m, 0, k, j, i) = gm1*eion/(density*fi);
-    temp(m, 1, k, j, i) = gm1*eele/(density*fe);
-  });
+      cons(m, iion_, k, j, i) = eion;
+      cons(m, iele_, k, j, i) = eele;
+      prim(m, iion_, k, j, i) = eion/density;
+      prim(m, iele_, k, j, i) = eele/density;
+      temp(m, 0, k, j, i) = gm1*eion/(density*fi);
+      temp(m, 1, k, j, i) = gm1*eele/(density*fe);
+    });
+  } else {
+    auto mixture = material_mixture_;
+    Real initial_ratio = initial_temperature_ratio_;
+    par_for("two_temp_material_sync", DevExeSpace(), 0, nmb1, kl, ku, jl, ju,
+            il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real density = prim(m, IDN, k, j, i);
+      const Real eint = prim(m, IEN, k, j, i);
+      const Real y0 = mixture.Material0MassFractionFromPrimitive(prim, m, k, j, i);
+      const Real local_fe = mixture.ElectronHeatCapacityFraction(y0);
+      const Real local_fi = 1.0-local_fe;
+      const Real eion_adv = fmax(cons(m, iion_, k, j, i), 0.0);
+      const Real eele_adv = fmax(cons(m, iele_, k, j, i), 0.0);
+      const Real component_sum = eion_adv+eele_adv;
+
+      Real eele;
+      if (component_sum > 0.0) {
+        eele = eint*(eele_adv/component_sum);
+      } else {
+        eele = mixture.InitialElectronEnergyFraction(y0, initial_ratio)*eint;
+      }
+      eele = fmin(fmax(eele, 0.0), eint);
+      const Real eion = eint-eele;
+
+      cons(m, iion_, k, j, i) = eion;
+      cons(m, iele_, k, j, i) = eele;
+      prim(m, iion_, k, j, i) = eion/density;
+      prim(m, iele_, k, j, i) = eele/density;
+      temp(m, 0, k, j, i) = gm1*eion/(density*local_fi);
+      temp(m, 1, k, j, i) = gm1*eele/(density*local_fe);
+    });
+  }
   if (pradiation != nullptr) {
     pradiation->UpdateDiagnostics(cons, prim, il, iu, jl, ju, kl, ku);
   }
@@ -165,7 +309,7 @@ void TwoTemperature::Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
 void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
                               DvceArray5D<Real> &prim,
                               int il, int iu, int jl, int ju, int kl, int ku) {
-  if (t_ei_ >= 0.0) {
+  if (!use_material_mixture_ && t_ei_ >= 0.0) {
     int nmb1 = pmy_pack_->nmb_thispack - 1;
     int iion_ = iion;
     int iele_ = iele;
@@ -202,6 +346,71 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
       prim(m, iele_, k, j, i) = eele_new/density;
       temp(m, 0, k, j, i) = gm1*eion_new/(density*fi);
       temp(m, 1, k, j, i) = gm1*eele_new/(density*fe);
+    });
+  } else if (use_material_mixture_) {
+    int nmb1 = pmy_pack_->nmb_thispack - 1;
+    int iion_ = iion;
+    int iele_ = iele;
+    Real gm1 = gamma_minus_one_;
+    auto mixture = material_mixture_;
+    auto temp = temperature;
+    bool use_spitzer = use_spitzer_exchange_;
+    Real coulomb_log = spitzer_coulomb_log_;
+    Real spitzer_multiplier = spitzer_multiplier_;
+    Real temperature_floor = spitzer_temperature_floor_;
+    Real density_scale = density_scale_cgs_;
+    Real velocity_squared = velocity_squared_cgs_;
+    Real time_scale = time_scale_cgs_;
+
+    par_for("two_temp_material_exchange", DevExeSpace(), 0, nmb1, kl, ku, jl,
+            ju, il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real density = cons(m, IDN, k, j, i);
+      const Real y0 = mixture.Material0MassFractionFromConserved(
+          cons, m, k, j, i);
+      const Real local_fe = mixture.ElectronHeatCapacityFraction(y0);
+      const Real local_fi = 1.0-local_fe;
+      const Real eion = cons(m, iion_, k, j, i);
+      const Real eele = cons(m, iele_, k, j, i);
+      const Real eint = eion+eele;
+      const Real tion = gm1*eion/(density*local_fi);
+      const Real tele = gm1*eele/(density*local_fe);
+      Real exchange_time = mixture.ExchangeTime(y0);
+      if (use_spitzer) {
+        constexpr Real atomic_mass_unit_cgs = 1.660538921e-24;
+        constexpr Real boltzmann_cgs = 1.3806488e-16;
+        const Real kelvin_per_code_temperature = velocity_squared*
+            mixture.MeanParticleMass(y0)*atomic_mass_unit_cgs/boltzmann_cgs;
+        const Real tion_kelvin = fmax(
+            tion*kelvin_per_code_temperature, temperature_floor);
+        const Real tele_kelvin = fmax(
+            tele*kelvin_per_code_temperature, temperature_floor);
+        const Real electron_density = mixture.ElectronNumberDensityCgs(
+            density, density_scale, y0);
+        const Real exchange_seconds = SpitzerExchangeTime(
+            electron_density, tion_kelvin, tele_kelvin,
+            mixture.MeanAtomicMass(y0), mixture.EffectiveCharge(y0), coulomb_log);
+        exchange_time = spitzer_multiplier*exchange_seconds/time_scale;
+      }
+      if (exchange_time < 0.0 || !Kokkos::isfinite(exchange_time)) return;
+
+      const Real teq = local_fi*tion+local_fe*tele;
+      Real decay = 0.0;
+      if (exchange_time > 0.0) {
+        decay = exp(-(1.0+local_fe/local_fi)*dt/exchange_time);
+      }
+      const Real delta_t = (tion-tele)*decay;
+      const Real tion_new = teq+local_fe*delta_t;
+
+      Real eion_new = density*local_fi*tion_new/gm1;
+      eion_new = fmin(fmax(eion_new, 0.0), eint);
+      const Real eele_new = eint-eion_new;
+      cons(m, iion_, k, j, i) = eion_new;
+      cons(m, iele_, k, j, i) = eele_new;
+      prim(m, iion_, k, j, i) = eion_new/density;
+      prim(m, iele_, k, j, i) = eele_new/density;
+      temp(m, 0, k, j, i) = gm1*eion_new/(density*local_fi);
+      temp(m, 1, k, j, i) = gm1*eele_new/(density*local_fe);
     });
   }
 

@@ -13,6 +13,7 @@
 #include <limits>
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
 #include "mhd/biermann_battery.hpp"
 #include "parameter_input.hpp"
@@ -33,14 +34,16 @@ namespace mhd {
 //----------------------------------------------------------------------------------------
 // Constructor.  AthenaK uses mu0=k_B=1 normalized units here.  The coefficient
 // is the normalized inverse electron charge in E_B=-C_B grad(p_e)/n_e and
-// v_e-v=-C_B curl(B)/n_e.  The electron number density is n_e=f_e*rho, where
-// f_e is the electron heat-capacity fraction of the common-gamma 2T model.
+// v_e-v=-C_B curl(B)/n_e.  Legacy decks use n_e=f_e*rho.  With <materials>, n_e
+// is instead evaluated from rho*sum(Y_s Z_s/A_s); the local heat-capacity fraction
+// remains a separate quantity used only to convert electron energy to temperature.
 
 BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
                                  int electron_index,
                                  Real electron_heat_capacity_fraction,
                                  Real gamma, Real density_floor,
-                                 Real pressure_floor)
+                                 Real pressure_floor,
+                                 materials::MaterialMixture *material_mixture)
     : coefficient(pin->GetOrAddReal("mhd", "biermann_coefficient", 1.0)),
       dtnew(std::numeric_limits<float>::max()),
       suppress_in_shocks(
@@ -51,12 +54,14 @@ BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
       electron_fraction_(electron_heat_capacity_fraction), gamma_(gamma),
       gamma_minus_one_(gamma - 1.0), density_floor_(density_floor),
       pressure_floor_(pressure_floor),
+      use_material_mixture_(material_mixture != nullptr),
       smooth_cell_("biermann-smooth", 1, 1, 1, 1),
       e3x1_("biermann-e3x1", 1, 1, 1, 1), e2x1_("biermann-e2x1", 1, 1, 1, 1),
       e1x2_("biermann-e1x2", 1, 1, 1, 1), e3x2_("biermann-e3x2", 1, 1, 1, 1),
       e2x3_("biermann-e2x3", 1, 1, 1, 1), e1x3_("biermann-e1x3", 1, 1, 1, 1),
       vd1_("biermann-vd1", 1, 1, 1, 1), vd2_("biermann-vd2", 1, 1, 1, 1),
       vd3_("biermann-vd3", 1, 1, 1, 1) {
+  if (use_material_mixture_) material_mixture_ = material_mixture->DeviceData();
   if (!std::isfinite(coefficient) || coefficient < 0.0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
@@ -187,6 +192,8 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
   Real fe = electron_fraction_;
   Real dfloor = density_floor_;
   int iele = iele_;
+  bool use_materials = use_material_mixture_;
+  auto material_mixture = material_mixture_;
   // x1-face electric fields, including the transverse halo needed by flux-CT.
   int jl = multi_d ? js - 1 : js;
   int ju = multi_d ? je + 1 : je;
@@ -211,10 +218,23 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                     ElectronPressure(w, iele, gm1, m, k - 1, j, i);
           dp3 = 0.25 * (pp - pm) / size.d_view(m).dx3;
         }
-        Real rho =
-            fmax(0.5 * (w(m, IDN, k, j, i - 1) + w(m, IDN, k, j, i)), dfloor);
         Real mask = fmin(smooth(m, k, j, i - 1), smooth(m, k, j, i));
-        Real inv_ne = 1.0 / (fe * rho);
+        Real inv_ne;
+        if (use_materials) {
+          const Real rho_l = fmax(w(m, IDN, k, j, i-1), dfloor);
+          const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
+          const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i-1);
+          const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i);
+          const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
+                               material_mixture.ElectronNumberDensity(rho_r, y_r));
+          inv_ne = 1.0/ne;
+        } else {
+          const Real rho = fmax(
+              0.5*(w(m, IDN, k, j, i-1)+w(m, IDN, k, j, i)), dfloor);
+          inv_ne = 1.0/(fe*rho);
+        }
         e21(m, k, j, i) = -coeff * mask * dp2 * inv_ne;
         e31(m, k, j, i) = -coeff * mask * dp3 * inv_ne;
       });
@@ -240,10 +260,23 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                  ElectronPressure(w, iele, gm1, m, k - 1, j, i);
             dp3 = 0.25 * (pp - pm) / size.d_view(m).dx3;
           }
-          Real rho =
-              fmax(0.5 * (w(m, IDN, k, j - 1, i) + w(m, IDN, k, j, i)), dfloor);
           Real mask = fmin(smooth(m, k, j - 1, i), smooth(m, k, j, i));
-          Real inv_ne = 1.0 / (fe * rho);
+          Real inv_ne;
+          if (use_materials) {
+            const Real rho_l = fmax(w(m, IDN, k, j-1, i), dfloor);
+            const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
+            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j-1, i);
+            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+            inv_ne = 1.0/ne;
+          } else {
+            const Real rho = fmax(
+                0.5*(w(m, IDN, k, j-1, i)+w(m, IDN, k, j, i)), dfloor);
+            inv_ne = 1.0/(fe*rho);
+          }
           e12(m, k, j, i) = -coeff * mask * dp1 * inv_ne;
           e32(m, k, j, i) = -coeff * mask * dp3 * inv_ne;
         });
@@ -265,10 +298,23 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           pm = ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) +
                ElectronPressure(w, iele, gm1, m, k, j - 1, i);
           Real dp2 = 0.25 * (pp - pm) / size.d_view(m).dx2;
-          Real rho =
-              fmax(0.5 * (w(m, IDN, k - 1, j, i) + w(m, IDN, k, j, i)), dfloor);
           Real mask = fmin(smooth(m, k - 1, j, i), smooth(m, k, j, i));
-          Real inv_ne = 1.0 / (fe * rho);
+          Real inv_ne;
+          if (use_materials) {
+            const Real rho_l = fmax(w(m, IDN, k-1, j, i), dfloor);
+            const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
+            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k-1, j, i);
+            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+            inv_ne = 1.0/ne;
+          } else {
+            const Real rho = fmax(
+                0.5*(w(m, IDN, k-1, j, i)+w(m, IDN, k, j, i)), dfloor);
+            inv_ne = 1.0/(fe*rho);
+          }
           e13(m, k, j, i) = -coeff * mask * dp1 * inv_ne;
           e23(m, k, j, i) = -coeff * mask * dp2 * inv_ne;
         });
@@ -287,7 +333,6 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
       KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
         Real rho_l = fmax(w(m, IDN, k, j, i - 1), dfloor);
         Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
-        Real rho = fmax(0.5 * (rho_l + rho_r), dfloor);
         Real mask = fmin(smooth(m, k, j, i - 1), smooth(m, k, j, i));
         Real j1 = 0.0;
         if (multi_d) {
@@ -302,7 +347,19 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                  b(m, IBY, k - 1, j, i - 1) - b(m, IBY, k - 1, j, i)) /
                 size.d_view(m).dx3;
         }
-        Real drift = -coeff * mask * j1 / (fe * rho);
+        Real drift;
+        if (use_materials) {
+          const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i-1);
+          const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i);
+          const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
+                               material_mixture.ElectronNumberDensity(rho_r, y_r));
+          drift = -coeff*mask*j1/ne;
+        } else {
+          const Real rho = fmax(0.5*(rho_l+rho_r), dfloor);
+          drift = -coeff*mask*j1/(fe*rho);
+        }
         vd1(m, k, j, i) = drift;
         Real eps_l = fmax(rho_l * w(m, iele, k, j, i - 1), 0.0);
         Real eps_r = fmax(rho_r * w(m, iele, k, j, i), 0.0);
@@ -323,7 +380,6 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         ie, KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
           Real rho_l = fmax(w(m, IDN, k, j - 1, i), dfloor);
           Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
-          Real rho = fmax(0.5 * (rho_l + rho_r), dfloor);
           Real mask = fmin(smooth(m, k, j - 1, i), smooth(m, k, j, i));
           Real j2 = -0.25 *
                     (b(m, IBZ, k, j - 1, i + 1) + b(m, IBZ, k, j, i + 1) -
@@ -335,7 +391,19 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                    b(m, IBX, k - 1, j - 1, i) - b(m, IBX, k - 1, j, i)) /
                   size.d_view(m).dx3;
           }
-          Real drift = -coeff * mask * j2 / (fe * rho);
+          Real drift;
+          if (use_materials) {
+            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j-1, i);
+            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+            drift = -coeff*mask*j2/ne;
+          } else {
+            const Real rho = fmax(0.5*(rho_l+rho_r), dfloor);
+            drift = -coeff*mask*j2/(fe*rho);
+          }
           vd2(m, k, j, i) = drift;
           Real eps_l = fmax(rho_l * w(m, iele, k, j - 1, i), 0.0);
           Real eps_r = fmax(rho_r * w(m, iele, k, j, i), 0.0);
@@ -357,7 +425,6 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         ie, KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
           Real rho_l = fmax(w(m, IDN, k - 1, j, i), dfloor);
           Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
-          Real rho = fmax(0.5 * (rho_l + rho_r), dfloor);
           Real mask = fmin(smooth(m, k - 1, j, i), smooth(m, k, j, i));
           Real j3 = 0.25 *
                     (b(m, IBY, k - 1, j, i + 1) + b(m, IBY, k, j, i + 1) -
@@ -367,7 +434,19 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                 (b(m, IBX, k - 1, j + 1, i) + b(m, IBX, k, j + 1, i) -
                  b(m, IBX, k - 1, j - 1, i) - b(m, IBX, k, j - 1, i)) /
                 size.d_view(m).dx2;
-          Real drift = -coeff * mask * j3 / (fe * rho);
+          Real drift;
+          if (use_materials) {
+            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k-1, j, i);
+            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+            drift = -coeff*mask*j3/ne;
+          } else {
+            const Real rho = fmax(0.5*(rho_l+rho_r), dfloor);
+            drift = -coeff*mask*j3/(fe*rho);
+          }
           vd3(m, k, j, i) = drift;
           Real eps_l = fmax(rho_l * w(m, iele, k - 1, j, i), 0.0);
           Real eps_r = fmax(rho_r * w(m, iele, k, j, i), 0.0);
@@ -512,6 +591,8 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
   Real fe = electron_fraction_;
   Real dfloor = density_floor_;
   int iele = iele_;
+  bool use_materials = use_material_mixture_;
+  auto material_mixture = material_mixture_;
   Real dt1 = std::numeric_limits<float>::max();
   Real dt2 = std::numeric_limits<float>::max();
   Real dt3 = std::numeric_limits<float>::max();
@@ -531,21 +612,61 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real dx2 = size.d_view(m).dx2;
         Real dx3 = size.d_view(m).dx3;
         Real rho = fmax(w(m, IDN, k, j, i), dfloor);
-        Real ne = fe * rho;
-        Real dln1 = (log(fmax(w(m, IDN, k, j, i + 1), dfloor)) -
-                     log(fmax(w(m, IDN, k, j, i - 1), dfloor))) /
-                    (2.0 * dx1);
+        Real local_fe = fe;
+        Real ne;
+        Real dln1;
+        if (use_materials) {
+          const Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i);
+          local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
+          ne = material_mixture.ElectronNumberDensity(rho, y0);
+          const Real rho_p = fmax(w(m, IDN, k, j, i+1), dfloor);
+          const Real rho_m = fmax(w(m, IDN, k, j, i-1), dfloor);
+          const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i+1);
+          const Real y_m = material_mixture.Material0MassFractionFromPrimitive(
+              w, m, k, j, i-1);
+          const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
+          const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
+          dln1 = (log(ne_p)-log(ne_m))/(2.0*dx1);
+        } else {
+          ne = fe*rho;
+          dln1 = (log(fmax(w(m, IDN, k, j, i+1), dfloor))-
+                  log(fmax(w(m, IDN, k, j, i-1), dfloor)))/(2.0*dx1);
+        }
         Real dln2 = 0.0;
         Real dln3 = 0.0;
         if (multi_d) {
-          dln2 = (log(fmax(w(m, IDN, k, j + 1, i), dfloor)) -
-                  log(fmax(w(m, IDN, k, j - 1, i), dfloor))) /
-                 (2.0 * dx2);
+          if (use_materials) {
+            const Real rho_p = fmax(w(m, IDN, k, j+1, i), dfloor);
+            const Real rho_m = fmax(w(m, IDN, k, j-1, i), dfloor);
+            const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j+1, i);
+            const Real y_m = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k, j-1, i);
+            const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
+            const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
+            dln2 = (log(ne_p)-log(ne_m))/(2.0*dx2);
+          } else {
+            dln2 = (log(fmax(w(m, IDN, k, j+1, i), dfloor))-
+                    log(fmax(w(m, IDN, k, j-1, i), dfloor)))/(2.0*dx2);
+          }
         }
         if (three_d) {
-          dln3 = (log(fmax(w(m, IDN, k + 1, j, i), dfloor)) -
-                  log(fmax(w(m, IDN, k - 1, j, i), dfloor))) /
-                 (2.0 * dx3);
+          if (use_materials) {
+            const Real rho_p = fmax(w(m, IDN, k+1, j, i), dfloor);
+            const Real rho_m = fmax(w(m, IDN, k-1, j, i), dfloor);
+            const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k+1, j, i);
+            const Real y_m = material_mixture.Material0MassFractionFromPrimitive(
+                w, m, k-1, j, i);
+            const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
+            const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
+            dln3 = (log(ne_p)-log(ne_m))/(2.0*dx3);
+          } else {
+            dln3 = (log(fmax(w(m, IDN, k+1, j, i), dfloor))-
+                    log(fmax(w(m, IDN, k-1, j, i), dfloor)))/(2.0*dx3);
+          }
         }
 
         Real j1 = 0.0;
@@ -562,7 +683,7 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           j2 += (b(m, IBX, k + 1, j, i) - b(m, IBX, k - 1, j, i)) / (2.0 * dx3);
         }
 
-        Real tele = gm1 * fmax(w(m, iele, k, j, i), 0.0) / fe;
+        Real tele = gm1*fmax(w(m, iele, k, j, i), 0.0)/local_fe;
         Real gradln = sqrt(SQR(dln1) + SQR(dln2) + SQR(dln3));
         Real vtm = coeff * sqrt(gm1 * tele / ne) * gradln;
         Real vd1 = -coeff * j1 / ne;

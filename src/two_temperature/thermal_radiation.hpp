@@ -65,8 +65,11 @@ class ThermalRadiation {
   Real initial_radiation_x1_;
   Real energy_floor_;
   Real source_cfl_;
+  Real ap_streaming_threshold_;
+  Real ap_optical_depth_threshold_;
   int initial_profile_mode_;
   bool couple_matter_;
+  bool use_ap_transport_;
   bool use_opacity_table_ = false;
   OpacityTable *opacity_table_ = nullptr;
 

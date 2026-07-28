@@ -20,6 +20,7 @@
 #include "mesh/mesh.hpp"
 #include "laser/laser.hpp"
 #include "laser/laser_physics.hpp"
+#include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -300,6 +301,9 @@ void Laser::InitializeRays() {
   bool refractive = propagation_model_ == PropagationModel::refractive;
   Real number_scale = density_scale_cgs_*electron_number_per_gram_;
   Real length_scale = length_scale_cgs_;
+  bool use_materials = use_material_mixture_;
+  auto material_mixture = material_mixture_;
+  Real density_scale_cgs = density_scale_cgs_;
 
   Kokkos::parallel_for(
       "laser_initialize_rays", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
@@ -351,31 +355,87 @@ void Laser::InitializeRays() {
           Real offset_x = px-center_x;
           Real offset_y = py-center_y;
           Real offset_z = pz-center_z;
-          Real density = primitive(m, IDN, kk, jj, ii);
-          Real grad_x = (primitive(m, IDN, kk, jj, ii+1) -
-                         primitive(m, IDN, kk, jj, ii-1))/(2.0*sizes(m).dx1);
-          Real hess_x = (primitive(m, IDN, kk, jj, ii+1) - 2.0*density +
-                         primitive(m, IDN, kk, jj, ii-1))/SQR(sizes(m).dx1);
-          Real reconstructed_density =
-              density + grad_x*offset_x + 0.5*hess_x*SQR(offset_x);
-          if (multi_d) {
-            Real grad_y = (primitive(m, IDN, kk, jj+1, ii) -
-                           primitive(m, IDN, kk, jj-1, ii))/(2.0*sizes(m).dx2);
-            Real hess_y = (primitive(m, IDN, kk, jj+1, ii) - 2.0*density +
-                           primitive(m, IDN, kk, jj-1, ii))/SQR(sizes(m).dx2);
-            reconstructed_density +=
-                grad_y*offset_y + 0.5*hess_y*SQR(offset_y);
-          }
-          if (three_d) {
-            Real grad_z = (primitive(m, IDN, kk+1, jj, ii) -
-                           primitive(m, IDN, kk-1, jj, ii))/(2.0*sizes(m).dx3);
-            Real hess_z = (primitive(m, IDN, kk+1, jj, ii) - 2.0*density +
-                           primitive(m, IDN, kk-1, jj, ii))/SQR(sizes(m).dx3);
-            reconstructed_density +=
-                grad_z*offset_z + 0.5*hess_z*SQR(offset_z);
+          Real electron_density;
+          if (use_materials) {
+            Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                primitive, m, kk, jj, ii);
+            Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                primitive, m, kk, jj, ii+1);
+            Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                primitive, m, kk, jj, ii-1);
+            Real electron_density_center = material_mixture.ElectronNumberDensityCgs(
+                primitive(m, IDN, kk, jj, ii), density_scale_cgs, y0);
+            Real electron_density_p = material_mixture.ElectronNumberDensityCgs(
+                primitive(m, IDN, kk, jj, ii+1), density_scale_cgs, yp);
+            Real electron_density_m = material_mixture.ElectronNumberDensityCgs(
+                primitive(m, IDN, kk, jj, ii-1), density_scale_cgs, ym);
+            Real grad_x = (electron_density_p-electron_density_m)/
+                          (2.0*sizes(m).dx1);
+            Real hess_x = (electron_density_p-2.0*electron_density_center+
+                           electron_density_m)/SQR(sizes(m).dx1);
+            Real reconstructed_density = electron_density_center+
+                grad_x*offset_x+0.5*hess_x*SQR(offset_x);
+            if (multi_d) {
+              Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, kk, jj+1, ii);
+              Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, kk, jj-1, ii);
+              electron_density_p = material_mixture.ElectronNumberDensityCgs(
+                  primitive(m, IDN, kk, jj+1, ii), density_scale_cgs, yp);
+              electron_density_m = material_mixture.ElectronNumberDensityCgs(
+                  primitive(m, IDN, kk, jj-1, ii), density_scale_cgs, ym);
+              Real grad_y = (electron_density_p-electron_density_m)/
+                            (2.0*sizes(m).dx2);
+              Real hess_y = (electron_density_p-2.0*electron_density_center+
+                             electron_density_m)/SQR(sizes(m).dx2);
+              reconstructed_density +=
+                  grad_y*offset_y+0.5*hess_y*SQR(offset_y);
+            }
+            if (three_d) {
+              Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, kk+1, jj, ii);
+              Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, kk-1, jj, ii);
+              electron_density_p = material_mixture.ElectronNumberDensityCgs(
+                  primitive(m, IDN, kk+1, jj, ii), density_scale_cgs, yp);
+              electron_density_m = material_mixture.ElectronNumberDensityCgs(
+                  primitive(m, IDN, kk-1, jj, ii), density_scale_cgs, ym);
+              Real grad_z = (electron_density_p-electron_density_m)/
+                            (2.0*sizes(m).dx3);
+              Real hess_z = (electron_density_p-2.0*electron_density_center+
+                             electron_density_m)/SQR(sizes(m).dx3);
+              reconstructed_density +=
+                  grad_z*offset_z+0.5*hess_z*SQR(offset_z);
+            }
+            electron_density = fmax(reconstructed_density, 0.0);
+          } else {
+            // Preserve the original density reconstruction operation-for-operation.
+            Real density = primitive(m, IDN, kk, jj, ii);
+            Real grad_x = (primitive(m, IDN, kk, jj, ii+1)-
+                           primitive(m, IDN, kk, jj, ii-1))/(2.0*sizes(m).dx1);
+            Real hess_x = (primitive(m, IDN, kk, jj, ii+1)-2.0*density+
+                           primitive(m, IDN, kk, jj, ii-1))/SQR(sizes(m).dx1);
+            Real reconstructed_density =
+                density+grad_x*offset_x+0.5*hess_x*SQR(offset_x);
+            if (multi_d) {
+              Real grad_y = (primitive(m, IDN, kk, jj+1, ii)-
+                             primitive(m, IDN, kk, jj-1, ii))/(2.0*sizes(m).dx2);
+              Real hess_y = (primitive(m, IDN, kk, jj+1, ii)-2.0*density+
+                             primitive(m, IDN, kk, jj-1, ii))/SQR(sizes(m).dx2);
+              reconstructed_density +=
+                  grad_y*offset_y+0.5*hess_y*SQR(offset_y);
+            }
+            if (three_d) {
+              Real grad_z = (primitive(m, IDN, kk+1, jj, ii)-
+                             primitive(m, IDN, kk-1, jj, ii))/(2.0*sizes(m).dx3);
+              Real hess_z = (primitive(m, IDN, kk+1, jj, ii)-2.0*density+
+                             primitive(m, IDN, kk-1, jj, ii))/SQR(sizes(m).dx3);
+              reconstructed_density +=
+                  grad_z*offset_z+0.5*hess_z*SQR(offset_z);
+            }
+            electron_density = number_scale*fmax(reconstructed_density, 0.0);
           }
           Real critical_density = CriticalDensity(wavelength(r)*length_scale);
-          Real electron_density = number_scale*fmax(reconstructed_density, 0.0);
           Real normalized_density = electron_density/critical_density;
           if (!(normalized_density >= 0.0 && normalized_density < 1.0)) {
             status(r) = static_cast<int>(RayStatus::failed);
@@ -507,6 +567,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   Real electron_number_per_gram = electron_number_per_gram_;
   Real density_scale_cgs = density_scale_cgs_;
   Real temperature_scale_cgs = temperature_scale_cgs_;
+  Real unit_mean_molecular_weight = unit_mean_molecular_weight_;
   Real length_scale_cgs = length_scale_cgs_;
   Real fixed_coulomb_log = inverse_bremsstrahlung_coulomb_log_;
   Real ib_temperature_floor = inverse_bremsstrahlung_temperature_floor_;
@@ -516,6 +577,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   int max_reflections = max_reflections_per_ray_;
   Real reflection_offset_fraction = reflection_offset_fraction_;
   int seg_per_launch = max_segments_per_launch_;
+  bool use_materials = use_material_mixture_;
+  auto material_mixture = material_mixture_;
 
   SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
@@ -578,20 +641,65 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
             Real normal_x = 0.0, normal_y = 0.0, normal_z = 0.0;
             if (reflect_at_critical) {
               Real number_scale = density_scale_cgs*electron_number_per_gram;
-              Real grad_x = number_scale*
-                  (primitive(m, IDN, k, j, i+1) -
-                   primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
+              Real ne_center;
+              Real ne_p;
+              Real ne_m;
+              Real grad_x;
+              if (use_materials) {
+                Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k, j, i);
+                Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k, j, i+1);
+                Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k, j, i-1);
+                ne_center = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k, j, i), density_scale_cgs, y0);
+                ne_p = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k, j, i+1), density_scale_cgs, yp);
+                ne_m = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k, j, i-1), density_scale_cgs, ym);
+                grad_x = (ne_p-ne_m)/(2.0*size.dx1);
+              } else {
+                ne_center = number_scale*primitive(m, IDN, k, j, i);
+                grad_x = number_scale*
+                    (primitive(m, IDN, k, j, i+1)-
+                     primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
+              }
               Real grad_y = 0.0;
               Real grad_z = 0.0;
               if (multi_d) {
-                grad_y = number_scale*
-                    (primitive(m, IDN, k, j+1, i) -
-                     primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
+                if (use_materials) {
+                  Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                      primitive, m, k, j+1, i);
+                  Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                      primitive, m, k, j-1, i);
+                  ne_p = material_mixture.ElectronNumberDensityCgs(
+                      primitive(m, IDN, k, j+1, i), density_scale_cgs, yp);
+                  ne_m = material_mixture.ElectronNumberDensityCgs(
+                      primitive(m, IDN, k, j-1, i), density_scale_cgs, ym);
+                  grad_y = (ne_p-ne_m)/(2.0*size.dx2);
+                } else {
+                  grad_y = number_scale*
+                      (primitive(m, IDN, k, j+1, i)-
+                       primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
+                }
               }
               if (three_d) {
-                grad_z = number_scale*
-                    (primitive(m, IDN, k+1, j, i) -
-                     primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
+                if (use_materials) {
+                  Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                      primitive, m, k+1, j, i);
+                  Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                      primitive, m, k-1, j, i);
+                  ne_p = material_mixture.ElectronNumberDensityCgs(
+                      primitive(m, IDN, k+1, j, i), density_scale_cgs, yp);
+                  ne_m = material_mixture.ElectronNumberDensityCgs(
+                      primitive(m, IDN, k-1, j, i), density_scale_cgs, ym);
+                  grad_z = (ne_p-ne_m)/(2.0*size.dx3);
+                } else {
+                  grad_z = number_scale*
+                      (primitive(m, IDN, k+1, j, i)-
+                       primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
+                }
               }
               Real grad_norm = sqrt(SQR(grad_x)+SQR(grad_y)+SQR(grad_z));
               if (grad_norm > 0.0) {
@@ -601,9 +709,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 Real center_x = size.x1min + (i-is+0.5)*size.dx1;
                 Real center_y = size.x2min + (j-js+0.5)*size.dx2;
                 Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
-                Real electron_density =
-                    number_scale*primitive(m, IDN, k, j, i) +
-                    grad_x*(x(r)-center_x);
+                Real electron_density = ne_center+grad_x*(x(r)-center_x);
                 if (multi_d) electron_density += grad_y*(y(r)-center_y);
                 if (three_d) electron_density += grad_z*(z(r)-center_z);
                 Real approach = grad_x*nx(r) + grad_y*ny(r) + grad_z*nz(r);
@@ -641,15 +747,29 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
                 Real electron_energy =
                     fmax(primitive(m, electron_index, k, j, i), 0.0);
+                Real local_fe = electron_heat_capacity_fraction;
+                Real local_temperature_scale = temperature_scale_cgs;
+                Real electron_density;
+                Real local_zeff = zeff(r);
+                if (use_materials) {
+                  Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                      primitive, m, k, j, i);
+                  local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
+                  local_temperature_scale *=
+                      material_mixture.MeanParticleMass(y0)/unit_mean_molecular_weight;
+                  electron_density = material_mixture.ElectronNumberDensityCgs(
+                      density, density_scale_cgs, y0);
+                  local_zeff = material_mixture.EffectiveCharge(y0);
+                } else {
+                  electron_density = density*density_scale_cgs*
+                                     electron_number_per_gram;
+                }
                 Real electron_temperature = fmax(
-                    gamma_minus_one*electron_energy/
-                    electron_heat_capacity_fraction*temperature_scale_cgs,
+                    gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
                     ib_temperature_floor);
-                Real electron_density = density*density_scale_cgs*
-                    electron_number_per_gram;
                 Real wavelength_cgs = wavelength(r)*length_scale_cgs;
                 coefficient = InverseBremsstrahlungCoefficient(
-                    electron_density, electron_temperature, zeff(r), wavelength_cgs,
+                    electron_density, electron_temperature, local_zeff, wavelength_cgs,
                     fixed_coulomb_log)*length_scale_cgs;
               }
               coefficient = fmax(coefficient, 0.0);
@@ -888,6 +1008,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   Real electron_number_per_gram = electron_number_per_gram_;
   Real density_scale_cgs = density_scale_cgs_;
   Real temperature_scale_cgs = temperature_scale_cgs_;
+  Real unit_mean_molecular_weight = unit_mean_molecular_weight_;
   Real length_scale_cgs = length_scale_cgs_;
   Real fixed_coulomb_log = inverse_bremsstrahlung_coulomb_log_;
   Real ib_temperature_floor = inverse_bremsstrahlung_temperature_floor_;
@@ -896,6 +1017,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   Real curvature_fraction = refractive_curvature_fraction_;
   Real tau_max = refractive_tau_max_;
   int seg_per_launch = max_segments_per_launch_;
+  bool use_materials = use_material_mixture_;
+  auto material_mixture = material_mixture_;
 
   SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
@@ -925,31 +1048,78 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             Real critical_density =
                 CriticalDensity(wavelength(r)*length_scale_cgs);
             Real density = primitive(m, IDN, k, j, i);
-            Real grad_x = number_scale*
-                (primitive(m, IDN, k, j, i+1) -
-                 primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
-            Real hess_x = number_scale*
-                (primitive(m, IDN, k, j, i+1) - 2.0*density +
-                 primitive(m, IDN, k, j, i-1))/SQR(size.dx1);
+            Real electron_density_center;
+            Real grad_x;
+            Real hess_x;
+            if (use_materials) {
+              Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, k, j, i);
+              Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, k, j, i+1);
+              Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                  primitive, m, k, j, i-1);
+              electron_density_center = material_mixture.ElectronNumberDensityCgs(
+                  density, density_scale_cgs, y0);
+              Real ne_p = material_mixture.ElectronNumberDensityCgs(
+                  primitive(m, IDN, k, j, i+1), density_scale_cgs, yp);
+              Real ne_m = material_mixture.ElectronNumberDensityCgs(
+                  primitive(m, IDN, k, j, i-1), density_scale_cgs, ym);
+              grad_x = (ne_p-ne_m)/(2.0*size.dx1);
+              hess_x = (ne_p-2.0*electron_density_center+ne_m)/SQR(size.dx1);
+            } else {
+              electron_density_center = number_scale*density;
+              grad_x = number_scale*
+                  (primitive(m, IDN, k, j, i+1)-
+                   primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
+              hess_x = number_scale*
+                  (primitive(m, IDN, k, j, i+1)-2.0*density+
+                   primitive(m, IDN, k, j, i-1))/SQR(size.dx1);
+            }
             Real grad_y = 0.0;
             Real grad_z = 0.0;
             Real hess_y = 0.0;
             Real hess_z = 0.0;
             if (multi_d) {
-              grad_y = number_scale*
-                  (primitive(m, IDN, k, j+1, i) -
-                   primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
-              hess_y = number_scale*
-                  (primitive(m, IDN, k, j+1, i) - 2.0*density +
-                   primitive(m, IDN, k, j-1, i))/SQR(size.dx2);
+              if (use_materials) {
+                Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k, j+1, i);
+                Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k, j-1, i);
+                Real ne_p = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k, j+1, i), density_scale_cgs, yp);
+                Real ne_m = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k, j-1, i), density_scale_cgs, ym);
+                grad_y = (ne_p-ne_m)/(2.0*size.dx2);
+                hess_y = (ne_p-2.0*electron_density_center+ne_m)/SQR(size.dx2);
+              } else {
+                grad_y = number_scale*
+                    (primitive(m, IDN, k, j+1, i)-
+                     primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
+                hess_y = number_scale*
+                    (primitive(m, IDN, k, j+1, i)-2.0*density+
+                     primitive(m, IDN, k, j-1, i))/SQR(size.dx2);
+              }
             }
             if (three_d) {
-              grad_z = number_scale*
-                  (primitive(m, IDN, k+1, j, i) -
-                   primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
-              hess_z = number_scale*
-                  (primitive(m, IDN, k+1, j, i) - 2.0*density +
-                   primitive(m, IDN, k-1, j, i))/SQR(size.dx3);
+              if (use_materials) {
+                Real yp = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k+1, j, i);
+                Real ym = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k-1, j, i);
+                Real ne_p = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k+1, j, i), density_scale_cgs, yp);
+                Real ne_m = material_mixture.ElectronNumberDensityCgs(
+                    primitive(m, IDN, k-1, j, i), density_scale_cgs, ym);
+                grad_z = (ne_p-ne_m)/(2.0*size.dx3);
+                hess_z = (ne_p-2.0*electron_density_center+ne_m)/SQR(size.dx3);
+              } else {
+                grad_z = number_scale*
+                    (primitive(m, IDN, k+1, j, i)-
+                     primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
+                hess_z = number_scale*
+                    (primitive(m, IDN, k+1, j, i)-2.0*density+
+                     primitive(m, IDN, k-1, j, i))/SQR(size.dx3);
+              }
             }
             Real center_x = size.x1min + (i-is+0.5)*size.dx1;
             Real center_y = size.x2min + (j-js+0.5)*size.dx2;
@@ -957,7 +1127,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             Real offset_x = x(r)-center_x;
             Real offset_y = y(r)-center_y;
             Real offset_z = z(r)-center_z;
-            Real electron_density = number_scale*density +
+            Real electron_density = electron_density_center+
                                     grad_x*offset_x +
                                     0.5*hess_x*SQR(offset_x);
             if (multi_d) {
@@ -991,14 +1161,28 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               Real density = fmax(primitive(m, IDN, k, j, i), 0.0);
               Real electron_energy =
                   fmax(primitive(m, electron_index, k, j, i), 0.0);
+              Real local_fe = electron_heat_capacity_fraction;
+              Real local_temperature_scale = temperature_scale_cgs;
+              Real ne;
+              Real local_zeff = zeff(r);
+              if (use_materials) {
+                Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                    primitive, m, k, j, i);
+                local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
+                local_temperature_scale *=
+                    material_mixture.MeanParticleMass(y0)/unit_mean_molecular_weight;
+                ne = material_mixture.ElectronNumberDensityCgs(
+                    density, density_scale_cgs, y0);
+                local_zeff = material_mixture.EffectiveCharge(y0);
+              } else {
+                ne = density*density_scale_cgs*electron_number_per_gram;
+              }
               Real electron_temperature = fmax(
-                  gamma_minus_one*electron_energy/
-                  electron_heat_capacity_fraction*temperature_scale_cgs,
+                  gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
                   ib_temperature_floor);
-              Real ne = density*density_scale_cgs*electron_number_per_gram;
               Real wavelength_cgs = wavelength(r)*length_scale_cgs;
               coefficient = InverseBremsstrahlungCoefficient(
-                  ne, electron_temperature, zeff(r), wavelength_cgs,
+                  ne, electron_temperature, local_zeff, wavelength_cgs,
                   fixed_coulomb_log)*length_scale_cgs;
             }
             coefficient = fmax(coefficient, 0.0);

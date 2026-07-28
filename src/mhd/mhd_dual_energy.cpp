@@ -10,6 +10,7 @@
 
 #include "athena.hpp"
 #include "driver/driver.hpp"
+#include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
 #include "mhd/biermann_battery.hpp"
@@ -84,6 +85,11 @@ void MHD::ApplyDualEnergyFormalism(const Real dt) {
   const int iele = ptwo_temp->iele;
   const Real fe0 = ptwo_temp->InitialElectronEnergyFraction();
   const Real gm1 = eos.gamma - 1.0;
+  const bool use_materials = pmaterials != nullptr;
+  materials::MaterialMixtureDevice material_mixture;
+  if (use_materials) material_mixture = pmaterials->DeviceData();
+  const Real initial_temperature_ratio =
+      ptwo_temp->InitialElectronTemperatureRatio();
 
   par_for("mhd_2t_dual_energy_compress", DevExeSpace(),
           0, nmb1, ks, ke, js, je, is, ie,
@@ -103,7 +109,15 @@ void MHD::ApplyDualEnergyFormalism(const Real dt) {
     Real eion = fmax(u0_(m, iion, k, j, i), 0.0);
     Real eele = fmax(u0_(m, iele, k, j, i), 0.0);
     const Real component_sum = eion + eele;
-    const Real eele_fraction = (component_sum > 0.0) ? eele/component_sum : fe0;
+    Real initial_fraction = fe0;
+    if (use_materials) {
+      const Real y0 = material_mixture.Material0MassFractionFromConserved(
+          u0_, m, k, j, i, eos.dfloor);
+      initial_fraction = material_mixture.InitialElectronEnergyFraction(
+          y0, initial_temperature_ratio);
+    }
+    const Real eele_fraction =
+        (component_sum > 0.0) ? eele/component_sum : initial_fraction;
     Real eint = component_sum*exp(-gm1*divv*dt);
     eint = fmax(eint, MHDInternalEnergyFloor(eos, dens));
     eele = fmin(fmax(eele_fraction*eint, 0.0), eint);
@@ -143,6 +157,11 @@ void MHD::SynchronizeDualEnergyFromTotal() {
   const int iele = ptwo_temp->iele;
   const Real fe0 = ptwo_temp->InitialElectronEnergyFraction();
   const Real eta2 = dual_energy_eta2;
+  const bool use_materials = pmaterials != nullptr;
+  materials::MaterialMixtureDevice material_mixture;
+  if (use_materials) material_mixture = pmaterials->DeviceData();
+  const Real initial_temperature_ratio =
+      ptwo_temp->InitialElectronTemperatureRatio();
 
   if (eta2 > 0.0) {
     par_for("mhd_2t_dual_energy_etot_max", DevExeSpace(),
@@ -183,7 +202,15 @@ void MHD::SynchronizeDualEnergyFromTotal() {
     Real eion = fmax(u0_(m, iion, k, j, i), 0.0);
     Real eele = fmax(u0_(m, iele, k, j, i), 0.0);
     const Real component_sum = eion + eele;
-    const Real eele_fraction = (component_sum > 0.0) ? eele/component_sum : fe0;
+    Real initial_fraction = fe0;
+    if (use_materials) {
+      const Real y0 = material_mixture.Material0MassFractionFromConserved(
+          u0_, m, k, j, i, eos.dfloor);
+      initial_fraction = material_mixture.InitialElectronEnergyFraction(
+          y0, initial_temperature_ratio);
+    }
+    const Real eele_fraction =
+        (component_sum > 0.0) ? eele/component_sum : initial_fraction;
     Real eint_aux = component_sum;
     if (DualEnergySyncEligible(eint_cons, local_etot_max, eta2)) {
       eint_aux = eint_cons;

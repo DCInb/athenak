@@ -1,0 +1,112 @@
+# Uniform pressure/density with a passive-scalar material interface.  The two halves
+# remain mechanically identical, isolating composition-dependent 2T initialization and
+# exchange.  Material 0 is fully ionized CH and material 1 is fully ionized DT.
+
+<job>
+basename = two_material_relax
+
+<units>
+length_cgs = 1.0e-1
+mass_cgs = 1.0e-3
+time_cgs = 1.0e-9
+mu = 1.4444444444444444
+
+<mesh>
+nghost = 2
+nx1 = 16
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 1
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 1
+nx3 = 1
+
+<time>
+evolution = dynamic
+integrator = rk1
+cfl_number = 0.4
+nlim = -1
+tlim = 5.0e-2
+initial_dt = 1.0e-3
+ndiag = 1
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+nscalars = 1
+two_temperature = true
+dual_energy = true
+initial_electron_temperature_ratio = 0.25
+t_ei_model = constant
+t_ei = -1.0
+t_ei_coulomb_log = 10.0
+t_ei_spitzer_multiplier = 1.0
+t_ei_temperature_floor_kelvin = 1.0
+
+<materials>
+nmaterials = 2
+scalar_index = 0
+material0_name = CH
+material0_abar = 6.5
+material0_zbar = 3.5
+material0_zeff = 5.285714285714286
+material0_t_ei = 0.2
+material1_name = DT
+material1_abar = 2.5
+material1_zbar = 1.0
+material1_zeff = 1.0
+material1_t_ei = 0.4
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.0
+dl = 1.0
+pl = 1.0
+ul = 0.0
+vl = 0.0
+wl = 0.0
+bxl = 0.0
+byl = 0.0
+bzl = 0.0
+yl = 1.0
+dr = 1.0
+pr = 1.0
+ur = 0.0
+vr = 0.0
+wr = 0.0
+bxr = 0.0
+byr = 0.0
+bzr = 0.0
+yr = 0.0
+
+<output1>
+file_type = tab
+variable = mhd_2t
+data_format = %20.12e
+dt = 5.0e-2
+slice_x2 = 0.0
+slice_x3 = 0.0
+
+<output2>
+file_type = tab
+variable = mhd_w_s
+data_format = %20.12e
+dt = 5.0e-2
+slice_x2 = 0.0
+slice_x3 = 0.0

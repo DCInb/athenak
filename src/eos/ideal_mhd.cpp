@@ -7,6 +7,7 @@
 //! \brief derived class that implements ideal gas EOS in nonrelativistic mhd
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
 #include "eos.hpp"
 #include "eos/ideal_c2p_mhd.hpp"
@@ -64,6 +65,11 @@ void IdealMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
   int &nmb = pmy_pack->nmb_thispack;
   auto &eos = eos_data;
   auto &fofc_ = pmy_pack->pmhd->fofc;
+  const bool use_materials = pmy_pack->pmhd->pmaterials != nullptr;
+  materials::MaterialMixtureDevice material_mixture;
+  if (use_materials) {
+    material_mixture = pmy_pack->pmhd->pmaterials->DeviceData();
+  }
 
   const int ni   = (iu - il + 1);
   const int nji  = (ju - jl + 1)*ni;
@@ -171,9 +177,15 @@ void IdealMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
       bcc(m,IBZ,k,j,i) = u.bz;
       // convert scalars (if any), always stored at end of cons and prim arrays.
       for (int n=nmhd; n<(nmhd+nscal); ++n) {
-        // apply scalar floor
-        if (cons(m,n,k,j,i) < 0.0) {
-          cons(m,n,k,j,i) = 0.0;
+        if (use_materials && n == material_mixture.scalar_index) {
+          // The material scalar is conservative rho*Y0. Clamp only its mass fraction;
+          // the complementary material remains exactly 1-Y0.
+          cons(m,n,k,j,i) = fmin(fmax(cons(m,n,k,j,i), 0.0), u.d);
+        } else {
+          // Legacy positivity floor for every other advected scalar.
+          if (cons(m,n,k,j,i) < 0.0) {
+            cons(m,n,k,j,i) = 0.0;
+          }
         }
         prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
       }
@@ -203,6 +215,11 @@ void IdealMHD::PrimToCons(const DvceArray5D<Real> &prim, const DvceArray5D<Real>
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
   int &nmb = pmy_pack->nmb_thispack;
+  const bool use_materials = pmy_pack->pmhd->pmaterials != nullptr;
+  materials::MaterialMixtureDevice material_mixture;
+  if (use_materials) {
+    material_mixture = pmy_pack->pmhd->pmaterials->DeviceData();
+  }
 
   par_for("mhd_p2c", DevExeSpace(), 0, (nmb-1), kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -232,7 +249,12 @@ void IdealMHD::PrimToCons(const DvceArray5D<Real> &prim, const DvceArray5D<Real>
 
     // convert scalars (if any), always stored at end of cons and prim arrays.
     for (int n=nmhd; n<(nmhd+nscal); ++n) {
-      cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+      if (use_materials && n == material_mixture.scalar_index) {
+        cons(m,n,k,j,i) = u.d*material_mixture.ClampMassFraction(
+            prim(m,n,k,j,i));
+      } else {
+        cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+      }
     }
   });
 

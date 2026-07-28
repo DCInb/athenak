@@ -1,0 +1,29 @@
+# Synthetic separate ion/electron table for the standalone device-API test.
+athenak_two_temperature_eos 1
+dimensions 2 3
+abar 6.5
+density
+1.0 4.0
+temperature
+100.0 400.0 1600.0
+
+ion_pressure
+100.0 400.0 1600.0
+400.0 1600.0 6400.0
+
+electron_pressure
+100.0 400.0 1600.0
+1600.0 6400.0 25600.0
+
+ion_specific_internal_energy
+10.0 10.0 80.0
+40.0 40.0 320.0
+
+electron_specific_internal_energy
+10.0 40.0 160.0
+20.0 80.0 320.0
+
+mean_ionization
+0.0 1.0 2.0
+0.0 2.0 4.0
+end

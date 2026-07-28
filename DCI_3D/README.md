@@ -1,5 +1,8 @@
 # Provisional DCI_3D case
 
+The archive audit and every reference-versus-user override are recorded in
+[`REFERENCE_MAPPING.md`](REFERENCE_MAPPING.md).
+
 This directory is an executable first-version scaffold for a three-dimensional,
 laser-driven CH target with separate ion, electron, and multigroup-radiation energies,
 ion-electron exchange, dual-energy MHD, a Biermann battery, and a conservative material
@@ -75,13 +78,16 @@ This avoids incorrectly treating a volume fraction as a mass fraction across the
 eight-order density jump.  The scalar is advected conservatively and `CH_mass` and a
 mixed-mass indicator are recorded in history output.
 
-The current AthenaK core cannot yet perform the requested FLASH-like material closure:
+The shared AthenaK core now contains an ideal two-material closure, local material
+properties for laser absorption and Biermann terms, a standalone mixed-opacity
+evaluator, and a separate-ion/electron IONMIX table loader.  The requested end-to-end
+FLASH-like closure is still incomplete:
 
-- two-temperature laser MHD hard-requires a gamma-law EOS, while the existing tabulated
-  EOS is equilibrium, single-material, and incompatible with two-temperature/laser use;
-- thermal radiation accepts only one opacity table and has no multispecies opacity
-  mixing;
-- the laser and Biermann modules use global `fe`, electron-number, and `Zeff` values.
+- the IONMIX loader is standalone infrastructure and is not connected to the MHD
+  pressure, wave-speed, work-partition, laser, or radiation paths;
+- thermal radiation still constructs one opacity table and does not yet call the
+  mixed-opacity evaluator with the advected material fraction;
+- this provisional DCI deck does not configure the new material closure.
 
 Consequently, the deck uses ideal CH and a named, single-material surrogate opacity
 table.  The table contains constant values over a minimal density/temperature grid:
@@ -90,9 +96,10 @@ transport opacities of 100, 10, and 1 cm2/g and Planck absorption/emission opaci
 `3d_zb.zip`.  A tracer-only run must not be reported as satisfying material-specific EOS
 or FLASH mixing fidelity.
 
-When real tables become available, the intended mixed-cell closure is a common-pressure,
-common-temperature additive-volume EOS solve and FLASH-style opacity averaging by
-relative ion number density, with pure-material limits reproducing each source table.
+The audited CH/He tables can be regenerated locally from the untracked reference archive
+with `--regenerate-material-tables`, but the provisional deck does not consume them.  A
+run must not be described as material-specific until the loader and mixed opacity are
+wired into the production thermodynamic and radiation paths.
 
 ### Three-temperature physics
 
@@ -187,19 +194,31 @@ Print the intended production command for the 5 ns laser phase and 10 ns restart
 python3 DCI_3D/run_case.py --mode production --dry-run
 ```
 
-An actual production launch is intentionally disabled.  In the `1e-8`-density ambient,
-the group-3 transport opacity and explicit FLD stability calculation give a production
-mesh timestep of approximately `4.25e-16 ns`, or roughly `2.35e16` steps to 10 ns.  The
-compact `nlim=0` validation measured the same failure mode at `dt=8.17e-15 ns`; `nlim=0`
-and `nlim=2` checks do not establish runtime feasibility.  Resolve this with a validated
-free-streaming timestep treatment, radiation subcycling, or an implicit transport method
-before enabling production.  Increasing `initial_dt` does not bypass the stability limit.
+An actual production launch is intentionally disabled.  The new AP radiation flux removes
+the former optically thin timestep collapse: an eight-GPU compact run advanced 50 RK2
+steps to `7.21e-3 ns` with positive finite fields, conserved CH mass, and an energy-closure
+residual below `1e-7` of deposited laser energy.  That is stability evidence, not
+production acceptance.  Resolution/opacity convergence, restart behavior, the final
+20-group CH/He material path, full-mesh memory use, and evolution to both 5 ns and 10 ns
+remain unverified.  Keep the guard until those checks and the reference reconciliation
+are complete.
 
 The intended production staging directory is the local, ignored `DCI_3D/run`.  A
-dedicated non-deleting `/home/mengqi/Research/TranFile` configuration is still required
-to transfer verified outputs into `~/data/DCI_3D`.  The launcher deliberately does not
-invoke the existing TranFile daemon: its unrelated configuration can delete source
-`.bin` and `.rst` files.
+dedicated, non-deleting configuration is provided in `tranfile_config.json`; it preserves
+the run-directory tree under `~/data/DCI_3D` on `192.168.3.20`.  Validate its SSH and
+rsync setup after creating the local staging directory:
+
+```bash
+mkdir -p DCI_3D/run
+python3 /home/mengqi/Research/TranFile/file_watcher.py \
+  --config DCI_3D/tranfile_config.json --validate-only
+```
+
+Start that dedicated watcher before production with the same command but without
+`--validate-only`.  It requires four unchanged size/mtime checks spaced 15 seconds apart,
+uses separate DCI log/state files, and never deletes local output.  Do not use the global
+TranFile configuration for this case: its unrelated settings delete transferred `.bin`
+and `.rst` files.
 
 ## Outputs and diagnostics
 

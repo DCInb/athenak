@@ -63,27 +63,28 @@ Consequently, their advection, boundary communication, AMR restriction/prolongat
 flux correction, and restart storage use AthenaK's existing conservative infrastructure.
 
 FLD fluxes are added to the Hydro or MHD finite-volume fluxes at every Runge--Kutta stage.
-AthenaK computes the explicit multidimensional diffusion stability bound
+On optically thick faces AthenaK computes the local nonlinear flux Jacobian and recovers
+the explicit multidimensional diffusion stability bound
 
 \[
 \Delta t_g\leq
 \frac{1}{2c_*D_g(\Delta x_1^{-2}+\Delta x_2^{-2}+\Delta x_3^{-2})}
 \]
 
-and includes it in the normal CFL timestep.  This differs from FLASH, which time-lags the
-coefficients but solves each group diffusion equation implicitly.  The physical FLD
-closure and group emission/absorption terms follow FLASH; the current AthenaK transport
-update is explicit and does not require HYPRE.
+and includes it in the normal CFL timestep.  The default `asymptotic-preserving`
+discretization switches a limited face to a conservative LLF/upwind flux when its
+streaming fraction is at least `ap_streaming_threshold` or its cell optical depth is at
+most `ap_optical_depth_threshold`.  Such faces use a causal hyperbolic `dx/c_light` CFL
+instead of the singular optically thin diffusion Jacobian; inactive transverse faces
+with zero normal flux add no artificial dimensional penalty.  Set
+`transport_discretization=face-jacobian` to use the nonlinear centered face flux and its
+full explicit Jacobian everywhere.
 
-Two practical consequences of the explicit update (measured in the 2026-07 validation):
-the timestep scales linearly with the transport opacity (`dt` collapses proportionally
-to `kappa_transport` in optically thin regions — a `kappa` of 1e-6 in code units makes
-front-propagation runs infeasible), and in the free-streaming limit the flux limiter
-caps the half-height front at ≲0.9 c_hat while the low-amplitude leading edge shows an
-O(Δx) superluminal precursor (measured 1.14→1.06 c_hat as resolution doubles twice) —
-an inherent, converging artifact of explicit flux-limited diffusion, not an instability.
-The diffusive transport coefficient itself was validated to +0.065% against the
-analytic step-diffusion solution.
+This differs from FLASH, which time-lags the coefficients but solves each group diffusion
+equation implicitly.  Both AthenaK choices remain explicit and require resolution and
+convergence checks; the AP option is a finite-resolution transport approximation, not an
+implicit solve.  The thick diffusion coefficient and the thin causal timestep are
+covered by one-, two-, and three-dimensional conservation/positivity tests.
 
 Boundary conditions: radiation groups inherit the cell-centered fluid BCs. Note that
 for FLD an `outflow` (zero-gradient) boundary is an *insulated wall* — zero gradient
@@ -120,6 +121,9 @@ c_light = 1.0
 initial_radiation_temperature = 0.2
 flux_limiter = levermore-pomraning
 flux_limit_coefficient = 1.0
+transport_discretization = asymptotic-preserving
+ap_streaming_threshold = 0.5
+ap_optical_depth_threshold = 1.0
 source_cfl = 0.1
 couple_matter = true
 opacity_model = constant
@@ -153,12 +157,16 @@ clamped to its nearest edge.
 opacity_model = table
 opacity_table_file = inputs/hydro/two_temperature_opacity_table.dat
 opacity_interpolation = linear
+opacity_coordinate_interpolation = linear
 ```
 
-`opacity_interpolation` may be `linear` (the default) or `log`.  Log interpolation is
-performed on the opacity values, not the coordinates, and therefore requires every
-stored opacity to be strictly positive.  Linear tables may contain zero absorption or
-emission opacity.  Transport opacity must always be positive.
+`opacity_interpolation` may be `linear` (the default), strict `log`, or `geometric`.
+Strict log interpolation is performed on the opacity values and requires every stored
+opacity to be positive.  Geometric interpolation uses log values when all four stencil
+entries are positive and falls back to linear values for a stencil containing zero.
+`opacity_coordinate_interpolation` independently selects `linear` (the default) or
+`log` density/temperature coordinates.  Linear and geometric tables may contain zero
+absorption or emission opacity.  Transport opacity must always be positive.
 
 The native, comment-friendly table format is:
 

@@ -11,6 +11,7 @@
 #include <string>
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 
 class MeshBlockPack;
 class ParameterInput;
@@ -33,7 +34,8 @@ class ThermalRadiation;
 class TwoTemperature {
  public:
   TwoTemperature(const std::string &block, MeshBlockPack *ppack, ParameterInput *pin,
-                 int first_component_index);
+                 int first_component_index,
+                 materials::MaterialMixture *material_mixture = nullptr);
   ~TwoTemperature();
 
   int iion;  // conserved rho*e_i / primitive e_i index
@@ -47,6 +49,7 @@ class TwoTemperature {
 
   int NumberOfRadiationGroups() const;
   Real InitialElectronEnergyFraction() const { return initial_e_fraction_; }
+  Real InitialElectronTemperatureRatio() const { return initial_temperature_ratio_; }
   Real ElectronHeatCapacityFraction() const { return cv_e_fraction_; }
 
   // Set initial component energies from the total internal energy and requested Te/Ti.
@@ -71,7 +74,17 @@ class TwoTemperature {
   Real cv_i_fraction_;
   Real cv_e_fraction_;
   Real initial_e_fraction_;
+  Real initial_temperature_ratio_;
   Real t_ei_;
+  bool use_material_mixture_;
+  materials::MaterialMixtureDevice material_mixture_;
+  bool use_spitzer_exchange_ = false;
+  Real spitzer_coulomb_log_ = 10.0;
+  Real spitzer_multiplier_ = 1.0;
+  Real spitzer_temperature_floor_ = 1.0;
+  Real density_scale_cgs_ = 1.0;
+  Real velocity_squared_cgs_ = 1.0;
+  Real time_scale_cgs_ = 1.0;
 };
 
 } // namespace two_temperature

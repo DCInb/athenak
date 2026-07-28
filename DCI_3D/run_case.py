@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -19,6 +21,15 @@ REPO = CASE_DIR.parent
 PRODUCTION_INPUT = CASE_DIR / "dci_3d.athinput"
 CALIBRATION_INPUT = CASE_DIR / "dci_3d_calibration.athinput"
 OPACITY_TABLE = CASE_DIR / "ch_surrogate.opacity"
+TABLE_GENERATOR = CASE_DIR / "generate_reference_tables.py"
+MATERIAL_TABLE_DIR = CASE_DIR / "material_tables"
+MATERIAL_TABLE_NAMES = (
+    "ch.2t_eos",
+    "he.2t_eos",
+    "ch_20g.opacity",
+    "he_20g.opacity",
+)
+MATERIAL_TABLE_MANIFEST = MATERIAL_TABLE_DIR / "manifest.json"
 BUILD_DIR = CASE_DIR / "build"
 BINARY = BUILD_DIR / "src" / "athena"
 HELPER = Path(
@@ -42,6 +53,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--build", action="store_true")
+    parser.add_argument(
+        "--regenerate-material-tables",
+        action="store_true",
+        help=(
+            "recreate audited CH/He EOS and opacity tables from the local "
+            "3d_zb.zip (the provisional deck does not consume them yet)"
+        ),
+    )
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--jobs", type=int, default=40)
@@ -64,6 +83,50 @@ def parse_args() -> argparse.Namespace:
         help="permit a non-idle baseline (never recommended for memory acceptance)",
     )
     return parser.parse_args()
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def material_tables_are_valid() -> bool:
+    try:
+        manifest = json.loads(MATERIAL_TABLE_MANIFEST.read_text(encoding="utf-8"))
+        records = manifest["tables"]
+        if not isinstance(records, list):
+            return False
+        expected = set(MATERIAL_TABLE_NAMES)
+        actual: set[str] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                return False
+            name = record.get("output")
+            expected_hash = record.get("output_sha256")
+            if not isinstance(name, str) or not isinstance(expected_hash, str):
+                return False
+            path = MATERIAL_TABLE_DIR / name
+            if not path.is_file() or sha256_path(path) != expected_hash:
+                return False
+            actual.add(name)
+        return actual == expected
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def prepare_material_tables(force: bool, dry_run: bool) -> None:
+    if not force and material_tables_are_valid():
+        return
+    command = [sys.executable, str(TABLE_GENERATOR), "--force"]
+    if dry_run:
+        print(shlex.join(command))
+        return
+    subprocess.run(command, cwd=REPO, check=True)
+    if not material_tables_are_valid():
+        raise RuntimeError("Generated DCI material-table manifest failed verification")
 
 
 def default_run_dir(mode: str) -> Path:
@@ -307,13 +370,15 @@ def main() -> int:
         raise RuntimeError("--nlim is only valid for non-production modes")
     if args.mode == "production" and not args.dry_run:
         raise RuntimeError(
-            "Production is disabled: the explicit FLD stability limit in the "
-            "low-density ambient is about 4e-16 ns. Resolve the radiation "
-            "transport timestep described in DCI_3D/README.md before launching."
+            "Production is disabled: AP transport is stable in a compact smoke run, "
+            "but convergence, restart, final 20-group material physics, full-mesh "
+            "memory, and 5/10 ns endpoints remain unverified. See DCI_3D/README.md."
         )
     if args.clean and args.dry_run:
         raise RuntimeError("Combine neither --clean nor destructive actions with --dry-run")
 
+    if args.regenerate_material_tables:
+        prepare_material_tables(True, args.dry_run)
     if args.build:
         build(args.jobs, args.dry_run)
     if not args.dry_run and not BINARY.is_file():

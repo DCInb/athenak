@@ -107,7 +107,7 @@ void ParameterInput::CheckBlockNames() {
     "hydro", "mhd", "ion-neutral", "radiation", "thermal_radiation",
     "z4c", "z4c_amr", "cce",
     "rad_srcterms", "hydro_srcterms", "mhd_srcterms", "particles", "turb_driving",
-    "fastflow", "laser"
+    "fastflow", "laser", "materials"
     };
 
   for (auto it1 = block.begin(); it1 != block.end(); ++it1) {

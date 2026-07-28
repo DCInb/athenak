@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 #include "tasklist/task_list.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -179,8 +180,11 @@ class Laser {
   Real gamma_minus_one_ = 0.0;
   Real electron_heat_capacity_fraction_ = 0.0;
   Real electron_number_per_gram_ = 0.0;
+  bool use_material_mixture_ = false;
+  materials::MaterialMixtureDevice material_mixture_;
   Real density_scale_cgs_ = 1.0;
   Real temperature_scale_cgs_ = 1.0;
+  Real unit_mean_molecular_weight_ = 1.0;
   Real length_scale_cgs_ = 1.0;
   Real power_scale_cgs_ = 1.0;
   Real inverse_bremsstrahlung_coulomb_log_ = -1.0;

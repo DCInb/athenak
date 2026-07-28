@@ -1,0 +1,24 @@
+{
+  "local_watch_dir": "./run",
+  "remote_host": "192.168.3.20",
+  "remote_user": "mengqi",
+  "remote_dir": "/home/mengqi/data/DCI_3D",
+  "ssh_key_path": "~/.ssh/id_ed25519",
+  "file_stable_wait_seconds": 15,
+  "poll_interval_seconds": 10,
+  "log_file": "./tranfile/logs/file_watcher.log",
+  "state_file": "./tranfile/state/transfer_state.json",
+  "allowed_extensions": [],
+  "ignore_patterns": [
+    "*.part",
+    "*.tmp"
+  ],
+  "retry_attempts": 5,
+  "create_remote_dir": true,
+  "recursive": true,
+  "watch_mode": "polling",
+  "transfer_method": "rsync",
+  "stable_checks_required": 4,
+  "delete_after_transfer": false,
+  "delete_extensions": []
+}

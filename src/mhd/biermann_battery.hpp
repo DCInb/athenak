@@ -9,6 +9,7 @@
 //! \brief FLASH-style flux formulation of the Biermann battery for 2T MHD.
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 
 class MeshBlockPack;
 class ParameterInput;
@@ -24,7 +25,8 @@ class BiermannBattery {
  public:
   BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin, int electron_index,
                   Real electron_heat_capacity_fraction, Real gamma,
-                  Real density_floor, Real pressure_floor);
+                  Real density_floor, Real pressure_floor,
+                  materials::MaterialMixture *material_mixture = nullptr);
   ~BiermannBattery() = default;
 
   Real coefficient;
@@ -60,6 +62,8 @@ class BiermannBattery {
   Real gamma_minus_one_;
   Real density_floor_;
   Real pressure_floor_;
+  bool use_material_mixture_;
+  materials::MaterialMixtureDevice material_mixture_;
 
   // Cell mask is one in smooth flow and zero in symmetrically detected shocks.
   DvceArray4D<Real> smooth_cell_;

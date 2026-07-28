@@ -11,6 +11,7 @@ import test_suite.testutils as testutils
 
 input_file = "../../../inputs/hydro/two_temperature_opacity_table.athinput"
 opacity_table = "../../../inputs/hydro/two_temperature_opacity_table.dat"
+zero_safe_table = "../../../inputs/hydro/two_temperature_opacity_zero.dat"
 per_kind_input = Path("opacity_per_kind_scales.athinput")
 
 
@@ -45,6 +46,18 @@ def run_scale_case(basename, scale):
         f"job/basename={basename}",
         f"thermal_radiation/opacity_table_file={opacity_table}",
         f"thermal_radiation/opacity_value_scale={scale}",
+    ]
+    assert testutils.run(input_file, flags=flags), f"{basename} failed."
+    return athena_read.tab(f"tab/{basename}.hydro_3t.00001.tab")
+
+
+def run_zero_safe_case(basename, coordinate_interpolation):
+    flags = [
+        f"job/basename={basename}",
+        f"thermal_radiation/opacity_table_file={zero_safe_table}",
+        "thermal_radiation/opacity_interpolation=geometric",
+        ("thermal_radiation/opacity_coordinate_interpolation="
+         f"{coordinate_interpolation}"),
     ]
     assert testutils.run(input_file, flags=flags), f"{basename} failed."
     return athena_read.tab(f"tab/{basename}.hydro_3t.00001.tab")
@@ -114,6 +127,27 @@ def test_run():
         for result in (baseline, scaled):
             total = result["eion"] + result["eele"] + result["erad"]
             assert np.allclose(total, total[0], rtol=2.0e-12, atol=2.0e-13)
+
+        # Strict legacy log(value) interpolation still rejects a zero table entry.
+        strict_log = opacity_command(
+            "opacity_zero_strict_log",
+            [f"thermal_radiation/opacity_table_file={zero_safe_table}",
+             "thermal_radiation/opacity_interpolation=log"],
+        )
+        assert not testutils.run_command(strict_log)
+
+        # Zero-safe geometric interpolation falls back to linear only for stencils
+        # containing a zero.  Log-coordinate and linear-coordinate lookup should both
+        # remain finite/conservative and should differ at the off-center test state.
+        zero_linear = run_zero_safe_case("opacity_zero_linear_coord", "linear")
+        zero_log = run_zero_safe_case("opacity_zero_log_coord", "log")
+        for result in (zero_linear, zero_log):
+            for values in result.values():
+                assert np.all(np.isfinite(values))
+            total = result["eion"] + result["eele"] + result["erad"]
+            assert np.allclose(total, total[0], rtol=2.0e-12, atol=2.0e-13)
+        assert not np.allclose(zero_linear["erad00"], zero_log["erad00"],
+                               rtol=1.0e-12, atol=1.0e-14)
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

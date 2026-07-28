@@ -298,6 +298,95 @@ def parse_native_table(path):
     return result
 
 
+def parse_opacity_table(path):
+    """Parse the native-v1 opacity subset emitted by the converter."""
+    tokens = []
+    for line in path.read_text(encoding="ascii").splitlines():
+        tokens.extend(line.partition("#")[0].split())
+    cursor = 0
+
+    def take(label=None):
+        nonlocal cursor
+        token = tokens[cursor]
+        cursor += 1
+        if label is not None:
+            assert token == label
+        return token
+
+    take("athenak_opacity_table")
+    assert take() == "1"
+    take("dimensions")
+    ndensity = int(take())
+    ntemperature = int(take())
+    ngroups = int(take())
+    take("density")
+    density = [float(take()) for _ in range(ndensity)]
+    take("temperature")
+    temperature = [float(take()) for _ in range(ntemperature)]
+    take("group_bound")
+    group_bounds = [float(take()) for _ in range(ngroups + 1)]
+    count = ndensity * ntemperature * ngroups
+    result = {
+        "dimensions": (ndensity, ntemperature, ngroups),
+        "density": density,
+        "temperature": temperature,
+        "group_bound": group_bounds,
+    }
+    for name in ("transport", "absorption", "emission"):
+        take(name)
+        result[name] = [float(take()) for _ in range(count)]
+    take("end")
+    assert cursor == len(tokens)
+    return result
+
+
+def parse_two_temperature_table(path):
+    """Parse the separate ion/electron EOS format emitted by the converter."""
+    tokens = []
+    for line in path.read_text(encoding="ascii").splitlines():
+        tokens.extend(line.partition("#")[0].split())
+    cursor = 0
+
+    def take(label=None):
+        nonlocal cursor
+        token = tokens[cursor]
+        cursor += 1
+        if label is not None:
+            assert token == label
+        return token
+
+    take("athenak_two_temperature_eos")
+    assert take() == "1"
+    take("dimensions")
+    ndensity = int(take())
+    ntemperature = int(take())
+    count = ndensity * ntemperature
+    take("abar")
+    abar = float(take())
+    take("density")
+    density = [float(take()) for _ in range(ndensity)]
+    take("temperature")
+    temperature = [float(take()) for _ in range(ntemperature)]
+    result = {
+        "dimensions": (ndensity, ntemperature),
+        "abar": abar,
+        "density": density,
+        "temperature": temperature,
+    }
+    for name in (
+        "ion_pressure",
+        "electron_pressure",
+        "ion_specific_internal_energy",
+        "electron_specific_internal_energy",
+        "mean_ionization",
+    ):
+        take(name)
+        result[name] = [float(take()) for _ in range(count)]
+    take("end")
+    assert cursor == len(tokens)
+    return result
+
+
 def expected_surfaces(number_density, temperature_ev, mass_per_ion):
     """Return independently derived AthenaK fields on increasing axes."""
     pressure = []
@@ -383,6 +472,95 @@ def test_manual_grid_cli_converts_units_and_reorders_axes(tmp_path):
         [1.0, 10.0, 100.0],
         MANUAL_MASS_G,
         MANUAL_ABAR,
+    )
+
+
+def test_manual_grid_cli_exports_native_opacity(tmp_path):
+    input_path = tmp_path / "manual_opacity.cn4"
+    output_path = tmp_path / "manual.opacity"
+    write_manual_cn4(input_path)
+
+    result = run_converter(
+        input_path,
+        None,
+        "--opacity-output",
+        str(output_path),
+        "--abar",
+        str(MANUAL_ABAR),
+        "--grid-mode",
+        "manual",
+        "--electron-entropy",
+        "absent",
+        "--quiet",
+    )
+
+    assert result.returncode == 0, result.stderr
+    table = parse_opacity_table(output_path)
+    assert table["dimensions"] == (3, 3, 1)
+    assert table["density"] == pytest.approx(
+        [value * MANUAL_MASS_G for value in (1.0e23, 1.0e24, 1.0e25)],
+        rel=2.0e-12,
+    )
+    assert table["temperature"] == pytest.approx(
+        [1.0 * EV_TO_K, 10.0 * EV_TO_K, 100.0 * EV_TO_K], rel=2.0e-12
+    )
+    assert table["group_bound"] == pytest.approx([0.0, EV_TO_K])
+    assert table["transport"] == pytest.approx([1.0] * 9)
+    assert table["absorption"] == pytest.approx([2.0] * 9)
+    assert table["emission"] == pytest.approx([3.0] * 9)
+
+
+def test_manual_grid_cli_preserves_separate_two_temperature_eos(tmp_path):
+    input_path = tmp_path / "manual_2t.cn4"
+    output_path = tmp_path / "manual.2t_eos"
+    write_manual_cn4(input_path)
+
+    result = run_converter(
+        input_path,
+        None,
+        "--two-temperature-output",
+        str(output_path),
+        "--abar",
+        str(MANUAL_ABAR),
+        "--grid-mode",
+        "manual",
+        "--electron-entropy",
+        "absent",
+        "--quiet",
+    )
+
+    assert result.returncode == 0, result.stderr
+    table = parse_two_temperature_table(output_path)
+    assert table["dimensions"] == (3, 3)
+    assert table["abar"] == pytest.approx(MANUAL_ABAR)
+    assert table["density"] == pytest.approx(
+        [value * MANUAL_MASS_G for value in (1.0e23, 1.0e24, 1.0e25)],
+        rel=2.0e-12,
+    )
+    assert table["temperature"] == pytest.approx(
+        [value * EV_TO_K for value in (1.0, 10.0, 100.0)], rel=2.0e-12
+    )
+    expected = expected_surfaces(
+        [1.0e23, 1.0e24, 1.0e25],
+        [1.0, 10.0, 100.0],
+        MANUAL_MASS_G,
+    )
+    assert table["ion_pressure"] == pytest.approx(
+        [0.25 * value for value in expected["pressure"]], rel=3.0e-6
+    )
+    assert table["electron_pressure"] == pytest.approx(
+        [0.75 * value for value in expected["pressure"]], rel=3.0e-6
+    )
+    assert table["ion_specific_internal_energy"] == pytest.approx(
+        [0.40 * value for value in expected["specific_internal_energy"]],
+        rel=5.0e-6,
+    )
+    assert table["electron_specific_internal_energy"] == pytest.approx(
+        [0.60 * value for value in expected["specific_internal_energy"]],
+        rel=5.0e-6,
+    )
+    assert table["mean_ionization"] == pytest.approx(
+        expected["zbar"], rel=5.0e-6
     )
 
 

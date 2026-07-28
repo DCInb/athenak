@@ -78,6 +78,8 @@ add_executable(
         laser/laser_tasks.cpp
         laser/laser_trace.cpp
 
+        materials/material_mixture.cpp
+
         mesh/build_tree.cpp
         mesh/load_balance.cpp
         mesh/mesh.cpp
