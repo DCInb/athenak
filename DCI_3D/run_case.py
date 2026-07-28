@@ -62,7 +62,7 @@ PROBLEM = "../../DCI_3D/dci_3d"
 RUN_SENTINEL = ".athenak_dci_3d_run"
 OUTPUT_BLOCKS = range(1, 12)
 DEFAULT_PRODUCTION_GATE = CASE_DIR / "production_gate.json"
-PRODUCTION_GATE_SCHEMA = 2
+PRODUCTION_GATE_SCHEMA = 3
 REQUIRED_PRODUCTION_CHECKS = (
     "compact_20group_50step",
     "compact_output_and_restart",
@@ -467,19 +467,51 @@ def nonproduction_overrides(
             )
         )
     overrides.extend(disabled_output_overrides())
-    if mode == "smoke" and nlim is None:
-        # The default smoke is an acceptance-gate run: cross both diagnostic and restart
-        # boundaries, then run_case restarts it for ten additional cycles.
-        overrides.extend(
-            (
-                "output1/dt=1.0e-4",
+    if mode == "smoke":
+        # Explicit-cycle diagnostic runs still need history evidence. The default smoke
+        # additionally crosses volume/restart boundaries and launches phase two.
+        overrides.append("output1/dt=1.0e-4")
+        if nlim is None:
+            overrides.extend(
+                (
                 "output3/dt=5.0e-4",
                 "output4/dt=5.0e-4",
                 "output8/dt=1.0",
                 "output9/dt=1.0",
                 "output10/dt=1.0",
                 "output11/dt=5.0e-4",
+                )
             )
+    return overrides
+
+
+def smoke_restart_overrides(
+    radiation_c_light: float | None, compact_scale: int
+) -> list[str]:
+    first_cycles = default_smoke_cycles(radiation_c_light, compact_scale)
+    extra_cycles = max(
+        10,
+        int(
+            round(
+                10.0
+                * (radiation_c_light or 10.0)
+                / 10.0
+                * compact_scale
+            )
+        ),
+    )
+    overrides = [
+        f"time/nlim={first_cycles+extra_cycles}",
+        "time/tlim=1.0",
+        *disabled_output_overrides(),
+        "output1/dt=1.0e-4",
+        # Construct one 3T output object so Driver::Finalize writes a terminal,
+        # post-restart full volume for cell-by-cell gate validation.
+        "output9/dt=1.0",
+    ]
+    if radiation_c_light is not None:
+        overrides.append(
+            f"thermal_radiation/c_light={radiation_c_light:.17g}"
         )
     return overrides
 
@@ -692,30 +724,9 @@ def main() -> int:
     if args.mode == "production":
         second_overrides = ["time/tlim=10.0"]
     else:
-        first_cycles = default_smoke_cycles(
+        second_overrides = smoke_restart_overrides(
             args.radiation_c_light, args.compact_scale
         )
-        extra_cycles = max(
-            10,
-            int(
-                round(
-                    10.0
-                    * (args.radiation_c_light or 10.0)
-                    / 10.0
-                    * args.compact_scale
-                )
-            ),
-        )
-        second_overrides = [
-            f"time/nlim={first_cycles+extra_cycles}",
-            "time/tlim=1.0",
-            *disabled_output_overrides(),
-            "output1/dt=1.0e-4",
-        ]
-        if args.radiation_c_light is not None:
-            second_overrides.append(
-                f"thermal_radiation/c_light={args.radiation_c_light:.17g}"
-            )
     second_mpi = restart_command(restart.relative_to(run_dir), second_overrides)
     second_baseline = query_gpu(devices)
     second_monitor = GpuMemoryMonitor(devices, second_baseline)

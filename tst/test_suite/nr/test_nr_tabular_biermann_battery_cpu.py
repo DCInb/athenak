@@ -21,6 +21,7 @@ Y_SLICE = 0.0078125
 ELECTRON_PRESSURE_FRACTION = 0.8
 CH_IONIZATION = 0.25
 CH_ABAR = 6.5
+MINIMUM_ELECTRON_FRACTION = 1.0e-12
 
 
 def write_table(path, abar, ionization):
@@ -54,12 +55,17 @@ def write_table(path, abar, ionization):
         ]), encoding="ascii")
 
 
-def prepare_case():
-    write_table(ch_table, CH_ABAR, CH_IONIZATION)
-    write_table(he_table, 4.0, 0.5)
+def prepare_case(ch_ionization=CH_IONIZATION, he_ionization=0.5):
+    write_table(ch_table, CH_ABAR, ch_ionization)
+    write_table(he_table, 4.0, he_ionization)
     text = base_input.read_text(encoding="ascii")
     text = text.replace("<mhd>\n", "<mhd>\nnscalars = 1\n", 1)
     text = text.replace("rsolver = hlle", "rsolver = llf", 1)
+    text = text.replace(
+        "biermann_coefficient = 0.1\n",
+        "biermann_coefficient = 0.1\n"
+        f"biermann_minimum_electron_fraction = {MINIMUM_ELECTRON_FRACTION}\n",
+        1)
     text = text.replace(
         "<problem>\n", "<problem>\nmaterial0_fraction = 1.0\n", 1)
     text += f"""
@@ -94,6 +100,7 @@ eos_table_specific_energy_from_cgs = 1.0
 
 
 def run_case(basename, coefficient=COEFFICIENT, extra_flags=None):
+    Path(f"{basename}.mhd.hst").unlink(missing_ok=True)
     flags = [
         f"job/basename={basename}",
         f"mhd/biermann_coefficient={coefficient}",
@@ -129,7 +136,7 @@ def expected_biermann_dt(coefficient):
     dln2 = (np.roll(log_ne, -1, axis=0)-np.roll(log_ne, 1, axis=0))/(2.0*dx)
     pe = ELECTRON_PRESSURE_FRACTION*pressure
     gm1 = 2.0/3.0
-    vtm = coefficient*np.sqrt(gm1*pe/electron_density**2)*np.abs(dln2)
+    vtm = (coefficient*np.sqrt(gm1*pe)/electron_density*np.abs(dln2))
     return 0.3*dx/np.max(vtm)
 
 
@@ -165,6 +172,28 @@ def test_run():
         assert np.isclose(cfl_history["dt"][0],
                           expected_biermann_dt(cfl_coefficient),
                           rtol=3.0e-10, atol=0.0)
+
+        # A table can retain a numerical electron-pressure floor while its physical
+        # ionization is effectively zero.  q_e=1e-200 would underflow q_e**2 and make
+        # the old vTM expression pathological; the regularized plasma activation must
+        # suppress both the battery and its timestep constraint.
+        prepare_case(ch_ionization=CH_ABAR*1.0e-200)
+        run_case("tabular_biermann_neutral", cfl_coefficient)
+        neutral_field = athena_read.tab(
+            "tab/tabular_biermann_neutral.biermann.00001.tab")
+        assert np.count_nonzero(neutral_field["bcc1"]) == 0
+        assert np.count_nonzero(neutral_field["bcc2"]) == 0
+        assert np.count_nonzero(neutral_field["bcc3"]) == 0
+
+        one_step = ["time/nlim=1", "time/tlim=1.0"]
+        run_case("tabular_biermann_neutral_cfl", cfl_coefficient, one_step)
+        run_case("tabular_biermann_neutral_control", 0.0, one_step)
+        neutral_history = athena_read.hst(
+            "tabular_biermann_neutral_cfl.mhd.hst")
+        control_history = athena_read.hst(
+            "tabular_biermann_neutral_control.mhd.hst")
+        assert np.isfinite(neutral_history["dt"][0])
+        assert neutral_history["dt"][0] == control_history["dt"][0]
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

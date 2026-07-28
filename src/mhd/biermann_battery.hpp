@@ -62,6 +62,7 @@ class BiermannBattery {
   Real gamma_minus_one_;
   Real density_floor_;
   Real pressure_floor_;
+  Real minimum_electron_fraction_;
   bool use_material_mixture_;
   materials::MaterialMixtureDevice material_mixture_;
 

@@ -27,17 +27,26 @@ def test_cached_flux_and_exchange_sources():
     radiation_source = (
         source_root / "src/two_temperature/thermal_radiation.cpp").read_text(
             encoding="utf-8")
+    output_source = (source_root / "src/outputs/basetype_output.cpp").read_text(
+        encoding="utf-8")
     assert "ptwo_temp->thermodynamics" in flux_source
     assert "ReconstructMaterialThermodynamicsX1" in flux_source
     assert "ReconstructMaterialThermodynamicsX2" in flux_source
     assert "ReconstructMaterialThermodynamicsX3" in flux_source
     assert "StateFromRhoSpecificEnergies" not in llf_source
     assert "StateFromRhoTotalEnergyTemperatureDifference" in exchange_source
+    assert "ElectronHeatCapacityFraction(" in exchange_source
+    assert "1.0+local_fe/local_fi" in exchange_source
+    assert "if (exchange.used_fallback == 2)" in exchange_source
+    assert exchange_source.count("materials::ionmix_energy_below_table") >= 6
     assert "iteration < 32" not in exchange_source
     coupling_tail = exchange_source.split("pradiation->Couple", 1)[1]
     assert "RefreshMaterialThermodynamics" in coupling_tail
-    assert "mixture.MinimumState(density, y0)" in radiation_source
+    assert "mixture.MinimumStateNoSound(" in radiation_source
+    assert "density, y0, pressure_floor, temperature_floor" in radiation_source
     assert "eele_old-eele_floor-negative" in radiation_source
+    assert '"eos_flags"' in output_source
+    assert "TwoTemperature::eos_query_flags" in output_source
 
 
 def build_driver():

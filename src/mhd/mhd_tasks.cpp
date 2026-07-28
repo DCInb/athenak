@@ -81,7 +81,13 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
   id.bcs       = tl["stagen"]->AddTask(&MHD::ApplyPhysicalBCs, this, id.recvb_shr);
   id.prol      = tl["stagen"]->AddTask(&MHD::Prolongate, this, id.bcs);
   id.c2p       = tl["stagen"]->AddTask(&MHD::ConToPrim, this, id.prol);
-  id.newdt     = tl["stagen"]->AddTask(&MHD::NewTimeStep, this, id.c2p);
+  // Two-temperature exchange and matter-radiation coupling run after the final RK
+  // stage and can change pressure, opacity, and every source timestep.  In that case
+  // compute the next timestep from the post-source state in TwoTempExchange instead of
+  // caching a stale pre-source limit here.
+  if (ptwo_temp == nullptr) {
+    id.newdt = tl["stagen"]->AddTask(&MHD::NewTimeStep, this, id.c2p);
+  }
 
   // assemble "after_stagen" task list
   id.csend = tl["after_stagen"]->AddTask(&MHD::ClearSend, this, none);
@@ -601,7 +607,7 @@ TaskStatus MHD::TwoTempExchange(Driver *pdrive, int stage) {
   int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
-  return TaskStatus::complete;
+  return NewTimeStep(pdrive, pdrive->nexp_stages);
 }
 
 //----------------------------------------------------------------------------------------

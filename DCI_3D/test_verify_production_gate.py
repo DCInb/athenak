@@ -9,16 +9,19 @@ import run_case
 
 
 def write_history(path: Path, scale: float = 1.0,
-                  final_time: float = 1.0e-4) -> None:
+                  final_time: float = 1.0e-4,
+                  eos_bad_cells: float = 0.0,
+                  eos_floor_cells: float = 0.0) -> None:
     names = ["time", "dt", "laser_Edep", "rad_Pesc", "CH_mass", "eion_E",
              "eele_E", "erad_E", "erad_soft", "erad_mid", "erad_hard",
-             "chain_E", "laser_x"]
+             "chain_E", "laser_x", "eos_floor", "eos_bad"]
     chain_delta = (1.0e-3-0.5*2.0e-4*final_time)*scale
     rows = (
-        (0.0, 1e-4, 0.0, 0.0, 2.0, 1.0, 1.0, 1.0, .3, .4, .3, 3.0, 0.0),
+        (0.0, 1e-4, 0.0, 0.0, 2.0, 1.0, 1.0, 1.0, .3, .4, .3,
+         3.0, 0.0, 0.0, 0.0),
         (final_time, 1e-4, 1e-3*scale, 2e-4*scale, 2.0, 1.0,
          1.0+4e-4*scale, 1.0+4e-4*scale, .3, .4, .3004,
-         3.0+chain_delta, -5e-4*scale),
+         3.0+chain_delta, -5e-4*scale, eos_floor_cells, eos_bad_cells),
     )
     header = "# " + " ".join(f"[{index}]={name}" for index, name in enumerate(names, 1))
     path.write_text(header+"\n"+"\n".join(
@@ -49,6 +52,18 @@ def test_cycle_parser(tmp_path):
     assert rows[-1]["cycle"] == 50
 
 
+def test_reset_aware_cumulative_delta():
+    assert gate.reset_aware_cumulative_delta([0.0, 0.4, 1.0, 0.1, 0.3]) == 1.3
+    history = {
+        "time": [0.0, 1.0, 2.0, 3.0, 4.0],
+        "laser_Edep": [0.0, 0.4, 1.0, 0.1, 0.3],
+        "laser_x": [0.0, -0.2, -0.5, -0.05, -0.15],
+    }
+    assert gate.reset_aware_value_at(history, "laser_Edep", 1.5) == 0.7
+    assert gate.reset_aware_value_at(history, "laser_Edep", 4.0) == 1.3
+    assert gate.reset_aware_value_at(history, "laser_x", 4.0) == -0.65
+
+
 def test_source_record_is_content_addressed(tmp_path):
     output = tmp_path/"production_gate.json"
     source = tmp_path/"evidence.json"
@@ -70,6 +85,18 @@ def test_smoke_enables_checkpoint_full_volume_outputs():
     overrides = run_case.nonproduction_overrides("smoke", None, None, 1)
     for number in (8, 9, 10):
         assert f"output{number}/dt=1.0" in overrides
+
+
+def test_explicit_cycle_smoke_keeps_history_only():
+    overrides = run_case.nonproduction_overrides("smoke", 60, 299.792458, 1)
+    assert "output1/dt=1.0e-4" in overrides
+    assert "output9/dt=1.0" not in overrides
+
+
+def test_smoke_restart_runbook_requests_terminal_3t_volume():
+    overrides = run_case.smoke_restart_overrides(None, 1)
+    assert "time/nlim=60" in overrides
+    assert "output9/dt=1.0" in overrides
 
 
 def test_full_volume_glob_excludes_plane_slices(tmp_path):
@@ -158,6 +185,9 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "cycle": 50, "time": .008, "grid_nx1": 100, "grid_nx2": 64,
         "grid_nx3": 64, "meshblock_count": 8, "cell_count": 100*64*64,
         "radiation_group_count": 20, "minimum": 0.0,
+        "eos_trace_cell_count": 1000, "eos_energy_floor_cell_count": 1000,
+        "eos_disallowed_cell_count": 0,
+        "eos_maximum_flag": 1,
         "negative_tolerance": 1e-14})
     settings = {
         "artifacts": artifacts,
@@ -166,7 +196,21 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "resolution_relative_tolerance": .35,
         "rsla_relative_tolerance": .30,
         "minimum_causal_dt_fraction": 1e-4,
+        "maximum_eos_energy_floor_fraction": .05,
     }
     checks = gate.evaluate_checks(sources, settings)
     assert set(checks) == set(gate.CHECK_NAMES)
     assert all(record["passed"] for record in checks.values()), checks
+
+    write_history(
+        sources["smoke_history"], final_time=1.0e-2, eos_bad_cells=1.0
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["finite_nonnegative_3t"]["passed"]
+
+    write_history(
+        sources["smoke_history"], final_time=1.0e-2,
+        eos_floor_cells=0.06*100*64*64
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["finite_nonnegative_3t"]["passed"]

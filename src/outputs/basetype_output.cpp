@@ -639,6 +639,12 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("mhd_3t") == 0) {
       outvars.emplace_back("tele", 1, &(pm->pmb_pack->pmhd->ptwo_temp->temperature));
     }
+    if (variable.compare("mhd_2t") == 0 || variable.compare("mhd_3t") == 0) {
+      auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;
+      outvars.emplace_back(
+          "eos_flags", two_temperature::TwoTemperature::eos_query_flags,
+          &(ptwo->thermodynamics));
+    }
 
     // Multigroup thermal radiation. Group fields and erad are specific energies;
     // trad is defined by the summed radiation energy density E_rad=a_r*T_rad^4.

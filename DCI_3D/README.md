@@ -136,7 +136,7 @@ Activate the Athena plotting environment first:
 
 ```bash
 source /home/mengqi/miniconda3/etc/profile.d/conda.sh
-conda activate athena
+conda activate athenak-vis
 
 # Latest x1-x2 path map, with the nominal 0.8--1.0 mm, 50-degree CH cap.
 python DCI_3D/plot_laser_rays.py DCI_3D/runs/smoke \
@@ -166,7 +166,13 @@ candidate, not evidence that the 60--80 percent requirement has passed.
 History is written every `0.025 ns`.  Its 20 reductions include laser deposited energy
 and power, outward radiation power, total/CH mass, material/kinetic/magnetic/ion/electron
 energies, total and three broad-band radiation energies, matter-plus-radiation energy,
-integrated `|B|`, laser/radiation x-centroid numerators, mixed mass, and x momentum.
+integrated `|B|`, laser/radiation x-centroid numerators, and separate counts for the
+bounded low-energy material floor and disallowed EOS-table clamps since initialization
+(or since the most recent restart).  The per-cell `eos_flags` field is also included in
+every 2T/3T dump.  Trace-material density-below queries use the documented dilute-species
+rule.  The lower-energy flag is allowed in at most five percent of cells because the
+requested 11,606 K start is only 0.013 percent above the helium table edge; density-high,
+temperature, and energy-high flags retain a strict zero tolerance.
 Integrating `rad_Pesc` permits the chain-energy budget to include radiation boundary loss.
 All 20 individual group fields remain available in `mhd_3t` outputs.
 
@@ -181,6 +187,15 @@ The launcher uses the local AthenaK MPI/CUDA/Volta build helper and requires exa
 unique GPUs.  It rejects occupied GPUs unless explicitly allowed, refuses to clean a
 directory without its ownership sentinel, and never launches production merely because a
 command-line override was supplied.
+
+Use the visualization interpreter for all operational commands.  The system Python lacks
+the NumPy/HDF5 dependencies needed when the production gate re-reads AthenaK binary
+evidence:
+
+```bash
+source /home/mengqi/miniconda3/etc/profile.d/conda.sh
+conda activate athenak-vis
+```
 
 Print build and compact initialization commands without changing state:
 
@@ -198,8 +213,10 @@ The default smoke mode advances 50 RK2 steps, crosses history/slice/restart boun
 then restarts for ten more cycles with the same table copies/fingerprints.  The smoke
 overrides also write full-volume fluid, 3T, and laser dumps at the checkpoint so the gate
 checks every compact-mesh 3T cell rather than inferring positivity from a plane slice.
-Those volume blocks explicitly use AthenaK's collective single-file MPI layout; the gate
-requires all 20 `eradNN` fields and exactly `100*64*64` cells at cycle 50 or later:
+Phase two writes one additional terminal 3T volume so the cell-level check covers the
+post-restart segment as well.  Those volume blocks explicitly use AthenaK's collective
+single-file MPI layout; the gate requires all 20 `eradNN` fields and exactly
+`100*64*64` cells at cycle 50 or later:
 
 ```bash
 python3 DCI_3D/run_case.py --clean --mode smoke
@@ -234,7 +251,7 @@ python3 DCI_3D/verify_production_gate.py --dry-run
 python3 DCI_3D/verify_production_gate.py
 ```
 
-The verifier writes schema 2 with hashes of the binary, problem generator, decks,
+The verifier writes schema 3 with hashes of the binary, problem generator, decks,
 launcher, verifier, material tables, every selected log/status/history/3T/restart artifact,
 the numerical tolerances, and computed metrics.  It exits 2 and records failed checks when
 evidence is incomplete or outside tolerance.  On an actual production request,
@@ -255,17 +272,19 @@ The exact required check names are:
 - `reduced_light_speed_sensitivity`
 - `gpu_memory_60_80_all`
 
-The evidence must show finite, nonnegative ion/electron/group energies; a timestep of
-order `dx/c` without secular collapse; 10 kJ incident and laser power closure; chain-energy
-closure including integrated outward radiation; CH-mass conservation; continuous restart
-time/timestep/energies; a doubled-resolution or opacity-sensitivity result; acceptable
-`c_hat=10`/`30` (and short physical-`c`) sensitivity; and 60--80 percent memory on all
-eight V100s.
+The evidence must show finite, nonnegative ion/electron/group energies and no disallowed
+EOS-table clamps; a timestep of order `dx/c` without secular collapse; 10 kJ incident and
+laser power closure; chain-energy closure including integrated outward radiation; CH-mass
+conservation; continuous restart time/timestep/energies; a doubled-resolution or
+opacity-sensitivity result; acceptable `c_hat=10`/`30` (and short physical-`c`)
+sensitivity; and 60--80 percent memory on all eight V100s.
 
-The deterministic parser and gate-math tests do not substitute for GPU evidence:
+The deterministic parser and gate-math tests do not substitute for GPU evidence.  Run
+them with the repository test environment (the visualization environment intentionally
+does not carry pytest):
 
 ```bash
-python3 -m pytest -q DCI_3D/test_verify_production_gate.py
+.venv-tst/bin/python -m pytest -q DCI_3D/test_verify_production_gate.py
 ```
 
 Only after that manifest validates does phase 1 evolve to the aligned `5 ns` checkpoint.

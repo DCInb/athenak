@@ -16,7 +16,7 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-SCHEMA = 2
+SCHEMA = 3
 CHECK_NAMES = (
     "compact_20group_50step",
     "compact_output_and_restart",
@@ -135,12 +135,60 @@ def interpolate(history: dict[str, list[float]], field: str, target: float) -> f
     return values[-1]
 
 
+def reset_aware_series(
+    values: list[float], reset_indicator: list[float]
+) -> list[float]:
+    """Turn a process-local cumulative field into a restart-continuous series."""
+    if not values or len(values) != len(reset_indicator):
+        raise ValueError("Cumulative diagnostic samples are missing or mismatched")
+    if any(not math.isfinite(value) for value in values+reset_indicator):
+        raise ValueError("Cumulative diagnostic must be finite")
+    if any(value < 0.0 for value in reset_indicator):
+        raise ValueError("Cumulative reset indicator must be nonnegative")
+    result = [0.0]
+    total = 0.0
+    for index in range(1, len(values)):
+        reset = reset_indicator[index] < reset_indicator[index-1]
+        # At a reset, the new process accumulated values[index] from zero between the
+        # checkpoint and its first history sample. Signed moments use the same reset
+        # indicator while retaining their sign.
+        total += values[index] if reset else values[index]-values[index-1]
+        result.append(total)
+    return result
+
+
+def interpolate_samples(times: list[float], values: list[float], target: float) -> float:
+    if target <= times[0]:
+        return values[0]
+    for index in range(1, len(times)):
+        if target <= times[index]:
+            span = times[index]-times[index-1]
+            fraction = 0.0 if span == 0.0 else (target-times[index-1])/span
+            return values[index-1]+fraction*(values[index]-values[index-1])
+    return values[-1]
+
+
+def reset_aware_cumulative_delta(values: list[float]) -> float:
+    return reset_aware_series(values, values)[-1]
+
+
+def reset_aware_value_at(
+    history: dict[str, list[float]], field: str, target: float
+) -> float:
+    series = reset_aware_series(history[field], history["laser_Edep"])
+    return interpolate_samples(history["time"], series, target)
+
+
 def relative_change_difference(
     reference: dict[str, list[float]], comparison: dict[str, list[float]], field: str,
     target: float,
 ) -> float:
-    ref = interpolate(reference, field, target)-reference[field][0]
-    cmp = interpolate(comparison, field, target)-comparison[field][0]
+    if field == "laser_Edep":
+        ref = reset_aware_value_at(reference, field, target)
+        cmp = reset_aware_value_at(comparison, field, target)
+    else:
+        ref = interpolate(reference, field, target)-reference[field][0]
+        cmp = interpolate(comparison, field, target)-comparison[field][0]
     floor = 1.0e-10*max(abs(reference[field][0]), abs(comparison[field][0]), 1.0e-30)
     return abs(ref-cmp)/max(abs(ref), abs(cmp), floor)
 
@@ -153,12 +201,11 @@ def history_sensitivity(
     metrics = {field: relative_change_difference(reference, comparison, field, target)
                for field in fields}
     metrics["common_time"] = target
-    if interpolate(reference, "laser_Edep", target) > 0.0 and \
-       interpolate(comparison, "laser_Edep", target) > 0.0:
-        ref_x = interpolate(reference, "laser_x", target)/interpolate(
-            reference, "laser_Edep", target)
-        cmp_x = interpolate(comparison, "laser_x", target)/interpolate(
-            comparison, "laser_Edep", target)
+    ref_laser = reset_aware_value_at(reference, "laser_Edep", target)
+    cmp_laser = reset_aware_value_at(comparison, "laser_Edep", target)
+    if ref_laser > 0.0 and cmp_laser > 0.0:
+        ref_x = reset_aware_value_at(reference, "laser_x", target)/ref_laser
+        cmp_x = reset_aware_value_at(comparison, "laser_x", target)/cmp_laser
         metrics["laser_centroid"] = abs(ref_x-cmp_x)/max(abs(ref_x), abs(cmp_x), 1.0e-12)
     return metrics
 
@@ -188,13 +235,18 @@ def check_3t_binary(path: Path) -> dict[str, float | int]:
     data = bin_convert.read_binary(str(path))
     names = set(data["var_names"])
     group_names = {f"erad{group:02d}" for group in range(20)}
-    expected = {"eion", "eele", "tion", "tele", "erad", "trad"} | group_names
+    physical_names = {"eion", "eele", "tion", "tele", "erad", "trad"} | group_names
+    expected = physical_names | {"eos_flags"}
     missing = sorted(expected-names)
     if missing:
         raise ValueError(f"Missing 3T fields in {path}: {missing}")
     minimum = math.inf
     maximum = 0.0
     cell_count = 0
+    eos_trace_cell_count = 0
+    eos_energy_floor_cell_count = 0
+    eos_disallowed_cell_count = 0
+    eos_maximum_flag = 0
     for name in sorted(expected):
         arrays = data["mb_data"][name]
         if name == "eion":
@@ -202,8 +254,20 @@ def check_3t_binary(path: Path) -> dict[str, float | int]:
         for array in arrays:
             if not np.all(np.isfinite(array)):
                 raise ValueError(f"Nonfinite {name} in {path}")
-            minimum = min(minimum, float(np.min(array)))
-            maximum = max(maximum, float(np.max(np.abs(array))))
+            if name in physical_names:
+                minimum = min(minimum, float(np.min(array)))
+                maximum = max(maximum, float(np.max(np.abs(array))))
+            if name == "eos_flags":
+                rounded = np.rint(array)
+                if not np.all(array == rounded) or np.any(rounded < 0.0):
+                    raise ValueError(f"Nonintegral or negative eos_flags in {path}")
+                flags = rounded.astype(np.int64)
+                if np.any((flags & ~0x3f) != 0):
+                    raise ValueError(f"Unknown eos_flags bits in {path}")
+                eos_trace_cell_count += int(np.count_nonzero(flags & 0x01))
+                eos_energy_floor_cell_count += int(np.count_nonzero(flags & 0x10))
+                eos_disallowed_cell_count += int(np.count_nonzero(flags & 0x2e))
+                eos_maximum_flag = max(eos_maximum_flag, int(np.max(flags)))
     tolerance = 256.0*float(np.finfo(float).eps)*max(maximum, 1.0)
     if minimum < -tolerance:
         raise ValueError(f"Negative 3T field minimum {minimum} in {path}")
@@ -216,6 +280,10 @@ def check_3t_binary(path: Path) -> dict[str, float | int]:
         "meshblock_count": int(data["n_mbs"]),
         "cell_count": cell_count,
         "radiation_group_count": len(group_names & names),
+        "eos_trace_cell_count": eos_trace_cell_count,
+        "eos_energy_floor_cell_count": eos_energy_floor_cell_count,
+        "eos_disallowed_cell_count": eos_disallowed_cell_count,
+        "eos_maximum_flag": eos_maximum_flag,
         "minimum": minimum,
         "negative_tolerance": tolerance,
     }
@@ -296,13 +364,28 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         restart_bytes=sources["smoke_restart"].stat().st_size,
     )
 
-    finite_pass = binary_3t_pass
+    binary_floor_fraction = (
+        float(field_metrics.get("eos_energy_floor_cell_count", math.inf))
+        / max(int(field_metrics.get("cell_count", 0)), 1)
+    )
+    history_floor_fraction = max(history["eos_floor"])/expected_cells
+    finite_pass = (
+        binary_3t_pass
+        and int(field_metrics.get("eos_disallowed_cell_count", -1)) == 0
+        and binary_floor_fraction <= settings["maximum_eos_energy_floor_fraction"]
+        and history_floor_fraction <= settings["maximum_eos_energy_floor_fraction"]
+        and max(history["eos_bad"]) == 0.0
+    )
     positive_history_fields = ("eion_E", "eele_E", "erad_E", "erad_soft",
                                "erad_mid", "erad_hard")
     finite_pass = finite_pass and all(min(history[field]) >= 0.0
                                       for field in positive_history_fields)
     checks["finite_nonnegative_3t"] = evidence_check(
-        finite_pass, ["smoke_3t_volume", "smoke_history"], **field_metrics)
+        finite_pass, ["smoke_3t_volume", "smoke_history"],
+        **field_metrics, binary_eos_energy_floor_fraction=binary_floor_fraction,
+        history_eos_energy_floor_fraction=history_floor_fraction,
+        maximum_eos_energy_floor_fraction=
+            settings["maximum_eos_energy_floor_fraction"])
 
     c_light = float(read_deck_value(sources["production_input"], "c_light"))
     dx_min = min(3.5/(100*scale), 2.0/(64*scale))
@@ -320,7 +403,7 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     times = history["time"]
     escaped = sum(0.5*(history["rad_Pesc"][index-1]+history["rad_Pesc"][index])
                   *(times[index]-times[index-1]) for index in range(1, len(times)))
-    deposited = history["laser_Edep"][-1]-history["laser_Edep"][0]
+    deposited = reset_aware_cumulative_delta(history["laser_Edep"])
     chain_delta = history["chain_E"][-1]-history["chain_E"][0]
     residual = chain_delta+escaped-deposited
     energy_scale = max(abs(deposited), abs(chain_delta)+abs(escaped), 1.0e-30)
@@ -358,30 +441,40 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         phase2_last_cycle=int(smoke2[-1]["cycle"]), dt_ratio=restart_dt_ratio)
 
     resolution_metrics = history_sensitivity(history, resolution_history)
+    resolution_floor_fraction = max(resolution_history["eos_floor"])/(
+        200*128*128)
     resolution_pass = (
         same_artifacts and resolution_status.get("compact_scale") == 2
         and resolution_status.get("phase1_exit_code") == 0
         and resolution_status.get("phase2_exit_code") == 0
+        and max(resolution_history["eos_bad"]) == 0.0
+        and resolution_floor_fraction <=
+            settings["maximum_eos_energy_floor_fraction"]
         and max(value for key, value in resolution_metrics.items()
                 if key != "common_time") <= settings["resolution_relative_tolerance"]
     )
     checks["resolution_or_opacity_sensitivity"] = evidence_check(
         resolution_pass,
         ["resolution_status", "resolution_phase1_log", "resolution_phase2_log",
-         "resolution_history", "smoke_history"], **resolution_metrics)
+         "resolution_history", "smoke_history"], **resolution_metrics,
+        eos_energy_floor_fraction=resolution_floor_fraction)
 
     rsla_metrics = history_sensitivity(history, rsla_history)
+    rsla_floor_fraction = max(rsla_history["eos_floor"])/(100*64*64)
     rsla_pass = (
         same_artifacts and rsla_status.get("compact_scale") == 1
         and float(rsla_status.get("radiation_c_light_override", 0.0)) == 30.0
         and rsla_status.get("phase1_exit_code") == 0
         and rsla_status.get("phase2_exit_code") == 0
+        and max(rsla_history["eos_bad"]) == 0.0
+        and rsla_floor_fraction <= settings["maximum_eos_energy_floor_fraction"]
         and max(value for key, value in rsla_metrics.items()
                 if key != "common_time") <= settings["rsla_relative_tolerance"]
     )
     checks["reduced_light_speed_sensitivity"] = evidence_check(
         rsla_pass, ["rsla_status", "rsla_phase1_log", "rsla_phase2_log",
-                    "rsla_history", "smoke_history"], **rsla_metrics)
+                    "rsla_history", "smoke_history"], **rsla_metrics,
+        eos_energy_floor_fraction=rsla_floor_fraction)
 
     memory = calibration_status.get("phase1_memory", {})
     devices = memory.get("devices", {}) if isinstance(memory, dict) else {}
@@ -445,6 +538,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution-rtol", type=float, default=0.35)
     parser.add_argument("--rsla-rtol", type=float, default=0.30)
     parser.add_argument("--minimum-causal-dt-fraction", type=float, default=1.0e-4)
+    parser.add_argument("--maximum-eos-energy-floor-fraction", type=float, default=0.05)
     parser.add_argument("--dry-run", action="store_true",
                         help="evaluate and print the gate without writing it")
     return parser.parse_args()
@@ -470,6 +564,8 @@ def main() -> int:
             "resolution_relative_tolerance": args.resolution_rtol,
             "rsla_relative_tolerance": args.rsla_rtol,
             "minimum_causal_dt_fraction": args.minimum_causal_dt_fraction,
+            "maximum_eos_energy_floor_fraction":
+                args.maximum_eos_energy_floor_fraction,
         }
         checks = evaluate_checks(sources, settings)
     except Exception as exc:

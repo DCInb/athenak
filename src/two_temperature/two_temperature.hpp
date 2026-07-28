@@ -39,9 +39,13 @@ class TwoTemperature {
     electron_number_density_cgs = 2,
     mean_ionization = 3,
     sound_speed_squared = 4,
-    effective_charge = 5
+    effective_charge = 5,
+    // Bitwise OR of every IONMIX query flag seen by this cell in this process segment.
+    // The thermodynamic cache is reconstructed on restart, so lifetime gating must OR
+    // eos_flags from all pre- and post-restart output segments.
+    eos_query_flags = 6
   };
-  static constexpr int nthermodynamic_fields = 6;
+  static constexpr int nthermodynamic_fields = 7;
   TwoTemperature(const std::string &block, MeshBlockPack *ppack, ParameterInput *pin,
                  int first_component_index,
                  materials::MaterialMixture *material_mixture = nullptr);
@@ -76,13 +80,15 @@ class TwoTemperature {
 
   // Add multigroup FLD fluxes and compute their explicit stability limit.
   void AddRadiationFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx);
- void RadiationNewTimeStep(const DvceArray5D<Real> &prim);
+  void RadiationNewTimeStep(const DvceArray5D<Real> &prim);
 
- private:
+  // Public because nvcc requires a member enclosing an extended device lambda to have
+  // public access. This is an internal cache operation despite its access level.
   void RefreshMaterialThermodynamics(
       const DvceArray5D<Real> &cons, int il, int iu, int jl, int ju,
       int kl, int ku);
 
+ private:
   MeshBlockPack *pmy_pack_;
   Real gamma_minus_one_;
   Real cv_i_fraction_;

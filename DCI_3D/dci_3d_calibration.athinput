@@ -65,6 +65,7 @@ t_ei_spitzer_multiplier = 1.0
 t_ei_temperature_floor_kelvin = 1.0
 biermann_battery = true
 biermann_coefficient = 2.7875722321043606e-4
+biermann_minimum_electron_fraction = 1.0e-12
 biermann_shock_suppression = true
 biermann_shock_threshold = 8.0e-1
 

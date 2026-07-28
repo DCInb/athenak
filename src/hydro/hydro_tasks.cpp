@@ -75,7 +75,13 @@ void Hydro::AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> 
   id.bcs       = tl["stagen"]->AddTask(&Hydro::ApplyPhysicalBCs, this, id.recvu_shr);
   id.prol      = tl["stagen"]->AddTask(&Hydro::Prolongate, this, id.bcs);
   id.c2p       = tl["stagen"]->AddTask(&Hydro::ConToPrim, this, id.prol);
-  id.newdt     = tl["stagen"]->AddTask(&Hydro::NewTimeStep, this, id.c2p);
+  // Two-temperature exchange and matter-radiation coupling run after the final RK
+  // stage and can change pressure, opacity, and every source timestep.  In that case
+  // compute the next timestep from the post-source state in TwoTempExchange instead of
+  // caching a stale pre-source limit here.
+  if (ptwo_temp == nullptr) {
+    id.newdt = tl["stagen"]->AddTask(&Hydro::NewTimeStep, this, id.c2p);
+  }
 
   // assemble "after_stagen" task list
   id.csend = tl["after_stagen"]->AddTask(&Hydro::ClearSend, this, none);
@@ -436,7 +442,7 @@ TaskStatus Hydro::TwoTempExchange(Driver *pdrive, int stage) {
   int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
-  return TaskStatus::complete;
+  return NewTimeStep(pdrive, pdrive->nexp_stages);
 }
 
 //----------------------------------------------------------------------------------------

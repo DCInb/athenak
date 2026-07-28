@@ -53,6 +53,7 @@ class ThermalRadiation {
                  DvceFaceFld5D<Real> &flx);
   void Couple(Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
               DvceArray5D<Real> &temperature,
+              Real material_pressure_floor, Real material_temperature_floor,
               int il, int iu, int jl, int ju, int kl, int ku);
   void NewTimeStep(const DvceArray5D<Real> &prim,
                    const DvceArray5D<Real> &temperature);

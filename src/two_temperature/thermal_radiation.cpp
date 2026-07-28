@@ -784,6 +784,7 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
 
 void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     DvceArray5D<Real> &prim, DvceArray5D<Real> &temperature,
+    Real material_pressure_floor, Real material_temperature_floor,
     int il, int iu, int jl, int ju, int kl, int ku) {
   if (!couple_matter_ || dt <= 0.0) {
     UpdateDiagnostics(cons, prim, il, iu, jl, ju, kl, ku);
@@ -810,6 +811,8 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
   bool use_materials = use_material_mixture_;
   auto mixture = material_mixture_;
   auto diag = diagnostics;
+  const Real pressure_floor = material_pressure_floor;
+  const Real temperature_floor = material_temperature_floor;
 
   par_for("thermal_rad_couple", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -848,11 +851,12 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     Real eele_floor = 0.0;
     if (use_materials && mixture.UsesTabularEOS()) {
       const materials::MaterialThermodynamicState floor_state =
-          mixture.MinimumState(density, y0);
+          mixture.MinimumStateNoSound(
+              density, y0, pressure_floor, temperature_floor);
       eele_floor = density*floor_state.electron_specific_internal_energy;
     }
     // Absorbed radiation is immediately available, but tabular emission may not draw
-    // the electron component below its native material-table energy floor.
+    // the electron component below the same table/pressure/temperature floor as Sync.
     Real available = fmax(eele_old-eele_floor-negative, 0.0);
     Real emission_scale = (positive > available && positive > 0.0)
         ? available/positive : 1.0;

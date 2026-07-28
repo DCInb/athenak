@@ -59,6 +59,7 @@ two_temperature = true
 dual_energy = true
 biermann_battery = true
 biermann_coefficient = 1.0
+biermann_minimum_electron_fraction = 1.0e-12
 biermann_shock_suppression = true
 biermann_shock_threshold = 0.25
 ```
@@ -67,6 +68,7 @@ biermann_shock_threshold = 0.25
 | --- | ---: | --- |
 | `biermann_battery` | `false` | Enable the flux-form Biermann and 2T energy terms. |
 | `biermann_coefficient` | `1.0` | Normalized inverse-charge coefficient `C_B`; zero disables all terms. |
+| `biermann_minimum_electron_fraction` | `1.0e-12` | Minimum tabular `q_e=n_e/rho` for a resolved plasma. |
 | `biermann_shock_suppression` | `true` | Disable Biermann faces adjacent to detected pressure jumps. |
 | `biermann_shock_threshold` | `0.25` | Threshold for the symmetric centered gas-pressure jump. |
 
@@ -94,11 +96,25 @@ wave speed. FLASH recommends a lower CFL number for this formulation. It also re
 shock detection because a direct pressure-gradient discretization is not convergent
 inside a discontinuity; AthenaK therefore enables symmetric shock suppression by default.
 
-In the tabular branch the thermal-magnetic contribution is evaluated from cached
-thermodynamics as
+In the tabular branch, cached electron density is regularized with
+`n_e,eff=max(n_e,rho*q_min)`, where `q_min` is
+`biermann_minimum_electron_fraction`. This floor is used only in denominators and
+`grad(ln n_e)`: it does not turn neutral matter into an artificial plasma. A smooth
+activation `S(q_e)` is zero through `q_min`, rises from zero to one between `q_min` and
+`2*q_min`, and is exactly one above that interval. It multiplies the electric field,
+electron drift, and thermal-magnetic speed. Thus a tabular electron-pressure floor cannot
+drive Biermann terms in a cell with no physical free electrons.
+
+The default is far below the initial DCI states: direct table interpolation gives
+`q_e=0.170142` for CH at `rho=1.1 g cm^-3`, `T=11606 K`, and
+`q_e=1.36190e-4` for helium at `rho=1e-5 g cm^-3`. Both therefore have `S=1` without a
+case-specific override.
+
+The thermal-magnetic contribution is evaluated in the underflow-safe form
 
 ```text
-v_TM^2 = C_B^2 * (gamma-1) * p_e/n_e^2 * |grad(ln n_e)|^2.
+v_TM = S(q_e) * C_B * sqrt((gamma-1)*p_e)/n_e,eff
+       * |grad(ln n_e,eff)|.
 ```
 
 **Mask shape (2026-07 validation):** the suppression mask ramps linearly from 1 at a

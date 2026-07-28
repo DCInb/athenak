@@ -316,8 +316,8 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   pdata->label[15] = "abs_B";
   pdata->label[16] = "laser_x";
   pdata->label[17] = "rad_x";
-  pdata->label[18] = "mix_mass";
-  pdata->label[19] = "mom1";
+  pdata->label[18] = "eos_floor";
+  pdata->label[19] = "eos_bad";
 
   auto u0 = pmhd->u0;
   auto bcc0 = pmhd->bcc0;
@@ -326,12 +326,18 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   auto flx3 = pmhd->uflx.x3f;
   auto mb_bcs = pmbp->pmb->mb_bcs;
   auto laser_data = pmbp->plaser->cell_data;
+  auto thermodynamics = ptwo->thermodynamics;
   auto size = pmbp->pmb->mb_size;
   const int scalar_index = pmhd->pmaterials->ScalarIndex();
   const int iion = ptwo->iion;
   const int iele = ptwo->iele;
   const int ifirst = prad->ifirst;
   const int ngroups = prad->ngroups;
+  constexpr int disallowed_eos_flags =
+      materials::ionmix_density_above_table |
+      materials::ionmix_temperature_below_table |
+      materials::ionmix_temperature_above_table |
+      materials::ionmix_energy_above_table;
   const bool have_flux = pm->ncycle > 0;
 
   auto &indcs = pm->mb_indcs;
@@ -407,8 +413,6 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
             }
           }
         }
-        const Real bounded_xch = fmin(fmax(xch, 0.0), 1.0);
-
         array_sum::GlobalSum local;
         local.the_array[0] = volume*laser_data(m, 1, k, j, i);
         local.the_array[1] = volume*laser_data(m, 0, k, j, i);
@@ -428,8 +432,11 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
         local.the_array[15] = volume*sqrt(b2sum);
         local.the_array[16] = volume*x1*laser_data(m, 1, k, j, i);
         local.the_array[17] = volume*x1*erad;
-        local.the_array[18] = volume*density*4.0*bounded_xch*(1.0-bounded_xch);
-        local.the_array[19] = volume*u0(m, IM1, k, j, i);
+        const int eos_flags = static_cast<int>(thermodynamics(
+            m, two_temperature::TwoTemperature::eos_query_flags, k, j, i));
+        local.the_array[18] =
+            ((eos_flags & materials::ionmix_energy_below_table) != 0) ? 1.0 : 0.0;
+        local.the_array[19] = ((eos_flags & disallowed_eos_flags) != 0) ? 1.0 : 0.0;
         sum += local;
       }, Kokkos::Sum<array_sum::GlobalSum>(sum_this_rank));
   Kokkos::fence();

@@ -49,16 +49,48 @@ Real TotalPressure(const DvceArray5D<Real> &w,
   return gm1*w(m, IEN, k, j, i);
 }
 
+struct BoundedElectronDensity {
+  Real value;
+  Real activation;
+};
+
 // Convert the shared physical number-density cache back to the normalization used by
-// the Biermann coefficient: ne_code=rho*sum_s(Y_s Z_s/A_s).  This deliberately differs
-// from the legacy no-material convention ne_code=f_e*rho.
+// the Biermann coefficient: ne_code=rho*sum_s(Y_s Z_s/A_s).  In a nearly neutral table
+// cell, regularize the denominator with a minimum q_e=ne/rho and smoothly switch the
+// plasma source off between q_min and 2*q_min.  This prevents a nonzero table pressure
+// floor from manufacturing an arbitrarily large battery in matter with no free electrons.
+// The physical cached density is retained whenever the source is active.
 KOKKOS_INLINE_FUNCTION
-Real CachedElectronDensityCode(
+BoundedElectronDensity CachedElectronDensityCode(
     const DvceArray5D<Real> &thermodynamics, const Real cgs_to_code,
+    const Real mass_density, const Real minimum_electron_fraction,
+    const Real minimum_positive,
     const int m, const int k, const int j, const int i) {
-  return fmax(thermodynamics(
+  const Real physical = fmax(thermodynamics(
       m, two_temperature::TwoTemperature::electron_number_density_cgs,
-      k, j, i)*cgs_to_code, 1.0e-30);
+      k, j, i)*cgs_to_code, 0.0);
+  const Real threshold = fmax(
+      minimum_electron_fraction*fmax(mass_density, 0.0), minimum_positive);
+  BoundedElectronDensity result;
+  result.value = fmax(physical, threshold);
+  if (physical <= threshold) {
+    result.activation = 0.0;
+  } else if (physical >= 2.0*threshold) {
+    result.activation = 1.0;
+  } else {
+    const Real x = physical/threshold-1.0;
+    result.activation = x*x*(3.0-2.0*x);
+  }
+  return result;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real FaceInverseElectronDensity(const BoundedElectronDensity &left,
+                                const BoundedElectronDensity &right) {
+  const Real activation = fmin(left.activation, right.activation);
+  if (!(activation > 0.0)) return 0.0;
+  const Real density = 0.5*(left.value+right.value);
+  return activation/density;
 }
 
 } // namespace
@@ -79,7 +111,7 @@ BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
                                  Real pressure_floor,
                                  materials::MaterialMixture *material_mixture)
     : coefficient(pin->GetOrAddReal("mhd", "biermann_coefficient", 1.0)),
-      dtnew(std::numeric_limits<float>::max()),
+      dtnew(std::numeric_limits<Real>::max()),
       suppress_in_shocks(
           pin->GetOrAddBoolean("mhd", "biermann_shock_suppression", true)),
       shock_threshold(
@@ -88,6 +120,8 @@ BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
       electron_fraction_(electron_heat_capacity_fraction), gamma_(gamma),
       gamma_minus_one_(gamma - 1.0), density_floor_(density_floor),
       pressure_floor_(pressure_floor),
+      minimum_electron_fraction_(pin->GetOrAddReal(
+          "mhd", "biermann_minimum_electron_fraction", 1.0e-12)),
       use_material_mixture_(material_mixture != nullptr),
       smooth_cell_("biermann-smooth", 1, 1, 1, 1),
       e3x1_("biermann-e3x1", 1, 1, 1, 1), e2x1_("biermann-e2x1", 1, 1, 1, 1),
@@ -107,6 +141,14 @@ BiermannBattery::BiermannBattery(MeshBlockPack *ppack, ParameterInput *pin,
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
               << "<mhd>/biermann_shock_threshold must be finite and "
+              << "positive" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (!std::isfinite(minimum_electron_fraction_) ||
+      minimum_electron_fraction_ <= 0.0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "<mhd>/biermann_minimum_electron_fraction must be finite and "
               << "positive" << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -244,6 +286,8 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
       ? materials::MaterialMixtureDevice::atomic_mass_unit_cgs/
         material_mixture.density_to_cgs
       : 1.0;
+  Real minimum_electron_fraction = minimum_electron_fraction_;
+  Real minimum_positive = std::numeric_limits<Real>::min();
   // x1-face electric fields, including the transverse halo needed by flux-CT.
   int jl = multi_d ? js - 1 : js;
   int ju = multi_d ? je + 1 : je;
@@ -283,11 +327,15 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         Real mask = fmin(smooth(m, k, j, i - 1), smooth(m, k, j, i));
         Real inv_ne;
         if (use_tabular_materials) {
-          const Real ne = 0.5*(CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i-1)+
-              CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i));
-          inv_ne = 1.0/ne;
+          const Real rho_l = fmax(w(m, IDN, k, j, i-1), dfloor);
+          const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
+          const BoundedElectronDensity ne_l = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho_l,
+              minimum_electron_fraction, minimum_positive, m, k, j, i-1);
+          const BoundedElectronDensity ne_r = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho_r,
+              minimum_electron_fraction, minimum_positive, m, k, j, i);
+          inv_ne = FaceInverseElectronDensity(ne_l, ne_r);
         } else if (use_materials) {
           const Real rho_l = fmax(w(m, IDN, k, j, i-1), dfloor);
           const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
@@ -343,11 +391,15 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           Real mask = fmin(smooth(m, k, j - 1, i), smooth(m, k, j, i));
           Real inv_ne;
           if (use_tabular_materials) {
-            const Real ne = 0.5*(CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j-1, i)+
-                CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
-            inv_ne = 1.0/ne;
+            const Real rho_l = fmax(w(m, IDN, k, j-1, i), dfloor);
+            const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
+            const BoundedElectronDensity ne_l = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_l,
+                minimum_electron_fraction, minimum_positive, m, k, j-1, i);
+            const BoundedElectronDensity ne_r = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_r,
+                minimum_electron_fraction, minimum_positive, m, k, j, i);
+            inv_ne = FaceInverseElectronDensity(ne_l, ne_r);
           } else if (use_materials) {
             const Real rho_l = fmax(w(m, IDN, k, j-1, i), dfloor);
             const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
@@ -399,11 +451,15 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           Real mask = fmin(smooth(m, k - 1, j, i), smooth(m, k, j, i));
           Real inv_ne;
           if (use_tabular_materials) {
-            const Real ne = 0.5*(CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k-1, j, i)+
-                CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
-            inv_ne = 1.0/ne;
+            const Real rho_l = fmax(w(m, IDN, k-1, j, i), dfloor);
+            const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
+            const BoundedElectronDensity ne_l = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_l,
+                minimum_electron_fraction, minimum_positive, m, k-1, j, i);
+            const BoundedElectronDensity ne_r = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_r,
+                minimum_electron_fraction, minimum_positive, m, k, j, i);
+            inv_ne = FaceInverseElectronDensity(ne_l, ne_r);
           } else if (use_materials) {
             const Real rho_l = fmax(w(m, IDN, k-1, j, i), dfloor);
             const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
@@ -453,11 +509,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         }
         Real drift;
         if (use_tabular_materials) {
-          const Real ne = 0.5*(CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i-1)+
-              CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i));
-          drift = -coeff*mask*j1/ne;
+          const BoundedElectronDensity ne_l = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho_l,
+              minimum_electron_fraction, minimum_positive, m, k, j, i-1);
+          const BoundedElectronDensity ne_r = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho_r,
+              minimum_electron_fraction, minimum_positive, m, k, j, i);
+          drift = -coeff*mask*j1*FaceInverseElectronDensity(ne_l, ne_r);
         } else if (use_materials) {
           const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
               w, m, k, j, i-1);
@@ -514,11 +572,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           }
           Real drift;
           if (use_tabular_materials) {
-            const Real ne = 0.5*(CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j-1, i)+
-                CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
-            drift = -coeff*mask*j2/ne;
+            const BoundedElectronDensity ne_l = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_l,
+                minimum_electron_fraction, minimum_positive, m, k, j-1, i);
+            const BoundedElectronDensity ne_r = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_r,
+                minimum_electron_fraction, minimum_positive, m, k, j, i);
+            drift = -coeff*mask*j2*FaceInverseElectronDensity(ne_l, ne_r);
           } else if (use_materials) {
             const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
                 w, m, k, j-1, i);
@@ -574,11 +634,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                 size.d_view(m).dx2;
           Real drift;
           if (use_tabular_materials) {
-            const Real ne = 0.5*(CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k-1, j, i)+
-                CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
-            drift = -coeff*mask*j3/ne;
+            const BoundedElectronDensity ne_l = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_l,
+                minimum_electron_fraction, minimum_positive, m, k-1, j, i);
+            const BoundedElectronDensity ne_r = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_r,
+                minimum_electron_fraction, minimum_positive, m, k, j, i);
+            drift = -coeff*mask*j3*FaceInverseElectronDensity(ne_l, ne_r);
           } else if (use_materials) {
             const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
                 w, m, k-1, j, i);
@@ -736,7 +798,7 @@ void BiermannBattery::ApplyElectronWork(Real dt, DvceArray5D<Real> &cons,
 
 void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
                                   const DvceArray5D<Real> &bcc) {
-  dtnew = std::numeric_limits<float>::max();
+  dtnew = std::numeric_limits<Real>::max();
   if (coefficient == 0.0)
     return;
 
@@ -766,9 +828,11 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
       ? materials::MaterialMixtureDevice::atomic_mass_unit_cgs/
         material_mixture.density_to_cgs
       : 1.0;
-  Real dt1 = std::numeric_limits<float>::max();
-  Real dt2 = std::numeric_limits<float>::max();
-  Real dt3 = std::numeric_limits<float>::max();
+  Real minimum_electron_fraction = minimum_electron_fraction_;
+  Real minimum_positive = std::numeric_limits<Real>::min();
+  Real dt1 = std::numeric_limits<Real>::max();
+  Real dt2 = std::numeric_limits<Real>::max();
+  Real dt3 = std::numeric_limits<Real>::max();
 
   Kokkos::parallel_reduce(
       "biermann_newdt", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
@@ -787,15 +851,23 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real rho = fmax(w(m, IDN, k, j, i), dfloor);
         Real local_fe = fe;
         Real ne;
+        Real electron_activation = 1.0;
         Real dln1;
         if (use_tabular_materials) {
-          ne = CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i);
-          const Real ne_p = CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i+1);
-          const Real ne_m = CachedElectronDensityCode(
-              thermodynamics, electron_density_cgs_to_code, m, k, j, i-1);
-          dln1 = (log(ne_p)-log(ne_m))/(2.0*dx1);
+          const BoundedElectronDensity ne_center = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho,
+              minimum_electron_fraction, minimum_positive, m, k, j, i);
+          const Real rho_p = fmax(w(m, IDN, k, j, i+1), dfloor);
+          const Real rho_m = fmax(w(m, IDN, k, j, i-1), dfloor);
+          const BoundedElectronDensity ne_p = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho_p,
+              minimum_electron_fraction, minimum_positive, m, k, j, i+1);
+          const BoundedElectronDensity ne_m = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, rho_m,
+              minimum_electron_fraction, minimum_positive, m, k, j, i-1);
+          ne = ne_center.value;
+          electron_activation = ne_center.activation;
+          dln1 = (log(ne_p.value)-log(ne_m.value))/(2.0*dx1);
         } else if (use_materials) {
           const Real y0 = material_mixture.Material0MassFractionFromPrimitive(
               w, m, k, j, i);
@@ -819,11 +891,15 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real dln3 = 0.0;
         if (multi_d) {
           if (use_tabular_materials) {
-            const Real ne_p = CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j+1, i);
-            const Real ne_m = CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k, j-1, i);
-            dln2 = (log(ne_p)-log(ne_m))/(2.0*dx2);
+            const Real rho_p = fmax(w(m, IDN, k, j+1, i), dfloor);
+            const Real rho_m = fmax(w(m, IDN, k, j-1, i), dfloor);
+            const BoundedElectronDensity ne_p = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_p,
+                minimum_electron_fraction, minimum_positive, m, k, j+1, i);
+            const BoundedElectronDensity ne_m = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_m,
+                minimum_electron_fraction, minimum_positive, m, k, j-1, i);
+            dln2 = (log(ne_p.value)-log(ne_m.value))/(2.0*dx2);
           } else if (use_materials) {
             const Real rho_p = fmax(w(m, IDN, k, j+1, i), dfloor);
             const Real rho_m = fmax(w(m, IDN, k, j-1, i), dfloor);
@@ -841,11 +917,15 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         }
         if (three_d) {
           if (use_tabular_materials) {
-            const Real ne_p = CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k+1, j, i);
-            const Real ne_m = CachedElectronDensityCode(
-                thermodynamics, electron_density_cgs_to_code, m, k-1, j, i);
-            dln3 = (log(ne_p)-log(ne_m))/(2.0*dx3);
+            const Real rho_p = fmax(w(m, IDN, k+1, j, i), dfloor);
+            const Real rho_m = fmax(w(m, IDN, k-1, j, i), dfloor);
+            const BoundedElectronDensity ne_p = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_p,
+                minimum_electron_fraction, minimum_positive, m, k+1, j, i);
+            const BoundedElectronDensity ne_m = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, rho_m,
+                minimum_electron_fraction, minimum_positive, m, k-1, j, i);
+            dln3 = (log(ne_p.value)-log(ne_m.value))/(2.0*dx3);
           } else if (use_materials) {
             const Real rho_p = fmax(w(m, IDN, k+1, j, i), dfloor);
             const Real rho_m = fmax(w(m, IDN, k-1, j, i), dfloor);
@@ -882,14 +962,25 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           const Real pe = fmax(thermodynamics(
               m, two_temperature::TwoTemperature::electron_pressure,
               k, j, i), 0.0);
-          vtm = coeff*sqrt(gm1*pe/(ne*ne))*gradln;
+          vtm = (electron_activation > 0.0 && pe > 0.0)
+              ? coeff*electron_activation*(sqrt(gm1*pe)/ne)*gradln
+              : 0.0;
         } else {
           Real tele = gm1*fmax(w(m, iele, k, j, i), 0.0)/local_fe;
           vtm = coeff*sqrt(gm1*tele/ne)*gradln;
         }
-        Real vd1 = -coeff * j1 / ne;
-        Real vd2 = -coeff * j2 / ne;
-        Real vd3 = -coeff * j3 / ne;
+        Real vd1;
+        Real vd2;
+        Real vd3;
+        if (use_tabular_materials) {
+          vd1 = -coeff*electron_activation*j1/ne;
+          vd2 = -coeff*electron_activation*j2/ne;
+          vd3 = -coeff*electron_activation*j3/ne;
+        } else {
+          vd1 = -coeff*j1/ne;
+          vd2 = -coeff*j2/ne;
+          vd3 = -coeff*j3/ne;
+        }
         Real speed = fabs(vd1) + vtm;
         if (speed > 0.0)
           min_dt1 = fmin(min_dt1, dx1 / speed);
