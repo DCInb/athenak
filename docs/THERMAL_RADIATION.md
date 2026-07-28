@@ -33,8 +33,10 @@ P(x)=\int_0^x\frac{t^3}{e^t-1}\,dt.
 \]
 
 The group boundaries `epsilon_g=h*nu_g/k_B` are therefore entered in the same code
-temperature units as `tele`.  The Planck integral uses a cancellation-safe small-argument
-series and an exponentially convergent complementary series.
+temperature units as `tele`.  With a `<materials>` closure, `tele` is the local
+composition- and EOS-dependent electron temperature.  The Planck integral uses a
+cancellation-safe small-argument series and an exponentially convergent complementary
+series.
 
 The FLD flux is
 
@@ -234,6 +236,51 @@ the dimensions, density and electron-temperature axes, converted group boundarie
 the three opacity arrays before each rank initializes its device views. The file therefore
 only needs to be accessible to rank 0.
 
+### Mixed-material tabulated opacities
+
+When a two-material `<materials>` closure is active, `opacity_model=table` automatically
+uses mixed opacity if both material table files are supplied.  The explicit
+`opacity_model=mixed-table` spelling is also accepted and requires both files.  Omitting
+the two material files retains the single-table path above.
+
+```text
+<thermal_radiation>
+opacity_model = table
+
+<materials>
+material0_opacity_table_file = ch.opacity
+material1_opacity_table_file = he.opacity
+material0_opacity_interpolation = geometric
+material1_opacity_interpolation = geometric
+material0_opacity_coordinate_interpolation = log
+material1_opacity_coordinate_interpolation = log
+```
+
+Each material accepts the same optional table controls as a single table by prefixing
+them with `material0_opacity_` or `material1_opacity_`: `density_scale`,
+`temperature_scale`, `group_bound_scale`, `value_scale`, `transport_scale`,
+`absorption_scale`, and `emission_scale`.  The group count and converted boundaries in
+both files must match the radiation groups.
+
+Following FLASH's partial-density additive rule, every transport, absorption, and
+emission mass opacity is evaluated as
+
+\[
+\kappa_g(\rho,T_e,Y_0)=Y_0\,\kappa_{0,g}(\rho Y_0,T_e)
+ +(1-Y_0)\,\kappa_{1,g}(\rho(1-Y_0),T_e).
+\]
+
+Thus the pure-material limits query their tables at the full density, while a genuinely
+mixed cell queries each table at that material's partial density before mass weighting.
+At a face, AthenaK density-weights the adjacent mass fractions and uses the cached local
+electron temperatures from the two-temperature closure.  This avoids repeating a
+tabular energy-to-temperature inversion for every radiation group.  Source coupling and
+its accuracy timestep use the cell's cached material-dependent electron temperature;
+after radiation exchange, AthenaK performs one electron-EOS inversion to refresh it.
+
+In MPI runs, rank 0 alone opens both material opacity files and broadcasts each validated
+table.  Non-root ranks never need filesystem access to either file.
+
 `source_cfl > 0` limits the fractional electron-energy change for accuracy.  The local
 source update remains positive and conservative without this limit.  Set
 `couple_matter=false` to test pure radiation advection and diffusion.
@@ -267,14 +314,13 @@ Ready-to-run examples are:
 
 ## Current scope
 
-This implementation supports standalone Newtonian ideal-gas Hydro and MHD, constant or
-single-material density/electron-temperature opacity tables, Cartesian finite-volume
-diffusion, and up to 100 groups.  It models thermal transport and electron-radiation
-energy exchange.  Radiation pressure, momentum feedback, radiation work,
-frequency-space Doppler coupling, multispecies opacity mixing, direct IONMIX parsing, and
-an implicit global diffusion solver are not yet included.  It is therefore appropriate
-when radiation energy transport and thermal coupling matter but radiation forces are
-subdominant.
+This implementation supports standalone Newtonian Hydro and MHD, constant opacities,
+single-material or partial-density mixed-material density/electron-temperature opacity
+tables, Cartesian finite-volume diffusion, and up to 100 groups.  It models thermal
+transport and electron-radiation energy exchange.  Radiation pressure, momentum feedback,
+radiation work, frequency-space Doppler coupling, and an implicit global diffusion solver
+are not yet included.  It is therefore appropriate when radiation energy transport and
+thermal coupling matter but radiation forces are subdominant.
 
 The design follows the FLASH User's Guide sections on
 [3T capabilities](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node103.html),

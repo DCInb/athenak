@@ -79,6 +79,7 @@ add_executable(
         laser/laser_trace.cpp
 
         materials/material_mixture.cpp
+        materials/ionmix_two_temperature_table.cpp
 
         mesh/build_tree.cpp
         mesh/load_balance.cpp

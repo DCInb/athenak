@@ -9,6 +9,7 @@
 //! \brief Multigroup flux-limited diffusion coupled to two-temperature electrons.
 
 #include "athena.hpp"
+#include "materials/material_mixture.hpp"
 
 class MeshBlockPack;
 class ParameterInput;
@@ -16,6 +17,7 @@ class ParameterInput;
 namespace two_temperature {
 
 class OpacityTable;
+class MixedOpacityTable;
 
 //----------------------------------------------------------------------------------------
 //! \class ThermalRadiation
@@ -31,7 +33,8 @@ class ThermalRadiation {
  public:
   ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin, int first_group_index,
                    int electron_index, Real gamma_minus_one,
-                   Real electron_heat_capacity_fraction);
+                   Real electron_heat_capacity_fraction,
+                   materials::MaterialMixture *material_mixture = nullptr);
   ~ThermalRadiation();
 
   int ngroups;
@@ -45,11 +48,14 @@ class ThermalRadiation {
                   int il, int iu, int jl, int ju, int kl, int ku);
   void UpdateDiagnostics(const DvceArray5D<Real> &cons, const DvceArray5D<Real> &prim,
                          int il, int iu, int jl, int ju, int kl, int ku);
-  void AddFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx);
+  void AddFluxes(const DvceArray5D<Real> &prim,
+                 const DvceArray5D<Real> &temperature,
+                 DvceFaceFld5D<Real> &flx);
   void Couple(Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
               DvceArray5D<Real> &temperature,
               int il, int iu, int jl, int ju, int kl, int ku);
-  void NewTimeStep(const DvceArray5D<Real> &prim);
+  void NewTimeStep(const DvceArray5D<Real> &prim,
+                   const DvceArray5D<Real> &temperature);
 
  private:
   MeshBlockPack *pmy_pack_;
@@ -70,8 +76,12 @@ class ThermalRadiation {
   int initial_profile_mode_;
   bool couple_matter_;
   bool use_ap_transport_;
+  bool use_material_mixture_ = false;
+  materials::MaterialMixtureDevice material_mixture_;
   bool use_opacity_table_ = false;
   OpacityTable *opacity_table_ = nullptr;
+  bool use_mixed_opacity_table_ = false;
+  MixedOpacityTable *mixed_opacity_table_ = nullptr;
 
   DualArray1D<Real> group_bounds_;
   DualArray1D<Real> kappa_transport_;

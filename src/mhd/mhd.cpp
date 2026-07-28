@@ -117,9 +117,16 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
     pmaterials = new materials::MaterialMixture(
-        pin, nmhd, nuser_scalars, peos->eos_data.gamma);
+        pin, nmhd, nuser_scalars, peos->eos_data.gamma, ppack->punit);
+    use_tabular_material_eos = pmaterials->UsesTabularEOS();
   }
   bool use_two_temperature = pin->GetOrAddBoolean("mhd", "two_temperature", false);
+  if (use_tabular_material_eos && !use_two_temperature) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "tabular <materials> EOS requires "
+              << "<mhd>/two_temperature=true" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (use_two_temperature) {
     if (!peos->eos_data.is_gamma_law || pmy_pack->pcoord->is_special_relativistic ||
         pmy_pack->pcoord->is_general_relativistic ||
@@ -384,6 +391,12 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<mhd>/eos=table currently requires rsolver=llf"
                 << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (use_tabular_material_eos && rsolver != "llf" && rsolver != "hlle") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "tabular <materials> EOS currently requires "
+                << "rsolver=llf or rsolver=hlle" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     // Special relativistic solvers

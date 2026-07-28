@@ -1,5 +1,6 @@
 build/
 material_tables/
+production_gate.json
 run/
 runs/
 tranfile/logs/

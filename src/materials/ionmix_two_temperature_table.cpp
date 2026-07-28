@@ -489,4 +489,21 @@ IonmixTwoTemperatureTableDevice IonmixTwoTemperatureTable::DeviceData() const {
   return result;
 }
 
+//----------------------------------------------------------------------------------------
+
+bool IonmixTwoTemperatureTable::SharesTemperatureGrid(
+    const IonmixTwoTemperatureTable &other) const {
+  if (metadata_.ntemperature != other.metadata_.ntemperature) return false;
+  for (int it = 0; it < metadata_.ntemperature; ++it) {
+    const Real lhs = log_temperature_kelvin_.h_view(it);
+    const Real rhs = other.log_temperature_kelvin_.h_view(it);
+    const Real scale = std::max(static_cast<Real>(1.0),
+                                std::max(std::abs(lhs), std::abs(rhs)));
+    if (std::abs(lhs-rhs) > 32.0*std::numeric_limits<Real>::epsilon()*scale) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace materials

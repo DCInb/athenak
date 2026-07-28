@@ -267,6 +267,31 @@ struct IonmixTwoTemperatureTableDevice {
 
  public:
   KOKKOS_INLINE_FUNCTION
+  Real MinimumDensityCode() const {
+    return exp(log_density_cgs(0))/density_to_cgs;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MaximumDensityCode() const {
+    return exp(log_density_cgs(ndensity-1))/density_to_cgs;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MinimumTemperatureCode() const {
+    return exp(log_temperature_kelvin(0))/temperature_to_kelvin;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MaximumTemperatureCode() const {
+    return exp(log_temperature_kelvin(ntemperature-1))/temperature_to_kelvin;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real TemperatureCodeAtIndex(const int index) const {
+    return exp(log_temperature_kelvin(index))/temperature_to_kelvin;
+  }
+
+  KOKKOS_INLINE_FUNCTION
   IonmixComponentState ComponentFromRhoTemperature(
       const IonmixComponent component, const Real code_density,
       const Real code_temperature) const {
@@ -464,6 +489,7 @@ class IonmixTwoTemperatureTable {
 
   IonmixTwoTemperatureTableDevice DeviceData() const;
   const IonmixTwoTemperatureTableMetadata &Metadata() const { return metadata_; }
+  bool SharesTemperatureGrid(const IonmixTwoTemperatureTable &other) const;
 
  private:
   IonmixTwoTemperatureTableOptions options_;

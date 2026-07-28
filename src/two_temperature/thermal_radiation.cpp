@@ -210,9 +210,12 @@ Real FLDFaceStabilityRate(const FLDLinearization &properties, Real energy,
 }
 
 struct FLDFaceState {
+  Real energy_left;
+  Real energy_right;
   Real energy;
   Real density;
   Real electron_temperature;
+  Real material0_mass_fraction;
   Real gradient;
   Real normal_gradient;
 };
@@ -224,9 +227,13 @@ Real RadiationEnergy(const DvceArray5D<Real> &w, int m, int n,
 }
 
 KOKKOS_INLINE_FUNCTION
-FLDFaceState X1FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
+FLDFaceState X1FaceState(const DvceArray5D<Real> &w,
+                         const DvceArray5D<Real> &temperature,
+                         int m, int n, int iele,
                          int k, int j, int i, bool multi_d, bool three_d,
-                         Real dx1, Real dx2, Real dx3, Real gm1, Real fe) {
+                         Real dx1, Real dx2, Real dx3, Real gm1, Real fe,
+                         bool use_materials,
+                         const materials::MaterialMixtureDevice &mixture) {
   Real el = RadiationEnergy(w, m, n, k, j, i-1);
   Real er = RadiationEnergy(w, m, n, k, j, i);
   Real grad1 = (er-el)/dx1;
@@ -248,19 +255,41 @@ FLDFaceState X1FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
   }
 
   FLDFaceState state;
+  state.energy_left = el;
+  state.energy_right = er;
   state.energy = 0.5*(el+er);
-  state.density = 0.5*(w(m, IDN, k, j, i-1)+w(m, IDN, k, j, i));
-  state.electron_temperature =
-      0.5*gm1*(w(m, iele, k, j, i-1)+w(m, iele, k, j, i))/fe;
+  const Real density_left = w(m, IDN, k, j, i-1);
+  const Real density_right = w(m, IDN, k, j, i);
+  state.density = 0.5*(density_left+density_right);
+  state.material0_mass_fraction = 0.0;
+  if (use_materials) {
+    const Real y_left = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i-1);
+    const Real y_right = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i);
+    const Real density_sum = density_left+density_right;
+    state.material0_mass_fraction = (density_sum > 0.0)
+        ? (density_left*y_left+density_right*y_right)/density_sum
+        : 0.5*(y_left+y_right);
+    state.electron_temperature = 0.5*(
+        temperature(m, 1, k, j, i-1)+temperature(m, 1, k, j, i));
+  } else {
+    state.electron_temperature =
+        0.5*gm1*(w(m, iele, k, j, i-1)+w(m, iele, k, j, i))/fe;
+  }
   state.gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
   state.normal_gradient = grad1;
   return state;
 }
 
 KOKKOS_INLINE_FUNCTION
-FLDFaceState X2FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
+FLDFaceState X2FaceState(const DvceArray5D<Real> &w,
+                         const DvceArray5D<Real> &temperature,
+                         int m, int n, int iele,
                          int k, int j, int i, bool three_d,
-                         Real dx1, Real dx2, Real dx3, Real gm1, Real fe) {
+                         Real dx1, Real dx2, Real dx3, Real gm1, Real fe,
+                         bool use_materials,
+                         const materials::MaterialMixtureDevice &mixture) {
   Real el = RadiationEnergy(w, m, n, k, j-1, i);
   Real er = RadiationEnergy(w, m, n, k, j, i);
   Real ell = RadiationEnergy(w, m, n, k, j-1, i-1);
@@ -279,19 +308,40 @@ FLDFaceState X2FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
   }
 
   FLDFaceState state;
+  state.energy_left = el;
+  state.energy_right = er;
   state.energy = 0.5*(el+er);
-  state.density = 0.5*(w(m, IDN, k, j-1, i)+w(m, IDN, k, j, i));
-  state.electron_temperature =
-      0.5*gm1*(w(m, iele, k, j-1, i)+w(m, iele, k, j, i))/fe;
+  const Real density_left = w(m, IDN, k, j-1, i);
+  const Real density_right = w(m, IDN, k, j, i);
+  state.density = 0.5*(density_left+density_right);
+  state.material0_mass_fraction = 0.0;
+  if (use_materials) {
+    const Real y_left = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j-1, i);
+    const Real y_right = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i);
+    const Real density_sum = density_left+density_right;
+    state.material0_mass_fraction = (density_sum > 0.0)
+        ? (density_left*y_left+density_right*y_right)/density_sum
+        : 0.5*(y_left+y_right);
+    state.electron_temperature = 0.5*(
+        temperature(m, 1, k, j-1, i)+temperature(m, 1, k, j, i));
+  } else {
+    state.electron_temperature =
+        0.5*gm1*(w(m, iele, k, j-1, i)+w(m, iele, k, j, i))/fe;
+  }
   state.gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
   state.normal_gradient = grad2;
   return state;
 }
 
 KOKKOS_INLINE_FUNCTION
-FLDFaceState X3FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
+FLDFaceState X3FaceState(const DvceArray5D<Real> &w,
+                         const DvceArray5D<Real> &temperature,
+                         int m, int n, int iele,
                          int k, int j, int i, Real dx1, Real dx2, Real dx3,
-                         Real gm1, Real fe) {
+                         Real gm1, Real fe, bool use_materials,
+                         const materials::MaterialMixtureDevice &mixture) {
   Real el = RadiationEnergy(w, m, n, k-1, j, i);
   Real er = RadiationEnergy(w, m, n, k, j, i);
   Real ell = RadiationEnergy(w, m, n, k-1, j, i-1);
@@ -307,10 +357,28 @@ FLDFaceState X3FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
   Real grad3 = (er-el)/dx3;
 
   FLDFaceState state;
+  state.energy_left = el;
+  state.energy_right = er;
   state.energy = 0.5*(el+er);
-  state.density = 0.5*(w(m, IDN, k-1, j, i)+w(m, IDN, k, j, i));
-  state.electron_temperature =
-      0.5*gm1*(w(m, iele, k-1, j, i)+w(m, iele, k, j, i))/fe;
+  const Real density_left = w(m, IDN, k-1, j, i);
+  const Real density_right = w(m, IDN, k, j, i);
+  state.density = 0.5*(density_left+density_right);
+  state.material0_mass_fraction = 0.0;
+  if (use_materials) {
+    const Real y_left = mixture.Material0MassFractionFromPrimitive(
+        w, m, k-1, j, i);
+    const Real y_right = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i);
+    const Real density_sum = density_left+density_right;
+    state.material0_mass_fraction = (density_sum > 0.0)
+        ? (density_left*y_left+density_right*y_right)/density_sum
+        : 0.5*(y_left+y_right);
+    state.electron_temperature = 0.5*(
+        temperature(m, 1, k-1, j, i)+temperature(m, 1, k, j, i));
+  } else {
+    state.electron_temperature =
+        0.5*gm1*(w(m, iele, k-1, j, i)+w(m, iele, k, j, i))/fe;
+  }
   state.gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
   state.normal_gradient = grad3;
   return state;
@@ -324,7 +392,8 @@ FLDFaceState X3FaceState(const DvceArray5D<Real> &w, int m, int n, int iele,
 
 ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
     int first_group_index, int electron_index, Real gamma_minus_one,
-    Real electron_heat_capacity_fraction) :
+    Real electron_heat_capacity_fraction,
+    materials::MaterialMixture *material_mixture) :
     ngroups(pin->GetInteger("thermal_radiation", "n_groups")),
     ifirst(first_group_index),
     dtnew(FLT_MAX),
@@ -333,10 +402,12 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
     iele_(electron_index),
     gamma_minus_one_(gamma_minus_one),
     cv_e_fraction_(electron_heat_capacity_fraction),
+    use_material_mixture_(material_mixture != nullptr),
     group_bounds_("thermal-radiation-bounds", 1),
     kappa_transport_("thermal-radiation-kappa-transport", 1),
     kappa_absorption_("thermal-radiation-kappa-absorption", 1),
     kappa_emission_("thermal-radiation-kappa-emission", 1) {
+  if (use_material_mixture_) material_mixture_ = material_mixture->DeviceData();
   if (ngroups < 1 || ngroups > 100) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "<thermal_radiation>/n_groups must be between 1 and 100"
@@ -463,9 +534,42 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
         std::exit(EXIT_FAILURE);
       }
     }
-  } else if (opacity_model == "table" || opacity_model == "tabulated") {
-    use_opacity_table_ = true;
-    opacity_table_ = new OpacityTable(pin, ngroups, group_bounds_);
+  } else if (opacity_model == "table" || opacity_model == "tabulated" ||
+             opacity_model == "mixed-table" ||
+             opacity_model == "mixed_tabulated") {
+    const bool material0_table = pin->DoesParameterExist(
+        "materials", "material0_opacity_table_file");
+    const bool material1_table = pin->DoesParameterExist(
+        "materials", "material1_opacity_table_file");
+    if (material0_table != material1_table) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Mixed opacity requires both <materials>/"
+                << "material0_opacity_table_file and material1_opacity_table_file"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const bool explicitly_mixed =
+        (opacity_model == "mixed-table" || opacity_model == "mixed_tabulated");
+    if (explicitly_mixed && !(material0_table && material1_table)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<thermal_radiation>/opacity_model="
+                << opacity_model << " requires both material opacity tables"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (material0_table && material1_table) {
+      if (!use_material_mixture_) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Mixed material opacity tables require an active "
+                  << "<materials> mixture" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      use_mixed_opacity_table_ = true;
+      mixed_opacity_table_ = new MixedOpacityTable(pin, ngroups, group_bounds_);
+    } else {
+      use_opacity_table_ = true;
+      opacity_table_ = new OpacityTable(pin, ngroups, group_bounds_);
+    }
     for (int g = 0; g < ngroups; ++g) {
       kappa_transport_.h_view(g) = 1.0;
       kappa_absorption_.h_view(g) = 0.0;
@@ -498,6 +602,7 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
 
 ThermalRadiation::~ThermalRadiation() {
   if (opacity_table_ != nullptr) delete opacity_table_;
+  if (mixed_opacity_table_ != nullptr) delete mixed_opacity_table_;
 }
 
 //----------------------------------------------------------------------------------------
@@ -561,6 +666,7 @@ void ThermalRadiation::UpdateDiagnostics(const DvceArray5D<Real> &cons,
 //! Add q_g=-c_hat*D_g*grad(E_g) to each radiation-group finite-volume flux.
 
 void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
+                                 const DvceArray5D<Real> &temperature,
                                  DvceFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
@@ -576,6 +682,11 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
   bool use_table = use_opacity_table_;
   OpacityTableDevice opacity;
   if (use_table) opacity = opacity_table_->DeviceData();
+  bool use_mixed_table = use_mixed_opacity_table_;
+  MixedOpacityTableDevice mixed_opacity;
+  if (use_mixed_table) mixed_opacity = mixed_opacity_table_->DeviceData();
+  bool use_materials = use_material_mixture_;
+  auto mixture = material_mixture_;
   int iele = iele_;
   Real gm1 = gamma_minus_one_;
   Real fe = cv_e_fraction_;
@@ -592,38 +703,24 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
           ks, ke, js, je, is, ie+1,
   KOKKOS_LAMBDA(int m, int g, int k, int j, int i) {
     int n = i0 + g;
-    Real el = w0(m, IDN, k, j, i-1)*w0(m, n, k, j, i-1);
-    Real er = w0(m, IDN, k, j, i)*w0(m, n, k, j, i);
-    Real grad1 = (er-el)/size.d_view(m).dx1;
-    Real grad2 = 0.0;
-    Real grad3 = 0.0;
-    if (multi_d) {
-      Real ell = w0(m, IDN, k, j-1, i-1)*w0(m, n, k, j-1, i-1);
-      Real elu = w0(m, IDN, k, j+1, i-1)*w0(m, n, k, j+1, i-1);
-      Real erl = w0(m, IDN, k, j-1, i)*w0(m, n, k, j-1, i);
-      Real eru = w0(m, IDN, k, j+1, i)*w0(m, n, k, j+1, i);
-      grad2 = (elu-ell+eru-erl)/(4.0*size.d_view(m).dx2);
-    }
-    if (three_d) {
-      Real ell = w0(m, IDN, k-1, j, i-1)*w0(m, n, k-1, j, i-1);
-      Real elu = w0(m, IDN, k+1, j, i-1)*w0(m, n, k+1, j, i-1);
-      Real erl = w0(m, IDN, k-1, j, i)*w0(m, n, k-1, j, i);
-      Real eru = w0(m, IDN, k+1, j, i)*w0(m, n, k+1, j, i);
-      grad3 = (elu-ell+eru-erl)/(4.0*size.d_view(m).dx3);
-    }
-    Real energy = 0.5*(el+er);
-    Real density = 0.5*(w0(m, IDN, k, j, i-1)+w0(m, IDN, k, j, i));
-    Real tele = 0.5*gm1*(w0(m, iele, k, j, i-1)+w0(m, iele, k, j, i))/fe;
-    Real grad = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
-    Real kappa = use_table ? opacity.Get(opacity_transport, g, density, tele) : kt(g);
-    Real sigma = density*kappa;
+    FLDFaceState state = X1FaceState(
+        w0, temperature, m, n, iele, k, j, i, multi_d, three_d,
+        size.d_view(m).dx1, size.d_view(m).dx2, size.d_view(m).dx3,
+        gm1, fe, use_materials, mixture);
+    Real kappa = use_mixed_table ? mixed_opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature,
+        state.material0_mass_fraction) : (use_table ? opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
+    Real sigma = state.density*kappa;
     FLDLinearization properties = FLDProperties(
-        sigma, energy, grad, grad1, alpha, floor, mode);
+        sigma, state.energy, state.gradient, state.normal_gradient,
+        alpha, floor, mode);
     bool use_ap_face = use_ap_transport && mode != 0 &&
         (properties.streaming_fraction >= streaming_threshold ||
          sigma*size.d_view(m).dx1 <= optical_depth_threshold);
     flx1(m, n, k, j, i) += FLDNumericalFlux(
-        properties, grad1, el, er, chat, use_ap_face);
+        properties, state.normal_gradient, state.energy_left,
+        state.energy_right, chat, use_ap_face);
   });
   if (pmy_pack_->pmesh->one_d) return;
 
@@ -632,36 +729,24 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
           ks, ke, js, je+1, is, ie,
   KOKKOS_LAMBDA(int m, int g, int k, int j, int i) {
     int n = i0 + g;
-    Real el = w0(m, IDN, k, j-1, i)*w0(m, n, k, j-1, i);
-    Real er = w0(m, IDN, k, j, i)*w0(m, n, k, j, i);
-    Real grad1;
-    Real ell = w0(m, IDN, k, j-1, i-1)*w0(m, n, k, j-1, i-1);
-    Real elu = w0(m, IDN, k, j-1, i+1)*w0(m, n, k, j-1, i+1);
-    Real erl = w0(m, IDN, k, j, i-1)*w0(m, n, k, j, i-1);
-    Real eru = w0(m, IDN, k, j, i+1)*w0(m, n, k, j, i+1);
-    grad1 = (elu-ell+eru-erl)/(4.0*size.d_view(m).dx1);
-    Real grad2 = (er-el)/size.d_view(m).dx2;
-    Real grad3 = 0.0;
-    if (three_d) {
-      ell = w0(m, IDN, k-1, j-1, i)*w0(m, n, k-1, j-1, i);
-      elu = w0(m, IDN, k+1, j-1, i)*w0(m, n, k+1, j-1, i);
-      erl = w0(m, IDN, k-1, j, i)*w0(m, n, k-1, j, i);
-      eru = w0(m, IDN, k+1, j, i)*w0(m, n, k+1, j, i);
-      grad3 = (elu-ell+eru-erl)/(4.0*size.d_view(m).dx3);
-    }
-    Real energy = 0.5*(el+er);
-    Real density = 0.5*(w0(m, IDN, k, j-1, i)+w0(m, IDN, k, j, i));
-    Real tele = 0.5*gm1*(w0(m, iele, k, j-1, i)+w0(m, iele, k, j, i))/fe;
-    Real grad = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
-    Real kappa = use_table ? opacity.Get(opacity_transport, g, density, tele) : kt(g);
-    Real sigma = density*kappa;
+    FLDFaceState state = X2FaceState(
+        w0, temperature, m, n, iele, k, j, i, three_d,
+        size.d_view(m).dx1, size.d_view(m).dx2, size.d_view(m).dx3,
+        gm1, fe, use_materials, mixture);
+    Real kappa = use_mixed_table ? mixed_opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature,
+        state.material0_mass_fraction) : (use_table ? opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
+    Real sigma = state.density*kappa;
     FLDLinearization properties = FLDProperties(
-        sigma, energy, grad, grad2, alpha, floor, mode);
+        sigma, state.energy, state.gradient, state.normal_gradient,
+        alpha, floor, mode);
     bool use_ap_face = use_ap_transport && mode != 0 &&
         (properties.streaming_fraction >= streaming_threshold ||
          sigma*size.d_view(m).dx2 <= optical_depth_threshold);
     flx2(m, n, k, j, i) += FLDNumericalFlux(
-        properties, grad2, el, er, chat, use_ap_face);
+        properties, state.normal_gradient, state.energy_left,
+        state.energy_right, chat, use_ap_face);
   });
   if (pmy_pack_->pmesh->two_d) return;
 
@@ -670,32 +755,24 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
           ks, ke+1, js, je, is, ie,
   KOKKOS_LAMBDA(int m, int g, int k, int j, int i) {
     int n = i0 + g;
-    Real el = w0(m, IDN, k-1, j, i)*w0(m, n, k-1, j, i);
-    Real er = w0(m, IDN, k, j, i)*w0(m, n, k, j, i);
-    Real ell = w0(m, IDN, k-1, j, i-1)*w0(m, n, k-1, j, i-1);
-    Real elu = w0(m, IDN, k-1, j, i+1)*w0(m, n, k-1, j, i+1);
-    Real erl = w0(m, IDN, k, j, i-1)*w0(m, n, k, j, i-1);
-    Real eru = w0(m, IDN, k, j, i+1)*w0(m, n, k, j, i+1);
-    Real grad1 = (elu-ell+eru-erl)/(4.0*size.d_view(m).dx1);
-    ell = w0(m, IDN, k-1, j-1, i)*w0(m, n, k-1, j-1, i);
-    elu = w0(m, IDN, k-1, j+1, i)*w0(m, n, k-1, j+1, i);
-    erl = w0(m, IDN, k, j-1, i)*w0(m, n, k, j-1, i);
-    eru = w0(m, IDN, k, j+1, i)*w0(m, n, k, j+1, i);
-    Real grad2 = (elu-ell+eru-erl)/(4.0*size.d_view(m).dx2);
-    Real grad3 = (er-el)/size.d_view(m).dx3;
-    Real energy = 0.5*(el+er);
-    Real density = 0.5*(w0(m, IDN, k-1, j, i)+w0(m, IDN, k, j, i));
-    Real tele = 0.5*gm1*(w0(m, iele, k-1, j, i)+w0(m, iele, k, j, i))/fe;
-    Real grad = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
-    Real kappa = use_table ? opacity.Get(opacity_transport, g, density, tele) : kt(g);
-    Real sigma = density*kappa;
+    FLDFaceState state = X3FaceState(
+        w0, temperature, m, n, iele, k, j, i,
+        size.d_view(m).dx1, size.d_view(m).dx2, size.d_view(m).dx3,
+        gm1, fe, use_materials, mixture);
+    Real kappa = use_mixed_table ? mixed_opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature,
+        state.material0_mass_fraction) : (use_table ? opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
+    Real sigma = state.density*kappa;
     FLDLinearization properties = FLDProperties(
-        sigma, energy, grad, grad3, alpha, floor, mode);
+        sigma, state.energy, state.gradient, state.normal_gradient,
+        alpha, floor, mode);
     bool use_ap_face = use_ap_transport && mode != 0 &&
         (properties.streaming_fraction >= streaming_threshold ||
          sigma*size.d_view(m).dx3 <= optical_depth_threshold);
     flx3(m, n, k, j, i) += FLDNumericalFlux(
-        properties, grad3, el, er, chat, use_ap_face);
+        properties, state.normal_gradient, state.energy_left,
+        state.energy_right, chat, use_ap_face);
   });
 }
 
@@ -727,23 +804,37 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
   bool use_table = use_opacity_table_;
   OpacityTableDevice opacity;
   if (use_table) opacity = opacity_table_->DeviceData();
+  bool use_mixed_table = use_mixed_opacity_table_;
+  MixedOpacityTableDevice mixed_opacity;
+  if (use_mixed_table) mixed_opacity = mixed_opacity_table_->DeviceData();
+  bool use_materials = use_material_mixture_;
+  auto mixture = material_mixture_;
   auto diag = diagnostics;
 
   par_for("thermal_rad_couple", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real density = cons(m, IDN, k, j, i);
     Real eele_old = fmax(cons(m, ie, k, j, i), 0.0);
-    Real tele = gm1*eele_old/(density*fe);
+    Real y0 = 0.0;
+    Real tele;
+    if (use_materials) {
+      y0 = mixture.Material0MassFractionFromConserved(cons, m, k, j, i);
+      tele = temperature(m, 1, k, j, i);
+    } else {
+      tele = gm1*eele_old/(density*fe);
+    }
     Real blackbody = arad*tele*tele*tele*tele;
     Real positive = 0.0;
     Real negative = 0.0;
 
     for (int g = 0; g < ng; ++g) {
       Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real kappaa = use_table ? opacity.Get(
-          opacity_absorption, g, density, tele) : ka(g);
-      Real kappae = use_table ? opacity.Get(
-          opacity_emission, g, density, tele) : ke(g);
+      Real kappaa = use_mixed_table ? mixed_opacity.Get(
+          opacity_absorption, g, density, tele, y0) : (use_table ? opacity.Get(
+          opacity_absorption, g, density, tele) : ka(g));
+      Real kappae = use_mixed_table ? mixed_opacity.Get(
+          opacity_emission, g, density, tele, y0) : (use_table ? opacity.Get(
+          opacity_emission, g, density, tele) : ke(g));
       Real siga = density*kappaa;
       Real sige = density*kappae;
       Real source = sige*blackbody*
@@ -761,10 +852,12 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     Real total_radiation = 0.0;
     for (int g = 0; g < ng; ++g) {
       Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real kappaa = use_table ? opacity.Get(
-          opacity_absorption, g, density, tele) : ka(g);
-      Real kappae = use_table ? opacity.Get(
-          opacity_emission, g, density, tele) : ke(g);
+      Real kappaa = use_mixed_table ? mixed_opacity.Get(
+          opacity_absorption, g, density, tele, y0) : (use_table ? opacity.Get(
+          opacity_absorption, g, density, tele) : ka(g));
+      Real kappae = use_mixed_table ? mixed_opacity.Get(
+          opacity_emission, g, density, tele, y0) : (use_table ? opacity.Get(
+          opacity_emission, g, density, tele) : ke(g));
       Real siga = density*kappaa;
       Real sige = density*kappae;
       Real source = sige*blackbody*
@@ -785,7 +878,9 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     prim(m, ie, k, j, i) = eele_new/density;
     cons(m, IEN, k, j, i) += matter_delta;
     prim(m, IEN, k, j, i) += matter_delta;
-    temperature(m, 1, k, j, i) = gm1*eele_new/(density*fe);
+    temperature(m, 1, k, j, i) = use_materials
+        ? mixture.ElectronTemperature(density, eele_new/density, y0)
+        : gm1*eele_new/(density*fe);
     diag(m, 0, k, j, i) = total_radiation/density;
     diag(m, 1, k, j, i) = pow(total_radiation/arad, 0.25);
   });
@@ -801,7 +896,9 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
 //! accumulated independently in each direction and then summed, which is conservative
 //! for variable coefficients, multiple groups, and multidimensional meshes.
 
-void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
+void ThermalRadiation::NewTimeStep(
+    const DvceArray5D<Real> &w0,
+    const DvceArray5D<Real> &temperature) {
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int is = indcs.is, nx1 = indcs.nx1;
   int js = indcs.js, nx2 = indcs.nx2;
@@ -818,6 +915,11 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
   bool use_table = use_opacity_table_;
   OpacityTableDevice opacity;
   if (use_table) opacity = opacity_table_->DeviceData();
+  bool use_mixed_table = use_mixed_opacity_table_;
+  MixedOpacityTableDevice mixed_opacity;
+  if (use_mixed_table) mixed_opacity = mixed_opacity_table_->DeviceData();
+  bool use_materials = use_material_mixture_;
+  auto mixture = material_mixture_;
   auto bounds = group_bounds_.d_view;
   Real chat = chat_;
   Real alpha = flux_limit_coefficient_;
@@ -858,10 +960,12 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
     Real dx_short = dx1;
     if (multi_d) dx_short = fmin(dx_short, dx2);
     if (three_d) dx_short = fmin(dx_short, dx3);
-    FLDFaceState state = X1FaceState(w0, m, i0+g, ie, k, j, i,
-        multi_d, three_d, dx1, dx2, dx3, gm1, fe);
-    Real kappa = use_table ? opacity.Get(opacity_transport, g, state.density,
-                                              state.electron_temperature) : kt(g);
+    FLDFaceState state = X1FaceState(w0, temperature, m, i0+g, ie, k, j, i,
+        multi_d, three_d, dx1, dx2, dx3, gm1, fe, use_materials, mixture);
+    Real kappa = use_mixed_table ? mixed_opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature,
+        state.material0_mass_fraction) : (use_table ? opacity.Get(
+        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
     Real sigma = state.density*kappa;
     FLDLinearization properties = FLDProperties(
         sigma, state.energy, state.gradient, state.normal_gradient,
@@ -894,10 +998,12 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
       Real dx3 = size.d_view(m).dx3;
       Real dx_short = fmin(dx1, dx2);
       if (three_d) dx_short = fmin(dx_short, dx3);
-      FLDFaceState state = X2FaceState(w0, m, i0+g, ie, k, j, i,
-          three_d, dx1, dx2, dx3, gm1, fe);
-      Real kappa = use_table ? opacity.Get(opacity_transport, g, state.density,
-                                                state.electron_temperature) : kt(g);
+      FLDFaceState state = X2FaceState(w0, temperature, m, i0+g, ie, k, j, i,
+          three_d, dx1, dx2, dx3, gm1, fe, use_materials, mixture);
+      Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, state.density, state.electron_temperature,
+          state.material0_mass_fraction) : (use_table ? opacity.Get(
+          opacity_transport, g, state.density, state.electron_temperature) : kt(g));
       Real sigma = state.density*kappa;
       FLDLinearization properties = FLDProperties(
           sigma, state.energy, state.gradient, state.normal_gradient,
@@ -930,10 +1036,12 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
       Real dx2 = size.d_view(m).dx2;
       Real dx3 = size.d_view(m).dx3;
       Real dx_short = fmin(dx1, fmin(dx2, dx3));
-      FLDFaceState state = X3FaceState(w0, m, i0+g, ie, k, j, i,
-                                      dx1, dx2, dx3, gm1, fe);
-      Real kappa = use_table ? opacity.Get(opacity_transport, g, state.density,
-                                                state.electron_temperature) : kt(g);
+      FLDFaceState state = X3FaceState(w0, temperature, m, i0+g, ie, k, j, i,
+          dx1, dx2, dx3, gm1, fe, use_materials, mixture);
+      Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, state.density, state.electron_temperature,
+          state.material0_mass_fraction) : (use_table ? opacity.Get(
+          opacity_transport, g, state.density, state.electron_temperature) : kt(g));
       Real sigma = state.density*kappa;
       FLDLinearization properties = FLDProperties(
           sigma, state.energy, state.gradient, state.normal_gradient,
@@ -970,7 +1078,14 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
     Real density = w0(m, IDN, k, j, i);
     Real cell_dt = FLT_MAX;
     Real source_rate = 0.0;
-    Real tele = gm1*w0(m, ie, k, j, i)/fe;
+    Real y0 = 0.0;
+    Real tele;
+    if (use_materials) {
+      y0 = mixture.Material0MassFractionFromPrimitive(w0, m, k, j, i);
+      tele = temperature(m, 1, k, j, i);
+    } else {
+      tele = gm1*w0(m, ie, k, j, i)/fe;
+    }
     Real blackbody = arad*tele*tele*tele*tele;
 
     for (int g = 0; g < ng; ++g) {
@@ -979,10 +1094,12 @@ void ThermalRadiation::NewTimeStep(const DvceArray5D<Real> &w0) {
       if (couple && source_cfl > 0.0) {
         Real equilibrium = blackbody*
             PlanckGroupFraction(bounds(g), bounds(g+1), tele);
-        Real kappaa = use_table ? opacity.Get(
-            opacity_absorption, g, density, tele) : ka(g);
-        Real kappae = use_table ? opacity.Get(
-            opacity_emission, g, density, tele) : kem(g);
+        Real kappaa = use_mixed_table ? mixed_opacity.Get(
+            opacity_absorption, g, density, tele, y0) : (use_table ? opacity.Get(
+            opacity_absorption, g, density, tele) : ka(g));
+        Real kappae = use_mixed_table ? mixed_opacity.Get(
+            opacity_emission, g, density, tele, y0) : (use_table ? opacity.Get(
+            opacity_emission, g, density, tele) : kem(g));
         source_rate += chat*fabs(density*kappae*equilibrium
                                  - density*kappaa*energy);
       }

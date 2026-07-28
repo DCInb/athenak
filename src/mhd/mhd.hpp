@@ -103,6 +103,7 @@ class MHD {
   int nscalars;            // total number of advected scalars, including 2T energies
   int nuser_scalars;       // number of user-requested passive scalars
   bool use_dual_energy = false;
+  bool use_tabular_material_eos = false;
   Real dual_energy_eta1 = 1.0e-3;
   Real dual_energy_eta2 = 1.0e-4;
   DvceArray5D<Real> u0;    // conserved variables

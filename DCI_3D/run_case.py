@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely build and launch provisional DCI_3D validation or production runs."""
+"""Build, validate, and gate the reference-informed DCI_3D case."""
 
 from __future__ import annotations
 
@@ -20,16 +20,38 @@ CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
 PRODUCTION_INPUT = CASE_DIR / "dci_3d.athinput"
 CALIBRATION_INPUT = CASE_DIR / "dci_3d_calibration.athinput"
-OPACITY_TABLE = CASE_DIR / "ch_surrogate.opacity"
 TABLE_GENERATOR = CASE_DIR / "generate_reference_tables.py"
 MATERIAL_TABLE_DIR = CASE_DIR / "material_tables"
-MATERIAL_TABLE_NAMES = (
-    "ch.2t_eos",
-    "he.2t_eos",
-    "ch_20g.opacity",
-    "he_20g.opacity",
-)
 MATERIAL_TABLE_MANIFEST = MATERIAL_TABLE_DIR / "manifest.json"
+ARCHIVE_SHA256 = "952708009c9e3bc00dc645e11c9c0f804614def9c70cc999b78c92f16c8a96cf"
+EXPECTED_MATERIAL_TABLES = {
+    "ch.2t_eos": {
+        "kind": "two_temperature_eos",
+        "material": "CH",
+        "sha256": "b29624877c7c90ed1d8c385bef6a7882b106dd8202bf0398301e2dee09faa0d8",
+    },
+    "he.2t_eos": {
+        "kind": "two_temperature_eos",
+        "material": "He",
+        "sha256": "aae12f2dde296992ad630094e5755f7f52baa0816c678771e075f4848a9d63d0",
+    },
+    "ch_20g.opacity": {
+        "kind": "opacity",
+        "material": "CH",
+        "sha256": "47ee4b8ab3e7f249e4b7108ab5efbaabeee71bb7dd88cdea59f4b4c64738f94d",
+    },
+    "he_20g.opacity": {
+        "kind": "opacity",
+        "material": "He",
+        "sha256": "1e0daba15df1a23f5f558663e867dda181886ea53b0dbad119beb6fa1215f420",
+    },
+}
+TABLE_INPUT_OVERRIDES = {
+    "materials/material0_eos_table_file": "material_tables/ch.2t_eos",
+    "materials/material1_eos_table_file": "material_tables/he.2t_eos",
+    "materials/material0_opacity_table_file": "material_tables/ch_20g.opacity",
+    "materials/material1_opacity_table_file": "material_tables/he_20g.opacity",
+}
 BUILD_DIR = CASE_DIR / "build"
 BINARY = BUILD_DIR / "src" / "athena"
 HELPER = Path(
@@ -39,6 +61,20 @@ ENV_SCRIPT = Path("/home/mengqi/Research/bashrc_athenaK")
 PROBLEM = "../../DCI_3D/dci_3d"
 RUN_SENTINEL = ".athenak_dci_3d_run"
 OUTPUT_BLOCKS = range(1, 12)
+DEFAULT_PRODUCTION_GATE = CASE_DIR / "production_gate.json"
+PRODUCTION_GATE_SCHEMA = 1
+REQUIRED_PRODUCTION_CHECKS = (
+    "compact_20group_50step",
+    "compact_output_and_restart",
+    "finite_nonnegative_3t",
+    "causal_timestep_no_collapse",
+    "laser_and_boundary_energy_closure",
+    "ch_mass_conservation",
+    "restart_continuity",
+    "resolution_or_opacity_sensitivity",
+    "reduced_light_speed_sensitivity",
+    "gpu_memory_60_80_all",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         choices=("validate", "smoke", "calibrate", "production"),
         default="validate",
         help=(
-            "validate=compact nlim=0, smoke=compact nlim=2, "
+            "validate=compact nlim=0, smoke=compact 50-step plus restart, "
             "calibrate=production mesh nlim=2, production=5+5 ns"
         ),
     )
@@ -57,8 +93,7 @@ def parse_args() -> argparse.Namespace:
         "--regenerate-material-tables",
         action="store_true",
         help=(
-            "recreate audited CH/He EOS and opacity tables from the local "
-            "3d_zb.zip (the provisional deck does not consume them yet)"
+            "recreate audited CH/He EOS and opacity tables from local 3d_zb.zip"
         ),
     )
     parser.add_argument("--clean", action="store_true")
@@ -74,8 +109,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nlim",
         type=int,
-        choices=(0, 2),
-        help="override nlim for non-production validation",
+        help="non-negative cycle-limit override for non-production validation",
+    )
+    parser.add_argument(
+        "--production-gate",
+        type=Path,
+        default=DEFAULT_PRODUCTION_GATE,
+        help="evidence manifest required for an actual production launch",
+    )
+    parser.add_argument(
+        "--radiation-c-light",
+        type=float,
+        choices=(10.0, 30.0, 299.792458),
+        help=(
+            "non-production RSLA sensitivity value in code units; default smoke "
+            "cycle count scales to approximately the same physical interval"
+        ),
+    )
+    parser.add_argument(
+        "--compact-scale",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="linear compact-mesh scale for validate/smoke resolution checks",
     )
     parser.add_argument(
         "--allow-busy-gpus",
@@ -96,17 +152,26 @@ def sha256_path(path: Path) -> str:
 def material_tables_are_valid() -> bool:
     try:
         manifest = json.loads(MATERIAL_TABLE_MANIFEST.read_text(encoding="utf-8"))
+        if manifest.get("archive_sha256") != ARCHIVE_SHA256:
+            return False
         records = manifest["tables"]
         if not isinstance(records, list):
             return False
-        expected = set(MATERIAL_TABLE_NAMES)
+        expected = set(EXPECTED_MATERIAL_TABLES)
         actual: set[str] = set()
         for record in records:
             if not isinstance(record, dict):
                 return False
             name = record.get("output")
-            expected_hash = record.get("output_sha256")
-            if not isinstance(name, str) or not isinstance(expected_hash, str):
+            if not isinstance(name, str) or name not in EXPECTED_MATERIAL_TABLES:
+                return False
+            specification = EXPECTED_MATERIAL_TABLES[name]
+            expected_hash = specification["sha256"]
+            if (
+                record.get("output_sha256") != expected_hash
+                or record.get("kind") != specification["kind"]
+                or record.get("material") != specification["material"]
+            ):
                 return False
             path = MATERIAL_TABLE_DIR / name
             if not path.is_file() or sha256_path(path) != expected_hash:
@@ -127,6 +192,80 @@ def prepare_material_tables(force: bool, dry_run: bool) -> None:
     subprocess.run(command, cwd=REPO, check=True)
     if not material_tables_are_valid():
         raise RuntimeError("Generated DCI material-table manifest failed verification")
+
+
+def table_overrides() -> list[str]:
+    return [f"{key}={value}" for key, value in TABLE_INPUT_OVERRIDES.items()]
+
+
+def stage_material_tables(run_dir: Path) -> None:
+    """Copy verified tables into the owned run tree for portable restart/transfer."""
+    destination = run_dir / "material_tables"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, specification in EXPECTED_MATERIAL_TABLES.items():
+        source = MATERIAL_TABLE_DIR / name
+        target = destination / name
+        shutil.copy2(source, target)
+        if sha256_path(target) != specification["sha256"]:
+            raise RuntimeError(f"Staged material table failed verification: {target}")
+    shutil.copy2(MATERIAL_TABLE_MANIFEST, destination / "manifest.json")
+
+
+def gate_artifact_hashes() -> dict[str, str]:
+    artifacts = {
+        "athena_binary": BINARY,
+        "dci_3d.cpp": CASE_DIR / "dci_3d.cpp",
+        "dci_3d.athinput": PRODUCTION_INPUT,
+        "dci_3d_calibration.athinput": CALIBRATION_INPUT,
+        "run_case.py": Path(__file__).resolve(),
+    }
+    result = {name: sha256_path(path) for name, path in artifacts.items()}
+    for name, specification in EXPECTED_MATERIAL_TABLES.items():
+        result[f"material_tables/{name}"] = str(specification["sha256"])
+    return result
+
+
+def validate_production_gate(path: Path) -> dict[str, object]:
+    """Require immutable evidence for every acceptance gate before production."""
+    try:
+        gate = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Production gate is missing or invalid: {path}: {exc}") from exc
+    if gate.get("schema") != PRODUCTION_GATE_SCHEMA:
+        raise RuntimeError(
+            f"Production gate schema must be {PRODUCTION_GATE_SCHEMA}: {path}"
+        )
+    expected_artifacts = gate_artifact_hashes()
+    if gate.get("artifacts") != expected_artifacts:
+        raise RuntimeError(
+            "Production gate artifact hashes do not match this binary, case, launcher, "
+            "and material tables"
+        )
+    checks = gate.get("checks")
+    if not isinstance(checks, dict) or set(checks) != set(REQUIRED_PRODUCTION_CHECKS):
+        raise RuntimeError("Production gate does not contain the exact required check set")
+    for name in REQUIRED_PRODUCTION_CHECKS:
+        record = checks[name]
+        if not isinstance(record, dict) or record.get("passed") is not True:
+            raise RuntimeError(f"Production gate has not passed: {name}")
+        evidence = record.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise RuntimeError(f"Production gate lacks immutable evidence: {name}")
+        for item in evidence:
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Malformed production evidence for {name}")
+            evidence_name = item.get("path")
+            evidence_hash = item.get("sha256")
+            if not isinstance(evidence_name, str) or not isinstance(evidence_hash, str):
+                raise RuntimeError(f"Malformed production evidence for {name}")
+            evidence_path = Path(evidence_name).expanduser()
+            if not evidence_path.is_absolute():
+                evidence_path = path.parent / evidence_path
+            if not evidence_path.is_file() or sha256_path(evidence_path) != evidence_hash:
+                raise RuntimeError(
+                    f"Production evidence is missing or changed for {name}: {evidence_path}"
+                )
+    return gate
 
 
 def default_run_dir(mode: str) -> Path:
@@ -281,15 +420,48 @@ def disabled_output_overrides() -> list[str]:
     return [f"output{number}/dt=-1.0" for number in OUTPUT_BLOCKS]
 
 
-def nonproduction_overrides(mode: str, nlim: int | None) -> list[str]:
-    selected_nlim = {"validate": 0, "smoke": 2, "calibrate": 2}[mode]
+def default_smoke_cycles(c_light: float | None, compact_scale: int) -> int:
+    value = 10.0 if c_light is None else c_light
+    return max(50, int(round(50.0*value/10.0*compact_scale)))
+
+
+def nonproduction_overrides(
+    mode: str,
+    nlim: int | None,
+    radiation_c_light: float | None,
+    compact_scale: int,
+) -> list[str]:
+    selected_nlim = {
+        "validate": 0,
+        "smoke": default_smoke_cycles(radiation_c_light, compact_scale),
+        "calibrate": 2,
+    }[mode]
     if nlim is not None:
         selected_nlim = nlim
-    overrides = [f"time/nlim={selected_nlim}", "time/tlim=1.0e-3"]
+    overrides = [f"time/nlim={selected_nlim}", "time/tlim=1.0"]
+    if radiation_c_light is not None:
+        overrides.append(f"thermal_radiation/c_light={radiation_c_light:.17g}")
     if mode in ("validate", "smoke"):
-        # Two blocks per direction: one production-size block per MPI rank.
-        overrides.extend(("mesh/nx1=100", "mesh/nx2=92", "mesh/nx3=92"))
+        # Scale 1 is two blocks per direction; scale 2 supplies a matched resolution gate.
+        overrides.extend(
+            (
+                f"mesh/nx1={100*compact_scale}",
+                f"mesh/nx2={64*compact_scale}",
+                f"mesh/nx3={64*compact_scale}",
+            )
+        )
     overrides.extend(disabled_output_overrides())
+    if mode == "smoke" and nlim is None:
+        # The default smoke is an acceptance-gate run: cross both diagnostic and restart
+        # boundaries, then run_case restarts it for ten additional cycles.
+        overrides.extend(
+            (
+                "output1/dt=1.0e-4",
+                "output3/dt=5.0e-4",
+                "output4/dt=5.0e-4",
+                "output11/dt=5.0e-4",
+            )
+        )
     return overrides
 
 
@@ -302,7 +474,21 @@ def mpi_command(input_path: Path, overrides: list[str]) -> list[str]:
         "--kokkos-map-device-id-by=mpi_rank",
         "-i",
         str(input_path),
-        f"thermal_radiation/opacity_table_file={OPACITY_TABLE}",
+        *table_overrides(),
+        *overrides,
+    ]
+
+
+def restart_command(restart: Path, overrides: list[str]) -> list[str]:
+    return [
+        "mpirun",
+        "-n",
+        "8",
+        str(BINARY),
+        "--kokkos-map-device-id-by=mpi_rank",
+        "-r",
+        str(restart),
+        *table_overrides(),
         *overrides,
     ]
 
@@ -343,18 +529,24 @@ def run_logged(
 
 
 def memory_is_accepted(memory: dict[str, object]) -> bool:
-    records = memory["devices"]
-    assert isinstance(records, dict)
+    records = memory.get("devices")
+    errors = memory.get("errors")
+    if not isinstance(records, dict) or len(records) != 8 or errors:
+        return False
     return all(
-        bool(record["within_60_80_percent"])
+        isinstance(record, dict) and bool(record.get("within_60_80_percent"))
         for record in records.values()
-        if isinstance(record, dict)
     )
 
 
 def print_dry_run(run_dir: Path, command: list[str], devices: list[str]) -> None:
     env = {"CUDA_VISIBLE_DEVICES": ",".join(devices)}
     print(f"mkdir -p {shlex.quote(str(run_dir))}")
+    print(
+        "cp -a "
+        f"{shlex.quote(str(MATERIAL_TABLE_DIR) + '/.')} "
+        f"{shlex.quote(str(run_dir / 'material_tables') + '/')}"
+    )
     print(
         f"CUDA_VISIBLE_DEVICES={shlex.quote(env['CUDA_VISIBLE_DEVICES'])} "
         + shlex.join(shell_command(run_dir, command))
@@ -368,21 +560,25 @@ def main() -> int:
 
     if args.mode == "production" and args.nlim is not None:
         raise RuntimeError("--nlim is only valid for non-production modes")
-    if args.mode == "production" and not args.dry_run:
-        raise RuntimeError(
-            "Production is disabled: AP transport is stable in a compact smoke run, "
-            "but convergence, restart, final 20-group material physics, full-mesh "
-            "memory, and 5/10 ns endpoints remain unverified. See DCI_3D/README.md."
-        )
+    if args.mode == "production" and args.radiation_c_light is not None:
+        raise RuntimeError("--radiation-c-light is only valid for non-production modes")
+    if args.mode in ("production", "calibrate") and args.compact_scale != 1:
+        raise RuntimeError("--compact-scale applies only to validate and smoke modes")
+    if args.nlim is not None and args.nlim < 0:
+        raise RuntimeError("--nlim must be non-negative")
     if args.clean and args.dry_run:
         raise RuntimeError("Combine neither --clean nor destructive actions with --dry-run")
 
-    if args.regenerate_material_tables:
-        prepare_material_tables(True, args.dry_run)
+    prepare_material_tables(args.regenerate_material_tables, args.dry_run)
     if args.build:
         build(args.jobs, args.dry_run)
     if not args.dry_run and not BINARY.is_file():
         raise RuntimeError(f"AthenaK executable not found; use --build: {BINARY}")
+
+    production_gate: dict[str, object] | None = None
+    production_gate_path = args.production_gate.expanduser().resolve()
+    if args.mode == "production" and not args.dry_run:
+        production_gate = validate_production_gate(production_gate_path)
 
     input_path = (
         PRODUCTION_INPUT if args.mode == "production" else CALIBRATION_INPUT
@@ -390,18 +586,30 @@ def main() -> int:
     first_overrides = (
         []
         if args.mode == "production"
-        else nonproduction_overrides(args.mode, args.nlim)
+        else nonproduction_overrides(
+            args.mode,
+            args.nlim,
+            args.radiation_c_light,
+            args.compact_scale,
+        )
     )
     first_mpi = mpi_command(input_path, first_overrides)
     if args.dry_run:
         print_dry_run(run_dir, first_mpi, devices)
         if args.mode == "production":
-            print("# Phase 2 restarts the 5 ns checkpoint with time/tlim=10.0.")
+            print(
+                "# Actual production additionally requires a hash-matched evidence "
+                f"manifest: {production_gate_path}"
+            )
+            print("# Phase 2 restarts the exact 5 ns checkpoint with time/tlim=10.0.")
+        elif args.mode == "smoke" and args.nlim is None:
+            print("# Phase 2 restarts the compact checkpoint for 10 more RK2 cycles.")
         return 0
 
     if args.clean:
         clean_run_dir(run_dir)
     prepare_run_dir(run_dir, args.mode)
+    stage_material_tables(run_dir)
 
     baseline = query_gpu(devices)
     processes = {device: gpu_processes(device) for device in devices}
@@ -415,10 +623,17 @@ def main() -> int:
         "mode": args.mode,
         "ranks": args.ranks,
         "gpus": devices,
+        "radiation_c_light_override": args.radiation_c_light,
+        "compact_scale": args.compact_scale,
         "run_dir": str(run_dir),
+        "case_artifacts": gate_artifact_hashes(),
+        "material_manifest_sha256": sha256_path(MATERIAL_TABLE_MANIFEST),
         "baseline": baseline,
         "baseline_processes": processes,
     }
+    if production_gate is not None:
+        status["production_gate"] = str(production_gate_path)
+        status["production_gate_sha256"] = sha256_path(production_gate_path)
 
     first_monitor = GpuMemoryMonitor(devices, baseline)
     first_code, first_elapsed, first_memory = run_logged(
@@ -444,25 +659,45 @@ def main() -> int:
         )
         return 2
 
-    if args.mode != "production":
+    run_smoke_restart = args.mode == "smoke" and args.nlim is None
+    if args.mode != "production" and not run_smoke_restart:
         return 0
 
-    restarts = sorted((run_dir / "rst").glob("dci_3d.*.rst"))
+    restart_basename = "dci_3d" if args.mode == "production" else "dci_3d_calibration"
+    restarts = sorted((run_dir / "rst").glob(f"{restart_basename}.*.rst"))
     if not restarts:
-        raise RuntimeError("Phase 1 completed without a DCI_3D restart checkpoint")
+        raise RuntimeError(
+            f"Phase 1 completed without a {restart_basename} restart checkpoint"
+        )
     restart = restarts[-1]
-    second_mpi = [
-        "mpirun",
-        "-n",
-        "8",
-        str(BINARY),
-        "--kokkos-map-device-id-by=mpi_rank",
-        "-r",
-        str(restart.relative_to(run_dir)),
-        "time/tlim=10.0",
-        "laser/beam0_end_time=4.999999999999",
-        f"thermal_radiation/opacity_table_file={OPACITY_TABLE}",
-    ]
+    if args.mode == "production":
+        second_overrides = ["time/tlim=10.0"]
+    else:
+        first_cycles = default_smoke_cycles(
+            args.radiation_c_light, args.compact_scale
+        )
+        extra_cycles = max(
+            10,
+            int(
+                round(
+                    10.0
+                    * (args.radiation_c_light or 10.0)
+                    / 10.0
+                    * args.compact_scale
+                )
+            ),
+        )
+        second_overrides = [
+            f"time/nlim={first_cycles+extra_cycles}",
+            "time/tlim=1.0",
+            *disabled_output_overrides(),
+            "output1/dt=1.0e-4",
+        ]
+        if args.radiation_c_light is not None:
+            second_overrides.append(
+                f"thermal_radiation/c_light={args.radiation_c_light:.17g}"
+            )
+    second_mpi = restart_command(restart.relative_to(run_dir), second_overrides)
     second_baseline = query_gpu(devices)
     second_monitor = GpuMemoryMonitor(devices, second_baseline)
     second_code, second_elapsed, second_memory = run_logged(

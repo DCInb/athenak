@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file dci_3d.cpp
-//! \brief Provisional 3D laser drive of an open CH spherical cap with 3T radiation.
+//! \brief Three-dimensional laser drive of an open CH spherical shell with CH/He 3T.
 
 #include <cmath>
 #include <cstdlib>
@@ -14,6 +14,7 @@
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "laser/laser.hpp"
+#include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
 #include "mhd/biermann_battery.hpp"
@@ -23,6 +24,7 @@
 #include "pgen/pgen.hpp"
 #include "two_temperature/thermal_radiation.hpp"
 #include "two_temperature/two_temperature.hpp"
+#include "units/units.hpp"
 
 namespace {
 
@@ -44,12 +46,13 @@ bool NearlyEqual(const Real lhs, const Real rhs, const Real scale = 1.0) {
 } // namespace
 
 //----------------------------------------------------------------------------------------
-//! Initialize the provisional CH spherical cap and its conservative material tracer.
+//! Initialize the CH spherical cap and its conservative material tracer.
 //!
 //! The smooth geometry variable alpha is a volume fraction.  The passive scalar is a
 //! mass fraction: rho*X_CH = alpha*rho_CH.  This distinction is important across the
-//! smoothed solid/ambient interface where the component densities differ by eight orders
-//! of magnitude.
+//! smoothed solid/ambient interface where the component densities differ by five orders
+//! of magnitude.  The material closure evaluates the CH and He tables at their partial
+//! densities and initializes both components at the requested common physical temperature.
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   static_assert(kHistoryFields <= NHISTORY_VARIABLES,
@@ -79,35 +82,49 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (pmhd->nuser_scalars != 1) {
     ProblemError("dci_3d requires exactly one user scalar for rho*X_CH");
   }
-  if (ptwo->pradiation->ngroups != 3) {
-    ProblemError("dci_3d provisional radiation model requires exactly three groups");
+  if (pmhd->pmaterials == nullptr) {
+    ProblemError("dci_3d requires the two-material CH/He closure");
+  }
+  if (!pmhd->pmaterials->UsesTabularEOS()) {
+    ProblemError("dci_3d requires both audited CH and He two-temperature EOS tables");
+  }
+  if (ptwo->pradiation->ngroups != 20) {
+    ProblemError("dci_3d requires the 20 reference radiation groups");
   }
   if (!pmhd->peos->eos_data.is_gamma_law) {
-    ProblemError("dci_3d currently requires the documented gamma-law CH surrogate");
+    ProblemError("dci_3d tabular material mode requires its gamma-law MHD carrier");
   }
 
   const Real ambient_density =
-      pin->GetOrAddReal("problem", "ambient_density", 1.0e-8);
+      pin->GetOrAddReal("problem", "ambient_density", 9.090909090909091e-6);
   const Real solid_density =
       pin->GetOrAddReal("problem", "solid_density", 1.0);
-  const Real temperature =
-      pin->GetOrAddReal("problem", "temperature", 1.7268498302462577e-6);
+  const Real temperature_kelvin =
+      pin->GetOrAddReal("problem", "temperature_kelvin", 11606.0);
   const Real inner_radius =
       pin->GetOrAddReal("problem", "inner_radius", 0.8);
   const Real outer_radius =
       pin->GetOrAddReal("problem", "outer_radius", 1.0);
   const Real opening_half_angle_deg =
-      pin->GetOrAddReal("problem", "opening_half_angle_deg", 25.0);
+      pin->GetOrAddReal("problem", "opening_half_angle_deg", 50.0);
   const Real transition_width =
       pin->GetOrAddReal("problem", "transition_width", 2.0e-2);
   const Real angular_transition =
       pin->GetOrAddReal("problem", "angular_transition", 1.0e-2);
   if (!(ambient_density > 0.0) || !(solid_density > ambient_density) ||
-      !(temperature > 0.0) || !(inner_radius > 0.0) ||
+      !(temperature_kelvin > 0.0) || !(inner_radius > 0.0) ||
       !(outer_radius > inner_radius) || !(opening_half_angle_deg > 0.0) ||
       !(opening_half_angle_deg < 90.0) || !(transition_width > 0.0) ||
       !(angular_transition > 0.0)) {
     ProblemError("dci_3d geometry and thermodynamic parameters are invalid");
+  }
+  if (!NearlyEqual(solid_density, 1.0) ||
+      !NearlyEqual(ambient_density, 9.090909090909091e-6) ||
+      !NearlyEqual(temperature_kelvin, 11606.0, 11606.0) ||
+      !NearlyEqual(inner_radius, 0.8) || !NearlyEqual(outer_radius, 1.0) ||
+      !NearlyEqual(opening_half_angle_deg, 50.0, 50.0)) {
+    ProblemError("dci_3d target must be 1.1 g/cc CH from 0.8--1.0 mm, a 50-degree "
+                 "half-angle, 1e-5 g/cc He, and 11606 K");
   }
 
   const std::string geometry =
@@ -118,19 +135,26 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const Real aperture_radius =
       pin->GetReal("laser", "beam0_aperture_radius");
   const Real target_radius = pin->GetReal("laser", "beam0_target_radius");
+  const Real profile_radius = pin->GetReal("laser", "beam0_profile_radius");
   const Real beam_power = pin->GetReal("laser", "beam0_power");
   const Real wavelength = pin->GetReal("laser", "beam0_wavelength");
   const Real beam_start = pin->GetReal("laser", "beam0_start_time");
   const Real beam_end = pin->GetReal("laser", "beam0_end_time");
+  const int beam_rays = pin->GetInteger("laser", "beam0_nrays");
   const Real pi = std::acos(-1.0);
   const Real projected_inner_radius =
       inner_radius*std::sin(opening_half_angle_deg*pi/180.0);
+  const Real covered_area_fraction =
+      SQR(target_radius/projected_inner_radius);
   if (geometry != "lens" || profile != "gaussian" ||
       !NearlyEqual(lens_x1, pmy_mesh_->mesh_size.x1max,
                    std::abs(pmy_mesh_->mesh_size.x1max)) ||
       !NearlyEqual(target_x1, -inner_radius, inner_radius) ||
       !(aperture_radius > target_radius) || !(target_radius > 0.0) ||
-      target_radius > projected_inner_radius ||
+      target_radius > projected_inner_radius || covered_area_fraction < 0.85 ||
+      covered_area_fraction > 1.0 ||
+      !NearlyEqual(profile_radius, aperture_radius, aperture_radius) ||
+      beam_rays < 4096 ||
       !NearlyEqual(beam_power, 2.0e19, 2.0e19) ||
       !NearlyEqual(wavelength, 1.053e-4, 1.053e-4) ||
       !NearlyEqual(beam_start, 0.0) || !NearlyEqual(beam_end, 5.0, 5.0)) {
@@ -142,11 +166,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int js = indcs.js, je = indcs.je;
   const int ks = indcs.ks, ke = indcs.ke;
   const int nmb1 = pmbp->nmb_thispack - 1;
-  const int scalar_index = pmhd->nmhd;
+  const int scalar_index = pmhd->pmaterials->ScalarIndex();
+  const auto material_mixture = pmhd->pmaterials->DeviceData();
+  const Real code_temperature =
+      material_mixture.CodeTemperatureFromKelvin(temperature_kelvin);
   auto size = pmbp->pmb->mb_size;
   auto w0 = pmhd->w0;
   auto bcc0 = pmhd->bcc0;
-  const Real gm1 = pmhd->peos->eos_data.gamma - 1.0;
   const Real cos_half_angle =
       std::cos(opening_half_angle_deg*pi/180.0);
 
@@ -180,13 +206,16 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real ambient_partial_density = (1.0-alpha)*ambient_density;
     const Real density = ch_partial_density + ambient_partial_density;
     const Real ch_mass_fraction = ch_partial_density/density;
-    const Real pressure = density*temperature;
+    const auto thermo = material_mixture.StateFromRhoTemperatures(
+        density, code_temperature, code_temperature, ch_mass_fraction);
+    const Real internal_energy = density*(thermo.ion_specific_internal_energy +
+                                          thermo.electron_specific_internal_energy);
 
     w0(m, IDN, k, j, i) = density;
     w0(m, IVX, k, j, i) = 0.0;
     w0(m, IVY, k, j, i) = 0.0;
     w0(m, IVZ, k, j, i) = 0.0;
-    w0(m, IEN, k, j, i) = pressure/gm1;
+    w0(m, IEN, k, j, i) = internal_energy;
     w0(m, scalar_index, k, j, i) = ch_mass_fraction;
   });
 
@@ -266,36 +295,39 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   pdata->nhist = kHistoryFields;
   pdata->label[0] = "laser_Edep";
   pdata->label[1] = "laser_Pdep";
-  pdata->label[2] = "mass";
-  pdata->label[3] = "CH_mass";
-  pdata->label[4] = "mat_E";
-  pdata->label[5] = "kin_E";
-  pdata->label[6] = "mag_E";
-  pdata->label[7] = "eion_E";
-  pdata->label[8] = "eele_E";
-  pdata->label[9] = "erad00_E";
-  pdata->label[10] = "erad01_E";
-  pdata->label[11] = "erad02_E";
-  pdata->label[12] = "chain_E";
-  pdata->label[13] = "abs_B";
-  pdata->label[14] = "bier_S";
-  pdata->label[15] = "laser_x";
-  pdata->label[16] = "rad_x";
-  pdata->label[17] = "mix_mass";
-  pdata->label[18] = "mom1";
-  pdata->label[19] = "volume";
+  pdata->label[2] = "rad_Pesc";
+  pdata->label[3] = "mass";
+  pdata->label[4] = "CH_mass";
+  pdata->label[5] = "mat_E";
+  pdata->label[6] = "kin_E";
+  pdata->label[7] = "mag_E";
+  pdata->label[8] = "eion_E";
+  pdata->label[9] = "eele_E";
+  pdata->label[10] = "erad_E";
+  pdata->label[11] = "erad_soft";
+  pdata->label[12] = "erad_mid";
+  pdata->label[13] = "erad_hard";
+  pdata->label[14] = "chain_E";
+  pdata->label[15] = "abs_B";
+  pdata->label[16] = "laser_x";
+  pdata->label[17] = "rad_x";
+  pdata->label[18] = "mix_mass";
+  pdata->label[19] = "mom1";
 
   auto u0 = pmhd->u0;
   auto bcc0 = pmhd->bcc0;
+  auto flx1 = pmhd->uflx.x1f;
+  auto flx2 = pmhd->uflx.x2f;
+  auto flx3 = pmhd->uflx.x3f;
+  auto mb_bcs = pmbp->pmb->mb_bcs;
   auto laser_data = pmbp->plaser->cell_data;
   auto size = pmbp->pmb->mb_size;
-  const int scalar_index = pmhd->nmhd;
+  const int scalar_index = pmhd->pmaterials->ScalarIndex();
   const int iion = ptwo->iion;
   const int iele = ptwo->iele;
   const int ifirst = prad->ifirst;
-  const Real gm1 = pmhd->peos->eos_data.gamma - 1.0;
-  const Real fe = ptwo->ElectronHeatCapacityFraction();
-  const Real biermann_coefficient = pmhd->pbiermann->coefficient;
+  const int ngroups = prad->ngroups;
+  const bool have_flux = pm->ncycle > 0;
 
   auto &indcs = pm->mb_indcs;
   const int is = indcs.is, nx1 = indcs.nx1;
@@ -328,53 +360,71 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
         const Real b2 = bcc0(m, IBY, k, j, i);
         const Real b3 = bcc0(m, IBZ, k, j, i);
         const Real b2sum = b1*b1 + b2*b2 + b3*b3;
-        const Real erad0 = u0(m, ifirst, k, j, i);
-        const Real erad1 = u0(m, ifirst+1, k, j, i);
-        const Real erad2 = u0(m, ifirst+2, k, j, i);
-        const Real erad = erad0 + erad1 + erad2;
-
-        const Real dne_dx1 = fe*(u0(m, IDN, k, j, i+1) -
-                                 u0(m, IDN, k, j, i-1))/(2.0*dx1);
-        const Real dne_dx2 = fe*(u0(m, IDN, k, j+1, i) -
-                                 u0(m, IDN, k, j-1, i))/(2.0*dx2);
-        const Real dne_dx3 = fe*(u0(m, IDN, k+1, j, i) -
-                                 u0(m, IDN, k-1, j, i))/(2.0*dx3);
-        const Real dpe_dx1 = gm1*(u0(m, iele, k, j, i+1) -
-                                  u0(m, iele, k, j, i-1))/(2.0*dx1);
-        const Real dpe_dx2 = gm1*(u0(m, iele, k, j+1, i) -
-                                  u0(m, iele, k, j-1, i))/(2.0*dx2);
-        const Real dpe_dx3 = gm1*(u0(m, iele, k+1, j, i) -
-                                  u0(m, iele, k-1, j, i))/(2.0*dx3);
-        const Real cross1 = dne_dx2*dpe_dx3 - dne_dx3*dpe_dx2;
-        const Real cross2 = dne_dx3*dpe_dx1 - dne_dx1*dpe_dx3;
-        const Real cross3 = dne_dx1*dpe_dx2 - dne_dx2*dpe_dx1;
-        const Real ne = fe*density;
-        const Real biermann_source = biermann_coefficient*
-            sqrt(cross1*cross1 + cross2*cross2 + cross3*cross3)/
-            fmax(ne*ne, 1.0e-60);
+        Real erad = 0.0;
+        Real erad_soft = 0.0;
+        Real erad_mid = 0.0;
+        Real erad_hard = 0.0;
+        Real radiation_escape_power = 0.0;
+        for (int g = 0; g < ngroups; ++g) {
+          const Real group_energy = u0(m, ifirst+g, k, j, i);
+          erad += group_energy;
+          if (g <= 6) {
+            erad_soft += group_energy;
+          } else if (g <= 13) {
+            erad_mid += group_energy;
+          } else {
+            erad_hard += group_energy;
+          }
+          if (have_flux) {
+            if (i == is &&
+                mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::outflow) {
+              radiation_escape_power -= dx2*dx3*flx1(m, ifirst+g, k, j, is);
+            }
+            if (i == is+nx1-1 &&
+                mb_bcs.d_view(m, BoundaryFace::outer_x1) == BoundaryFlag::outflow) {
+              radiation_escape_power += dx2*dx3*flx1(m, ifirst+g, k, j, is+nx1);
+            }
+            if (j == js &&
+                mb_bcs.d_view(m, BoundaryFace::inner_x2) == BoundaryFlag::outflow) {
+              radiation_escape_power -= dx1*dx3*flx2(m, ifirst+g, k, js, i);
+            }
+            if (j == js+nx2-1 &&
+                mb_bcs.d_view(m, BoundaryFace::outer_x2) == BoundaryFlag::outflow) {
+              radiation_escape_power += dx1*dx3*flx2(m, ifirst+g, k, js+nx2, i);
+            }
+            if (k == ks &&
+                mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::outflow) {
+              radiation_escape_power -= dx1*dx2*flx3(m, ifirst+g, ks, j, i);
+            }
+            if (k == ks+nx3-1 &&
+                mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::outflow) {
+              radiation_escape_power += dx1*dx2*flx3(m, ifirst+g, ks+nx3, j, i);
+            }
+          }
+        }
         const Real bounded_xch = fmin(fmax(xch, 0.0), 1.0);
 
         array_sum::GlobalSum local;
         local.the_array[0] = volume*laser_data(m, 1, k, j, i);
         local.the_array[1] = volume*laser_data(m, 0, k, j, i);
-        local.the_array[2] = volume*density;
-        local.the_array[3] = volume*u0(m, scalar_index, k, j, i);
-        local.the_array[4] = volume*u0(m, IEN, k, j, i);
-        local.the_array[5] = volume*0.5*momentum_squared/density;
-        local.the_array[6] = volume*0.5*b2sum;
-        local.the_array[7] = volume*u0(m, iion, k, j, i);
-        local.the_array[8] = volume*u0(m, iele, k, j, i);
-        local.the_array[9] = volume*erad0;
-        local.the_array[10] = volume*erad1;
-        local.the_array[11] = volume*erad2;
-        local.the_array[12] = volume*(u0(m, IEN, k, j, i)+erad);
-        local.the_array[13] = volume*sqrt(b2sum);
-        local.the_array[14] = volume*biermann_source;
-        local.the_array[15] = volume*x1*laser_data(m, 1, k, j, i);
-        local.the_array[16] = volume*x1*erad;
-        local.the_array[17] = volume*density*4.0*bounded_xch*(1.0-bounded_xch);
-        local.the_array[18] = volume*u0(m, IM1, k, j, i);
-        local.the_array[19] = volume;
+        local.the_array[2] = radiation_escape_power;
+        local.the_array[3] = volume*density;
+        local.the_array[4] = volume*u0(m, scalar_index, k, j, i);
+        local.the_array[5] = volume*u0(m, IEN, k, j, i);
+        local.the_array[6] = volume*0.5*momentum_squared/density;
+        local.the_array[7] = volume*0.5*b2sum;
+        local.the_array[8] = volume*u0(m, iion, k, j, i);
+        local.the_array[9] = volume*u0(m, iele, k, j, i);
+        local.the_array[10] = volume*erad;
+        local.the_array[11] = volume*erad_soft;
+        local.the_array[12] = volume*erad_mid;
+        local.the_array[13] = volume*erad_hard;
+        local.the_array[14] = volume*(u0(m, IEN, k, j, i)+erad);
+        local.the_array[15] = volume*sqrt(b2sum);
+        local.the_array[16] = volume*x1*laser_data(m, 1, k, j, i);
+        local.the_array[17] = volume*x1*erad;
+        local.the_array[18] = volume*density*4.0*bounded_xch*(1.0-bounded_xch);
+        local.the_array[19] = volume*u0(m, IM1, k, j, i);
         sum += local;
       }, Kokkos::Sum<array_sum::GlobalSum>(sum_this_rank));
   Kokkos::fence();

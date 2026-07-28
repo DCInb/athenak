@@ -19,6 +19,12 @@ DEFAULT_ARCHIVE = REPOSITORY / "3d_zb.zip"
 DEFAULT_OUTPUT_DIR = CASE_DIR / "material_tables"
 CONVERTER = REPOSITORY / "scripts" / "flash_cn4_to_athenak.py"
 ARCHIVE_SHA256 = "952708009c9e3bc00dc645e11c9c0f804614def9c70cc999b78c92f16c8a96cf"
+EXPECTED_OUTPUT_SHA256 = {
+    "ch.2t_eos": "b29624877c7c90ed1d8c385bef6a7882b106dd8202bf0398301e2dee09faa0d8",
+    "he.2t_eos": "aae12f2dde296992ad630094e5755f7f52baa0816c678771e075f4848a9d63d0",
+    "ch_20g.opacity": "47ee4b8ab3e7f249e4b7108ab5efbaabeee71bb7dd88cdea59f4b4c64738f94d",
+    "he_20g.opacity": "1e0daba15df1a23f5f558663e867dda181886ea53b0dbad119beb6fa1215f420",
+}
 
 OPACITY_TABLES = (
     (
@@ -59,6 +65,13 @@ def sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def repository_relative_or_absolute(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPOSITORY))
+    except ValueError:
+        return str(path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
@@ -86,9 +99,9 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: dict[str, object] = {
-        "archive": str(archive),
+        "archive": repository_relative_or_absolute(archive),
         "archive_sha256": archive_sha,
-        "converter": str(CONVERTER),
+        "converter": repository_relative_or_absolute(CONVERTER),
         "tables": [],
     }
     with zipfile.ZipFile(archive) as source_zip, tempfile.TemporaryDirectory(
@@ -120,6 +133,12 @@ def main() -> int:
             if args.force:
                 command.append("--force")
             subprocess.run(command, cwd=REPOSITORY, check=True)
+            output_sha = sha256_path(output_path)
+            if output_sha != EXPECTED_OUTPUT_SHA256[output_name]:
+                raise RuntimeError(
+                    f"Generated {output_name} SHA-256 mismatch: expected "
+                    f"{EXPECTED_OUTPUT_SHA256[output_name]}, found {output_sha}"
+                )
             manifest["tables"].append(
                 {
                     "kind": "opacity",
@@ -128,7 +147,7 @@ def main() -> int:
                     "archive_member": member,
                     "archive_member_sha256": hashlib.sha256(payload).hexdigest(),
                     "output": output_name,
-                    "output_sha256": sha256_path(output_path),
+                    "output_sha256": output_sha,
                 }
             )
 
@@ -156,6 +175,12 @@ def main() -> int:
             if args.force:
                 command.append("--force")
             subprocess.run(command, cwd=REPOSITORY, check=True)
+            output_sha = sha256_path(output_path)
+            if output_sha != EXPECTED_OUTPUT_SHA256[output_name]:
+                raise RuntimeError(
+                    f"Generated {output_name} SHA-256 mismatch: expected "
+                    f"{EXPECTED_OUTPUT_SHA256[output_name]}, found {output_sha}"
+                )
             manifest["tables"].append(
                 {
                     "kind": "two_temperature_eos",
@@ -164,7 +189,7 @@ def main() -> int:
                     "archive_member": member,
                     "archive_member_sha256": hashlib.sha256(payload).hexdigest(),
                     "output": output_name,
-                    "output_sha256": sha256_path(output_path),
+                    "output_sha256": output_sha,
                 }
             )
 

@@ -113,6 +113,26 @@ void MHD::ApplyDualEnergyFormalism(const Real dt) {
     if (use_materials) {
       const Real y0 = material_mixture.Material0MassFractionFromConserved(
           u0_, m, k, j, i, eos.dfloor);
+      if (material_mixture.UsesTabularEOS()) {
+        const materials::MaterialThermodynamicState state =
+            material_mixture.StateFromRhoSpecificEnergies(
+                dens, eion/dens, eele/dens, y0);
+        const materials::MaterialThermodynamicState floor =
+            material_mixture.MinimumState(dens, y0, eos.pfloor, eos.tfloor);
+        if (eion > 0.0) {
+          eion *= exp(-(state.ion_pressure/eion)*divv*dt);
+        }
+        if (eele > 0.0) {
+          eele *= exp(-(state.electron_pressure/eele)*divv*dt);
+        }
+        eion = fmax(eion, dens*floor.ion_specific_internal_energy);
+        eele = fmax(eele, dens*floor.electron_specific_internal_energy);
+        u0_(m, iion, k, j, i) = eion;
+        u0_(m, iele, k, j, i) = eele;
+        w0_(m, iion, k, j, i) = eion/dens;
+        w0_(m, iele, k, j, i) = eele/dens;
+        return;
+      }
       initial_fraction = material_mixture.InitialElectronEnergyFraction(
           y0, initial_temperature_ratio);
     }
@@ -206,6 +226,42 @@ void MHD::SynchronizeDualEnergyFromTotal() {
     if (use_materials) {
       const Real y0 = material_mixture.Material0MassFractionFromConserved(
           u0_, m, k, j, i, eos.dfloor);
+      if (material_mixture.UsesTabularEOS()) {
+        const materials::MaterialThermodynamicState floor =
+            material_mixture.MinimumState(dens, y0, eos.pfloor, eos.tfloor);
+        const Real eion_floor = dens*floor.ion_specific_internal_energy;
+        const Real eele_floor = dens*floor.electron_specific_internal_energy;
+        const Real minimum_sum = eion_floor+eele_floor;
+        Real eint_aux = component_sum;
+        if (DualEnergySyncEligible(eint_cons, local_etot_max, eta2)) {
+          eint_aux = eint_cons;
+        }
+        eint_aux = fmax(eint_aux, minimum_sum);
+        const materials::MaterialThermodynamicState state =
+            material_mixture.StateFromRhoSpecificEnergies(
+                dens, fmax(eion, eion_floor)/dens,
+                fmax(eele, eele_floor)/dens, y0);
+        const Real pressure_sum = state.ion_pressure+state.electron_pressure;
+        const Real ion_fraction = (pressure_sum > 0.0)
+            ? state.ion_pressure/pressure_sum
+            : ((component_sum > 0.0) ? eion/component_sum : 0.5);
+        const Real residual = eint_aux-component_sum;
+        Real ion_extra = fmax(eion+ion_fraction*residual-eion_floor, 0.0);
+        Real electron_extra = fmax(
+            eele+(1.0-ion_fraction)*residual-eele_floor, 0.0);
+        const Real available = eint_aux-minimum_sum;
+        const Real extra_sum = ion_extra+electron_extra;
+        if (extra_sum > 0.0) {
+          ion_extra *= available/extra_sum;
+          electron_extra *= available/extra_sum;
+        } else {
+          ion_extra = ion_fraction*available;
+          electron_extra = (1.0-ion_fraction)*available;
+        }
+        u0_(m, iion, k, j, i) = eion_floor+ion_extra;
+        u0_(m, iele, k, j, i) = eele_floor+electron_extra;
+        return;
+      }
       initial_fraction = material_mixture.InitialElectronEnergyFraction(
           y0, initial_temperature_ratio);
     }

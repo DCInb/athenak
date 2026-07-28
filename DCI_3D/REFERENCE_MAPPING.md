@@ -2,9 +2,9 @@
 
 This case uses the populated `3d_zb.zip` as a material/physics reference while honoring
 the user's explicit target and laser requirements where the archive conflicts.  The
-document records the target mapping and explicit modeling choices; it does not claim
-that every item is already active in the provisional deck.  Current implementation
-limits are kept in `README.md`.
+document records the target mapping and explicit modeling choices implemented by the two
+DCI decks.  Passing the production acceptance gates remains a separate requirement;
+current evidence and launch controls are described in `README.md`.
 
 The archive audited on 2026-07-28 has:
 
@@ -89,6 +89,11 @@ kappa_mix(rho, Te, Y) = sum_s Y_s kappa_s(rho*Y_s, Te).
 ```
 
 This recovers both pure-material limits and makes the mixing choice testable.
+Geometric interpolation is used in density and temperature.  Smoothed or numerically
+mixed cells can produce partial densities below a pure-material table.  Opacity coordinates
+are clamped to the nearest endpoint.  EOS energy and ionization use the minimum-density
+surface, while trace-material pressure is scaled linearly from that surface to zero as the
+partial density vanishes; this is an explicit part of the AthenaK closure.
 
 `generate_reference_tables.py` verifies the archive hash and converts the separate CH/He
 ion-electron EOS surfaces plus both opacity payloads into ignored local AthenaK tables.
@@ -105,7 +110,11 @@ The 20 reference photon boundaries are, in eV:
 
 The reference uses a harmonic flux limiter with coefficient one and vacuum conditions on
 all radiation faces.  The opacity tables provide Rosseland transport and Planck
-absorption/emission coefficients in cm2/g.
+absorption/emission coefficients in cm2/g.  AthenaK uses its explicit
+asymptotic-preserving face flux and does not inflate opacity.  The production candidate
+uses the documented reduced value `c_hat=1.0e9 cm/s` (about `c/30`) so a 10 ns run is
+feasible; a `c_hat=10` versus `30` compact sensitivity comparison, plus a short physical-c
+check where practical, is a mandatory production gate.
 
 ## Laser comparison
 
@@ -114,13 +123,14 @@ They are inclined approximately 50 degrees from `-z`, have equal 0.275 mm lens/t
 radii (collimated), and use a shaped pulse inferred to integrate to 7.0982 kJ total.
 Those settings demonstrate the archive's ray and symmetry conventions but conflict with
 the requested 1ω Gaussian converging 10 kJ square drive.  The AthenaK laser therefore
-uses the explicit user drive, with incident-energy and deposited-energy closure recorded
-in history output.
+uses one axial 4,096-ray beam with a 0.72 mm Gaussian aperture focused to 0.58 mm at the
+inner cap.  The target spot covers 89.5 percent of the cap's projected area.  Incident,
+deposited, and escaped-radiation power are recorded for energy closure.
 
 ## Exchange and numerical controls
 
 FLASH requests Spitzer electron-ion exchange; no constant exchange time appears in the
-archive.  AthenaK should therefore use the state- and mixture-dependent Spitzer option.
+archive.  AthenaK therefore uses the state- and mixture-dependent Spitzer option.
 Dual energy is enabled because the user explicitly requires it even though the archived
 runtime default for FLASH's auxiliary-energy equation is unavailable.
 

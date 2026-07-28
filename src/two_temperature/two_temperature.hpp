@@ -33,6 +33,14 @@ class ThermalRadiation;
 
 class TwoTemperature {
  public:
+  enum ThermodynamicField : int {
+    ion_pressure = 0,
+    electron_pressure = 1,
+    electron_number_density_cgs = 2,
+    mean_ionization = 3,
+    sound_speed_squared = 4
+  };
+  static constexpr int nthermodynamic_fields = 5;
   TwoTemperature(const std::string &block, MeshBlockPack *ppack, ParameterInput *pin,
                  int first_component_index,
                  materials::MaterialMixture *material_mixture = nullptr);
@@ -43,6 +51,7 @@ class TwoTemperature {
 
   // component 0 = ion temperature, component 1 = electron temperature
   DvceArray5D<Real> temperature;
+  DvceArray5D<Real> thermodynamics;
 
   // Optional FLASH-like thermal multigroup radiation model.
   ThermalRadiation *pradiation = nullptr;
@@ -85,6 +94,9 @@ class TwoTemperature {
   Real density_scale_cgs_ = 1.0;
   Real velocity_squared_cgs_ = 1.0;
   Real time_scale_cgs_ = 1.0;
+  Real density_floor_ = 0.0;
+  Real pressure_floor_ = 0.0;
+  Real temperature_floor_ = 0.0;
 };
 
 } // namespace two_temperature
