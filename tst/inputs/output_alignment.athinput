@@ -48,14 +48,16 @@ pgen_name = shock_tube
 shock_dir = 1
 xshock    = 0.0
 
+# A uniform state gives a constant CFL limit. Exact 0.1-time output events then
+# alternate one CFL step with one event remainder throughout the run.
 dl = 1.0
 pl = 1.0
 ul = 0.0
 vl = 0.0
 wl = 0.0
 
-dr = 0.125
-pr = 0.1
+dr = 1.0
+pr = 1.0
 ur = 0.0
 vr = 0.0
 wr = 0.0
@@ -67,3 +69,12 @@ data_format = %12.5e
 dt          = 0.1
 slice_x2    = 0.0
 slice_x3    = 0.0
+
+<output2>
+file_type   = hst
+data_format = %20.12e
+dcycle      = 1
+
+<output3>
+file_type   = rst
+dt          = 0.3

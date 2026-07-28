@@ -36,8 +36,33 @@ void Laser::AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) {
 }
 
 TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
+  stage_has_power_ = UpdateBeamPowers(pmy_pack_->pmesh->time, pmy_pack_->pmesh->dt);
+  diagnostics_ = LaserDiagnostics();
+  if (!stage_has_power_) {
+    transport_state_ = LaserTransportState::finished;
+    if (!instantaneous_data_zero_) {
+      ClearInstantaneousData(false);
+      instantaneous_data_zero_ = true;
+    }
+    return TaskStatus::complete;
+  }
+
+  instantaneous_data_zero_ = false;
   RefreshGlobalBlockInfo();
-  // Keep cumulative deposited energy (component 1), but clear per-stage diagnostics.
+  ClearInstantaneousData(stage == 1);
+  Kokkos::deep_copy(device_diagnostics_, 0.0);
+  Kokkos::deep_copy(device_counters_, 0);
+  transport_state_ = LaserTransportState::trace_local;
+  mpi_wave_ = 0;
+  InitializeRays();
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! Clear instantaneous diagnostics while retaining cumulative deposited energy. At the
+//! first stage, save the old cumulative field for the low-storage RK recurrence.
+
+void Laser::ClearInstantaneousData(bool capture_cumulative_start) {
   auto data = cell_data;
   auto energy_start = cumulative_energy_start_;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
@@ -46,24 +71,19 @@ TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
           indcs.ks, indcs.ke, indcs.js, indcs.je, indcs.is, indcs.ie,
   KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
     if (n != 1) data(m, n, k, j, i) = 0.0;
-    if (stage == 1 && n == 1) {
+    if (capture_cumulative_start && n == 1) {
       energy_start(m, 0, k, j, i) = data(m, 1, k, j, i);
     }
   });
-  Kokkos::deep_copy(device_diagnostics_, 0.0);
-  Kokkos::deep_copy(device_counters_, 0);
-  diagnostics_ = LaserDiagnostics();
-  transport_state_ = LaserTransportState::trace_local;
-  mpi_wave_ = 0;
-  InitializeRays(pmy_pack_->pmesh->time);
-  return TaskStatus::complete;
 }
 
 TaskStatus Laser::TraceAndDeposit(Driver *pdrive, int stage) {
+  if (!stage_has_power_) return TaskStatus::complete;
   return AdvanceDistributedTransport();
 }
 
 TaskStatus Laser::ApplySource(Driver *pdrive, int stage) {
+  if (!stage_has_power_) return TaskStatus::complete;
   Real beta_dt = pdrive->beta[stage-1]*pmy_pack_->pmesh->dt;
   Real gam0 = pdrive->gam0[stage-1];
   Real gam1 = pdrive->gam1[stage-1];

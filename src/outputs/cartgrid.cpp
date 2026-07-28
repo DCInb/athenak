@@ -142,11 +142,6 @@ void CartesianGridOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
   // increment counters
   out_params.file_number++;
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
+  AdvanceOutputSchedule(pm, pin);
   pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
 }

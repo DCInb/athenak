@@ -8,6 +8,7 @@
 //! \file outputs.hpp
 //  \brief provides classes to handle ALL types of data output
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -241,6 +242,10 @@ class BaseTypeOutput {
   virtual void LoadOutputData(Mesh *pm);
   virtual void WriteOutputFile(Mesh *pm, ParameterInput *pin) = 0;
 
+  // Advance time-based output cadence without accumulating one floating-point
+  // addition of roundoff per output.
+  void AdvanceOutputSchedule(Mesh *pm, ParameterInput *pin);
+
   // Functions to detect big endian machine, and to byte-swap 32-bit words.  The vtk
   // legacy format requires data to be stored as big-endian.
   int IsBigEndian() {
@@ -255,6 +260,9 @@ class BaseTypeOutput {
   }
 
  protected:
+  long double schedule_origin_;
+  std::uint64_t schedule_index_;
+
   // CC output data on host with dims (n,m,k,j,i) except
   // for restarts, where dims are (m,n,k,j,i)
   HostArray5D<Real> outarray;

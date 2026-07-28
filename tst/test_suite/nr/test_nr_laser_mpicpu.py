@@ -1,5 +1,6 @@
 """MPI migration regression tests for the two-temperature laser module."""
 
+import os
 import shutil
 
 import numpy as np
@@ -16,7 +17,7 @@ input_file = "../../../inputs/mhd/two_temperature_laser.athinput"
 pulse_file = "../../../tst/inputs/laser_multiknot.pulse"
 
 
-def run_mpi_case(basename, ranks, flags):
+def run_mpi_case(basename, ranks, flags, dump=1):
     common = [
         f"job/basename={basename}",
         "time/integrator=rk1",
@@ -30,13 +31,15 @@ def run_mpi_case(basename, ranks, flags):
     assert testutils.mpi_run(
         input_file, flags=common + flags, threads=ranks), (
             f"{basename} failed with {ranks} MPI ranks.")
-    return read_laser_binary(f"bin/{basename}.laser_full.00001.bin")
+    return read_laser_binary(f"bin/{basename}.laser_full.{dump:05d}.bin")
 
 
 def fields(output):
     return {
         name: assemble_binary_field(output, name)
-        for name in ("laser_q", "laser_ray_count", "laser_tau", "laser_path")
+        for name in (
+            "laser_q", "laser_energy", "laser_ray_count", "laser_tau", "laser_path"
+        )
     }
 
 
@@ -116,6 +119,32 @@ def test_run():
         lens_parallel = fields(run_mpi_case(
             "laser_mpi_lens_pulse_2", 2, lens_flags))
         compare_fields(lens_parallel, lens_reference)
+
+        # Both ranks take the same active-to-inactive branch. Only the two powered
+        # RK2 stages run transport; the following dark stages preserve cumulative energy.
+        offpulse_flags = [
+            "time/integrator=rk2",
+            "time/initial_dt=1.0e-6",
+            "time/tlim=2.0e-6",
+            "output4/dt=1.0e-6",
+            "laser/beam0_nrays=13",
+            "laser/absorption_coefficient=2.0",
+            f"laser/beam0_pulse_file={pulse_file}",
+            "laser/beam0_pulse_mode=relative",
+        ]
+        offpulse_results = []
+        for ranks in (1, 2):
+            log_offset = os.path.getsize(testutils.LOG_FILE_PATH)
+            result = fields(run_mpi_case(
+                f"laser_mpi_offpulse_{ranks}", ranks, offpulse_flags, dump=2))
+            with open(testutils.LOG_FILE_PATH, encoding="utf-8") as stream:
+                stream.seek(log_offset)
+                appended_log = stream.read()
+            assert appended_log.count("laser: launched=") == 2
+            assert np.count_nonzero(result["laser_q"]) == 0
+            assert np.any(result["laser_energy"] > 0.0)
+            offpulse_results.append(result)
+        compare_fields(offpulse_results[1], offpulse_results[0])
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

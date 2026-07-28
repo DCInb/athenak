@@ -87,7 +87,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   wall_time(wtlim),
   nmb_updated_(0),
   npart_updated_(0),
-  lb_efficiency_(0) {
+  lb_efficiency_(0),
+  physics_dt_(-1.0) {
   // set time-evolution option (no default)
   {
     std::string evolution_t = pin->GetString("time","evolution");
@@ -419,6 +420,12 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   radiation::Radiation *prad = pmesh->pmb_pack->prad;
   z4c::Z4c *pz4c = pmesh->pmb_pack->pz4c;
   if (time_evolution != TimeEvolution::tstatic) {
+    // A restart may have been written after a deliberately tiny terminal-alignment
+    // step. Recompute its first physical timestep from the restored state instead of
+    // applying the normal 2x growth limiter to that event remainder.
+    if (res_flag && align_outputs) {
+      pmesh->dt = std::numeric_limits<float>::max();
+    }
     if (phydro != nullptr) {
       (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
     }
@@ -436,6 +443,7 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
     if (!res_flag && initial_dt > 0.0) {
       pmesh->dt = std::min(pmesh->dt, initial_dt);
     }
+    physics_dt_ = pmesh->dt;
   }
 
   //---- Step 3.  Cycle through output Types and load data / write files.
@@ -557,7 +565,11 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // AMR
       if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
       // compute new timestep AFTER all Meshblocks refined/derefined
+      // Use the previous unconstrained physics timestep for the 2x growth limiter.
+      // The completed pmesh->dt may be a much smaller output-alignment remainder.
+      if (physics_dt_ > 0.0) pmesh->dt = physics_dt_;
       pmesh->NewTimeStep(tlim);
+      physics_dt_ = pmesh->dt;
       LimitTimeStepToNextOutput(pmesh, pout);
 
       // Update wall clock time if needed.

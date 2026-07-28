@@ -257,14 +257,7 @@ void Laser::BuildInitialRays() {
 //----------------------------------------------------------------------------------------
 //! Restore immutable launch data and map every live ray into a local MeshBlock/cell.
 
-void Laser::InitializeRays(Real time) {
-  auto host_beam_power = Kokkos::create_mirror_view(beam_power_);
-  Real dt = pmy_pack_->pmesh->dt;
-  for (std::size_t b = 0; b < beams_.size(); ++b) {
-    host_beam_power(static_cast<int>(b)) = BeamPowerForStep(beams_[b], time, dt);
-  }
-  Kokkos::deep_copy(beam_power_, host_beam_power);
-
+void Laser::InitializeRays() {
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
   auto global_blocks = global_block_info_;

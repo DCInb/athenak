@@ -58,6 +58,21 @@ Fluid, two-temperature, and laser binary dumps are aligned exactly every 0.1 ns.
 Restarts are written every 1 ns. The first phase lands exactly on the 5 ns pulse edge;
 `run_case.py` restarts with the laser disabled and advances the same state to 10 ns.
 
+### Long pauses and lower-I/O diagnostics
+
+The completed production run wrote 1.2 TiB to the network filesystem. Each 0.1 ns
+output event writes an 11.648 GB triplet (fluid, two-temperature, and laser), and each
+1 ns restart is 11.350 GB. Measured output pauses were about 194--487 seconds, during
+which the cycle log does not advance even though the MPI job is still writing. A long
+pause near a scheduled output time is therefore expected and is not evidence of a
+deadlock. Check file sizes and timestamps in the run directory before stopping the job.
+
+For iteration runs, increase `output2/dt`, `output3/dt`, and `output4/dt`, and disable
+restarts with `output5/dt = -1.0`. For a much smaller visualization run, use a scratch
+copy of the input and add `slice_x3 = 0.0` to outputs 2--4; this writes the central
+`x1-x2` plane instead of all 112 million cells. Keep the production settings for the
+full 3D acceptance analysis.
+
 ## Ray visualization
 
 Render the exact configured launch bundle and, when matching production dumps exist,
@@ -98,10 +113,11 @@ reflections, motivating the explicit one-reflection and 64-wave transport bounds
 bounded configuration completed a 1,200-cycle full-grid qualification through 0.314 ns
 in 565 seconds. The generated launch and traced-path images are under `plots/`.
 
-The revised 112-million-cell, 0-10 ns production run is not yet represented by those
-diagnostic images. `analyze_run.py` is the acceptance check for completion, output and
-restart cadence, geometry, 300 K fields, right-side incidence, transport, and per-GPU
-memory use.
+The revised 112-million-cell run subsequently completed both phases through 10 ns.
+`analyze_run.py` passes its checks for completion, output and restart cadence, geometry,
+300 K fields, right-side incidence, transport, and per-GPU memory use. The phase runtimes
+were 18,491 seconds laser-on and 15,044 seconds laser-off; most of the visible multi-minute
+pauses in the latter were synchronous output writes rather than hydrodynamic work.
 
 ## Model limits
 

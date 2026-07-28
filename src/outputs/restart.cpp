@@ -191,13 +191,8 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   }
   // increment counters now so values for *next* dump are stored in restart file
   out_params.file_number++;
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
+  AdvanceOutputSchedule(pm, pin);
   pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
 
   // create string holding input parameters (copy of input file)
   std::stringstream ost;

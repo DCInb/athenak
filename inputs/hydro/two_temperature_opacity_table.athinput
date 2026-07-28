@@ -62,6 +62,10 @@ group_bound_2 = 100.0
 opacity_model = table
 opacity_table_file = inputs/hydro/two_temperature_opacity_table.dat
 opacity_interpolation = linear
+opacity_density_scale = 1.0
+opacity_temperature_scale = 1.0
+opacity_group_bound_scale = 1.0
+opacity_value_scale = 1.0
 
 <problem>
 pgen_name = shock_tube

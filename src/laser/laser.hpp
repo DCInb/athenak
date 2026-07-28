@@ -147,8 +147,10 @@ class Laser {
   void BuildInitialRays();
   Real BeamPowerAtTime(const BeamConfig &beam, Real time) const;
   Real BeamPowerForStep(const BeamConfig &beam, Real time, Real dt) const;
+  bool UpdateBeamPowers(Real time, Real dt);
+  void ClearInstantaneousData(bool capture_cumulative_start);
   void RefreshGlobalBlockInfo();
-  void InitializeRays(Real time);
+  void InitializeRays();
   void TraceStraightRays(bool preserve_off_rank = false);
   void TraceRefractiveRays(bool preserve_off_rank = false);
   void CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next);
@@ -197,6 +199,8 @@ class Laser {
   Real refractive_curvature_fraction_ = 0.25;
   Real refractive_tau_max_ = 0.25;
   Real dispersion_tolerance_ = 1.0e-3;
+  bool stage_has_power_ = false;
+  bool instantaneous_data_zero_ = true;
 
   DvceArray1D<Real> ray_x0_, ray_y0_, ray_z0_;
   DvceArray1D<Real> ray_nx0_, ray_ny0_, ray_nz0_;

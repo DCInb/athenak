@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -113,13 +114,19 @@ class TableTokens {
   std::size_t position_ = 0;
 };
 
+std::size_t TableValueIndex(int kind, int group, int density, int temperature,
+                            int ngroups, int ndensity, int ntemperature) {
+  return ((static_cast<std::size_t>(kind)*ngroups+group)*ndensity+density)*ntemperature+
+         temperature;
+}
+
 [[noreturn]] void OpacityTableError(const std::string &filename,
                                     const std::string &message) {
   std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
             << std::endl << "Opacity table '" << filename << "': " << message
             << std::endl;
-  // A failure here can be rank-local (e.g. file unreadable on one node); abort the
-  // whole job rather than leaving other ranks blocked in collectives.
+  // Rank 0 can fail while other ranks are blocked in a broadcast. Abort the whole job
+  // rather than leaving those ranks waiting in a collective.
 #if MPI_PARALLEL_ENABLED
   MPI_Abort(MPI_COMM_WORLD, 1);
 #endif
@@ -176,98 +183,195 @@ OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
       "thermal_radiation", "opacity_absorption_scale", opacity_scale);
   emission_scale_ = pin->GetOrAddReal(
       "thermal_radiation", "opacity_emission_scale", opacity_scale);
+  if (!std::isfinite(density_scale_) || !std::isfinite(temperature_scale_) ||
+      !std::isfinite(group_scale) || !std::isfinite(opacity_scale) ||
+      !std::isfinite(transport_scale_) || !std::isfinite(absorption_scale_) ||
+      !std::isfinite(emission_scale_)) {
+    OpacityTableError(filename, "all opacity-table scales must be finite");
+  }
   if (density_scale_ <= 0.0 || temperature_scale_ <= 0.0 || group_scale <= 0.0 ||
-      transport_scale_ <= 0.0 || absorption_scale_ < 0.0 || emission_scale_ < 0.0) {
-    OpacityTableError(filename, "coordinate scales must be positive, the transport scale "
-                      "must be positive, and source-opacity scales must be non-negative");
+      opacity_scale <= 0.0 || transport_scale_ <= 0.0 || absorption_scale_ < 0.0 ||
+      emission_scale_ < 0.0) {
+    OpacityTableError(filename,
+                      "coordinate, common opacity, and transport scales must be "
+                      "positive, and source-opacity scales must be non-negative");
   }
 
-  try {
-    std::vector<std::string> raw_tokens = ReadTokens(filename);
-    TableTokens tokens(raw_tokens);
-    tokens.Expect("athenak_opacity_table");
-    int version = tokens.Integer("format version");
-    if (version != 1) throw std::runtime_error("only format version 1 is supported");
+  std::vector<Real> density_values;
+  std::vector<Real> temperature_values;
+  std::vector<Real> group_bound_values;
+  std::vector<Real> opacity_values;
+  bool read_file = true;
+#if MPI_PARALLEL_ENABLED
+  read_file = (global_variable::my_rank == 0);
+#endif
 
-    tokens.Expect("dimensions");
-    ndensity_ = tokens.Integer("density dimension");
-    ntemperature_ = tokens.Integer("temperature dimension");
-    int table_groups = tokens.Integer("group dimension");
-    if (ndensity_ < 1 || ntemperature_ < 1) {
-      throw std::runtime_error("density and temperature dimensions must be positive");
-    }
-    if (table_groups != ngroups_) {
-      throw std::runtime_error(
-          "group dimension does not match <thermal_radiation>/n_groups");
-    }
-    if (ndensity_ > 100000 || ntemperature_ > 100000 ||
-        static_cast<std::size_t>(ndensity_)*ntemperature_*table_groups > 100000000U) {
-      throw std::runtime_error("table dimensions are unreasonably large");
-    }
+  if (read_file) {
+    try {
+      std::vector<std::string> raw_tokens = ReadTokens(filename);
+      TableTokens tokens(raw_tokens);
+      tokens.Expect("athenak_opacity_table");
+      int version = tokens.Integer("format version");
+      if (version != 1) throw std::runtime_error("only format version 1 is supported");
 
-    Kokkos::realloc(density_, ndensity_);
-    Kokkos::realloc(temperature_, ntemperature_);
-    Kokkos::realloc(values_, 3, ngroups_, ndensity_, ntemperature_);
-
-    tokens.Expect("density");
-    for (int id = 0; id < ndensity_; ++id) {
-      Real value = tokens.Number("density coordinate");
-      if (value <= 0.0 || (id > 0 && value <= density_.h_view(id-1))) {
-        throw std::runtime_error("density coordinates must be positive and increasing");
+      tokens.Expect("dimensions");
+      ndensity_ = tokens.Integer("density dimension");
+      ntemperature_ = tokens.Integer("temperature dimension");
+      int table_groups = tokens.Integer("group dimension");
+      if (ndensity_ < 1 || ntemperature_ < 1) {
+        throw std::runtime_error("density and temperature dimensions must be positive");
       }
-      density_.h_view(id) = value;
-    }
-
-    tokens.Expect("temperature");
-    for (int it = 0; it < ntemperature_; ++it) {
-      Real value = tokens.Number("electron-temperature coordinate");
-      if (value < 0.0 || (it > 0 && value <= temperature_.h_view(it-1))) {
+      if (table_groups != ngroups_) {
         throw std::runtime_error(
-            "electron-temperature coordinates must be non-negative and increasing");
+            "group dimension does not match <thermal_radiation>/n_groups");
       }
-      temperature_.h_view(it) = value;
-    }
-
-    tokens.Expect("group_bound");
-    for (int g = 0; g <= ngroups_; ++g) {
-      Real converted = group_scale*tokens.Number("radiation group boundary");
-      Real expected = expected_group_bounds.h_view(g);
-      Real magnitude =
-          std::max(static_cast<Real>(1.0),
-                   std::max(std::abs(converted), std::abs(expected)));
-      if (std::abs(converted-expected) > 1.0e-10*magnitude) {
-        throw std::runtime_error(
-            "radiation group boundaries do not match the input file");
+      std::size_t table_cells =
+          static_cast<std::size_t>(ndensity_)*ntemperature_*ngroups_;
+      if (ndensity_ > 100000 || ntemperature_ > 100000 || table_cells > 100000000U) {
+        throw std::runtime_error("table dimensions are unreasonably large");
       }
-    }
 
-    const char *labels[3] = {"transport", "absorption", "emission"};
-    for (int kind = 0; kind < 3; ++kind) {
-      tokens.Expect(labels[kind]);
-      for (int g = 0; g < ngroups_; ++g) {
-        for (int id = 0; id < ndensity_; ++id) {
-          for (int it = 0; it < ntemperature_; ++it) {
-            Real value = tokens.Number(std::string(labels[kind]) + " opacity");
-            if ((kind == opacity_transport && value <= 0.0) || value < 0.0) {
-              throw std::runtime_error(
-                  "transport opacity must be positive and source opacities non-negative");
+      density_values.resize(ndensity_);
+      temperature_values.resize(ntemperature_);
+      group_bound_values.resize(ngroups_+1);
+      opacity_values.resize(3*table_cells);
+
+      tokens.Expect("density");
+      for (int id = 0; id < ndensity_; ++id) {
+        Real value = tokens.Number("density coordinate");
+        if (value <= 0.0 || (id > 0 && value <= density_values[id-1])) {
+          throw std::runtime_error("density coordinates must be positive and increasing");
+        }
+        density_values[id] = value;
+      }
+
+      tokens.Expect("temperature");
+      for (int it = 0; it < ntemperature_; ++it) {
+        Real value = tokens.Number("electron-temperature coordinate");
+        if (value < 0.0 || (it > 0 && value <= temperature_values[it-1])) {
+          throw std::runtime_error(
+              "electron-temperature coordinates must be non-negative and increasing");
+        }
+        temperature_values[it] = value;
+      }
+
+      tokens.Expect("group_bound");
+      for (int g = 0; g <= ngroups_; ++g) {
+        Real converted = group_scale*tokens.Number("radiation group boundary");
+        if (!std::isfinite(converted)) {
+          throw std::runtime_error("scaled radiation group boundaries must be finite");
+        }
+        group_bound_values[g] = converted;
+      }
+
+      const char *labels[3] = {"transport", "absorption", "emission"};
+      const Real scales[3] = {transport_scale_, absorption_scale_, emission_scale_};
+      for (int kind = 0; kind < 3; ++kind) {
+        tokens.Expect(labels[kind]);
+        for (int g = 0; g < ngroups_; ++g) {
+          for (int id = 0; id < ndensity_; ++id) {
+            for (int it = 0; it < ntemperature_; ++it) {
+              Real value = tokens.Number(std::string(labels[kind]) + " opacity");
+              if ((kind == opacity_transport && value <= 0.0) || value < 0.0) {
+                throw std::runtime_error(
+                    "transport opacity must be positive and source opacities "
+                    "non-negative");
+              }
+              Real scaled_value = value*scales[kind];
+              if (!std::isfinite(scaled_value) ||
+                  (kind == opacity_transport && !(scaled_value > 0.0)) ||
+                  (kind != opacity_transport && scaled_value < 0.0)) {
+                throw std::runtime_error(
+                    "scaled transport opacity must be finite and positive and "
+                    "scaled source opacities finite and non-negative");
+              }
+              if (log_interpolation_ && value <= 0.0) {
+                throw std::runtime_error(
+                    "log interpolation requires every tabulated opacity to be positive");
+              }
+              std::size_t index = TableValueIndex(
+                  kind, g, id, it, ngroups_, ndensity_, ntemperature_);
+              opacity_values[index] = log_interpolation_ ? std::log(value) : value;
             }
-            if (log_interpolation_ && value <= 0.0) {
-              throw std::runtime_error(
-                  "log interpolation requires every tabulated opacity to be positive");
-            }
-            values_.h_view(kind, g, id, it) =
-                log_interpolation_ ? std::log(value) : value;
           }
         }
       }
+      tokens.Expect("end");
+      if (!tokens.Done()) {
+        throw std::runtime_error("unexpected data follows the end marker");
+      }
+    } catch (const std::exception &error) {
+      OpacityTableError(filename, error.what());
     }
-    tokens.Expect("end");
-    if (!tokens.Done()) {
-      throw std::runtime_error("unexpected data follows the end marker");
+  }
+
+#if MPI_PARALLEL_ENABLED
+  int dimensions[3] = {ndensity_, ntemperature_, ngroups_};
+  int ierr = MPI_Bcast(dimensions, 3, MPI_INT, 0, MPI_COMM_WORLD);
+  if (ierr != MPI_SUCCESS) OpacityTableError(filename, "could not broadcast dimensions");
+  ndensity_ = dimensions[0];
+  ntemperature_ = dimensions[1];
+  if (ndensity_ < 1 || ntemperature_ < 1 || dimensions[2] != ngroups_) {
+    OpacityTableError(filename, "broadcast opacity-table dimensions are invalid");
+  }
+  std::size_t table_cells = static_cast<std::size_t>(ndensity_)*ntemperature_*ngroups_;
+  std::size_t nvalues_size = 3*table_cells;
+  if (ndensity_ > 100000 || ntemperature_ > 100000 || table_cells > 100000000U ||
+      nvalues_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    OpacityTableError(filename, "broadcast opacity table is unreasonably large");
+  }
+  int nvalues = static_cast<int>(nvalues_size);
+  if (!read_file) {
+    density_values.resize(ndensity_);
+    temperature_values.resize(ntemperature_);
+    group_bound_values.resize(ngroups_+1);
+    opacity_values.resize(nvalues);
+  }
+  ierr = MPI_Bcast(density_values.data(), ndensity_, MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+  if (ierr == MPI_SUCCESS) {
+    ierr = MPI_Bcast(temperature_values.data(), ntemperature_,
+                     MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+  }
+  if (ierr == MPI_SUCCESS) {
+    ierr = MPI_Bcast(group_bound_values.data(), ngroups_+1,
+                     MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+  }
+  if (ierr == MPI_SUCCESS) {
+    ierr = MPI_Bcast(opacity_values.data(), nvalues, MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+  }
+  if (ierr != MPI_SUCCESS) {
+    OpacityTableError(filename, "could not broadcast opacity-table values");
+  }
+#endif
+
+  for (int g = 0; g <= ngroups_; ++g) {
+    Real converted = group_bound_values[g];
+    Real expected = expected_group_bounds.h_view(g);
+    Real magnitude = std::max(static_cast<Real>(1.0),
+                              std::max(std::abs(converted), std::abs(expected)));
+    if (std::abs(converted-expected) > 1.0e-10*magnitude) {
+      OpacityTableError(filename,
+                        "radiation group boundaries do not match the input file");
     }
-  } catch (const std::exception &error) {
-    OpacityTableError(filename, error.what());
+  }
+
+  Kokkos::realloc(density_, ndensity_);
+  Kokkos::realloc(temperature_, ntemperature_);
+  Kokkos::realloc(values_, 3, ngroups_, ndensity_, ntemperature_);
+  for (int id = 0; id < ndensity_; ++id) density_.h_view(id) = density_values[id];
+  for (int it = 0; it < ntemperature_; ++it) {
+    temperature_.h_view(it) = temperature_values[it];
+  }
+  for (int kind = 0; kind < 3; ++kind) {
+    for (int g = 0; g < ngroups_; ++g) {
+      for (int id = 0; id < ndensity_; ++id) {
+        for (int it = 0; it < ntemperature_; ++it) {
+          std::size_t index = TableValueIndex(
+              kind, g, id, it, ngroups_, ndensity_, ntemperature_);
+          values_.h_view(kind, g, id, it) = opacity_values[index];
+        }
+      }
+    }
   }
 
   density_.modify_host();

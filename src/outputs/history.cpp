@@ -447,11 +447,6 @@ void HistoryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   } // End loop over hist_data vector
 
   // increment counters, clean up
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  AdvanceOutputSchedule(pm, pin);
   return;
 }

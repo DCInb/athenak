@@ -200,19 +200,31 @@ opacity_temperature_scale = 1.0
 # Multiply stored bounds before comparing them with group_bound_g.
 opacity_group_bound_scale = 1.0
 
-# Convert stored mass opacities back to code units.  Per-kind values override the common
-# scale and correspond to FLASH's transport, absorption, and emission scale factors.
+# Convert every stored mass opacity back to code units.
 opacity_value_scale = 1.0
+
+# Alternatively, set one or more per-kind overrides. These correspond to FLASH's
+# transport, absorption, and emission scale factors and take precedence over the
+# common opacity_value_scale when present.
 opacity_transport_scale = 1.0
 opacity_absorption_scale = 1.0
 opacity_emission_scale = 1.0
 ```
+
+Every scale must be finite. Density, temperature, group-bound, common opacity, and
+transport scales must be positive. Absorption and emission scales may be zero but must not
+be negative.
 
 The supplied example table is intentionally nonlinear and can be run with either linear
 or log interpolation.  The format stores only radiation opacity data rather than the
 unrelated EOS arrays required by an IONMIX file; IONMIX data can be converted by writing
 its density/temperature axes, group boundaries, Rosseland opacity, Planck absorption,
 and Planck emission in the order above.
+
+In an MPI build, rank 0 alone opens, parses, and validates the opacity file. It broadcasts
+the dimensions, density and electron-temperature axes, converted group boundaries, and
+the three opacity arrays before each rank initializes its device views. The file therefore
+only needs to be accessible to rank 0.
 
 `source_cfl > 0` limits the fractional electron-energy change for accuracy.  The local
 source update remains positive and conservative without this limit.  Set

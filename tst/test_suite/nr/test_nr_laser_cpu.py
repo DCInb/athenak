@@ -1,5 +1,6 @@
 """Regression tests for device DDA laser-ray transport and 2T deposition."""
 
+import os
 import shutil
 
 import numpy as np
@@ -245,6 +246,32 @@ def run_absorption_case(basename, flags):
     initial = sorted_tab(f"tab/{basename}.two_temperature.00000.tab")
     final = sorted_tab(f"tab/{basename}.two_temperature.00001.tab")
     return laser, initial, final
+
+
+def run_offpulse_case(basename, coefficient):
+    log_offset = os.path.getsize(testutils.LOG_FILE_PATH)
+    flags = [
+        f"job/basename={basename}",
+        "time/integrator=rk2",
+        f"time/initial_dt={SOURCE_DT}",
+        f"time/tlim={2.0*SOURCE_DT}",
+        "output1/dt=-1.0",
+        f"output2/dt={SOURCE_DT}",
+        f"output3/dt={SOURCE_DT}",
+        "output4/dt=-1.0",
+        f"laser/absorption_coefficient={coefficient}",
+        f"laser/beam0_pulse_file={pulse_file}",
+        "laser/beam0_pulse_mode=relative",
+    ]
+    assert testutils.run(input_file, flags=flags), (
+        f"{basename} active-to-inactive laser run failed.")
+    with open(testutils.LOG_FILE_PATH, encoding="utf-8") as stream:
+        stream.seek(log_offset)
+        appended_log = stream.read()
+    assert appended_log.count("laser: launched=") == 2
+    active = sorted_tab(f"tab/{basename}.laser.00001.tab")
+    inactive = sorted_tab(f"tab/{basename}.laser.00002.tab")
+    return active, inactive
 
 
 def constant_absorption_profile(x1, coefficient):
@@ -507,6 +534,18 @@ def test_run():
             laser["x1v"], coefficient)
         assert np.allclose(laser["laser_q"], expected_q,
                            rtol=2.0e-11, atol=2.0e-13)
+
+        # The first dark step clears instantaneous diagnostics once, bypasses both
+        # RK-stage transports, and retains the cumulative deposited energy.
+        active, inactive = run_offpulse_case("laser_offpulse", coefficient)
+        assert np.any(active["laser_q"] > 0.0)
+        assert np.array_equal(inactive["laser_energy"], active["laser_energy"])
+        for name in (
+                "laser_q", "laser_ray_count", "laser_tau", "laser_path",
+                "laser_dir1", "laser_dir2", "laser_dir3",
+                "laser_dispersion_error", "laser_x1_moment",
+                "laser_x2_moment", "laser_x3_moment"):
+            assert np.count_nonzero(inactive[name]) == 0, name
 
         # With B^2/2=5e17, the total-energy increment is below its floating-point
         # spacing. The dual 2T electron equation must still retain laser heating.

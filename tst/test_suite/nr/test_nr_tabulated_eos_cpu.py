@@ -9,20 +9,35 @@ import test_suite.testutils as testutils
 
 input_file = "../../../inputs/hydro/tabulated_eos.athinput"
 mhd_input_file = "../../../inputs/mhd/tabulated_eos.athinput"
+unit_input_file = "../../../tst/inputs/ut_table_eos.athinput"
 table_file = "../../../inputs/hydro/gamma_law_eos_table.dat"
+material_table_file = "../../../inputs/hydro/material_eos_table_v2.dat"
 binary_table_file = "gamma_law_eos_tablereader.dat"
+material_binary_table_file = "material_eos_tablereader.dat"
 non_gamma_table_file = "power_law_eos_table.dat"
 negative_size_table_file = "negative_size_eos_tablereader.dat"
 overflow_size_table_file = "overflow_size_eos_tablereader.dat"
 truncated_table_file = "truncated_eos_tablereader.dat"
+negative_material_table_file = "negative_material_eos_table.dat"
+nan_material_table_file = "nan_material_eos_table.dat"
+duplicate_material_table_file = "duplicate_material_eos_table.dat"
+negative_binary_material_table_file = "negative_material_eos_tablereader.dat"
 
 
-def tablereader_header(density_size, temperature_size):
+def tablereader_header(density_size, temperature_size, fields=None,
+                       extra_metadata=None):
     """Return a minimal TableReader header for the portable EOS fields."""
+    if fields is None:
+        fields = ("logpress", "logeps", "logcs2")
+    if extra_metadata is None:
+        extra_metadata = ()
+    metadata = "".join(f"{entry}\n" for entry in extra_metadata)
+    field_lines = "".join(f"{field}\n" for field in fields)
     return (
         "<metadatabegin>\n"
         "endianness = little\n"
         "log_axis_base = e\n"
+        f"{metadata}"
         "<metadataend>\n"
         "<scalarsbegin>\n"
         "<scalarsend>\n"
@@ -31,9 +46,7 @@ def tablereader_header(density_size, temperature_size):
         f"logtemp = {temperature_size}\n"
         "<pointsend>\n"
         "<fieldsbegin>\n"
-        "logpress\n"
-        "logeps\n"
-        "logcs2\n"
+        f"{field_lines}"
         "<fieldsend>\n"
     )
 
@@ -58,6 +71,62 @@ def write_tablereader_table(filename):
         table.write(np.asarray(np.log(temperature), dtype="<f8").tobytes())
         for field in fields:
             table.write(np.asarray(field, dtype="<f8").tobytes(order="C"))
+
+
+def material_table_arrays():
+    """Return the synthetic v2 material table in TableReader field order."""
+    density = np.array([1.0, 4.0])
+    temperature = np.array([1.0, 9.0])
+    fields = {
+        "logpress": np.log(np.array([[2.0, 18.0], [8.0, 72.0]])),
+        "logeps": np.log(np.array([[3.0, 27.0], [6.0, 54.0]])),
+        "logcs2": np.log(np.array([[2.0, 6.0], [4.0, 12.0]])),
+        "gamma1": np.array([[1.2, 1.3], [1.4, 1.5]]),
+        "gamma3m1": np.array([[0.2, 0.3], [0.4, 0.5]]),
+        "zbar": np.array([[0.0, 1.0], [2.0, 3.0]]),
+        "zeff": np.array([[0.25, 1.25], [2.25, 4.25]]),
+        "abar": np.array([[6.0, 6.0], [8.0, 8.0]]),
+        "mu": np.array([[6.0, 3.0], [4.0, 2.0]]),
+    }
+    return density, temperature, fields
+
+
+def write_material_tablereader_table(filename, negative_mu=False):
+    """Write the v2 material fixture using optional TableReader field names."""
+    density, temperature, fields = material_table_arrays()
+    if negative_mu:
+        fields["mu"] = fields["mu"].copy()
+        fields["mu"][0, 0] = -1.0
+    names = tuple(fields)
+    header = tablereader_header(
+        density.size, temperature.size, names,
+        extra_metadata=("material_name = synthetic_nonconstant",))
+    with open(filename, "wb") as table:
+        table.write(header.encode("ascii"))
+        table.write(np.asarray(np.log(density), dtype="<f8").tobytes())
+        table.write(np.asarray(np.log(temperature), dtype="<f8").tobytes())
+        for name in names:
+            table.write(np.asarray(fields[name], dtype="<f8").tobytes(order="C"))
+
+
+def write_native_v2_table(filename, material_fields):
+    """Write a minimal native-v2 table with caller-supplied material fields."""
+    lines = [
+        "athenak_eos_table 2",
+        "dimensions 2 2",
+        "density 1.0 4.0",
+        "temperature 1.0 9.0",
+        "pressure 2.0 18.0 8.0 72.0",
+        "specific_internal_energy 3.0 27.0 6.0 54.0",
+        "sound_speed_squared 2.0 6.0 4.0 12.0",
+        f"material_fields {len(material_fields)}",
+    ]
+    for name, values in material_fields:
+        lines.append(name)
+        lines.append(" ".join(str(value) for value in values))
+    lines.append("end")
+    with open(filename, "w", encoding="ascii") as table:
+        table.write("\n".join(lines) + "\n")
 
 
 def write_power_law_table(filename):
@@ -104,6 +173,7 @@ def invalid_table_command(filename):
 def test_run():
     try:
         write_tablereader_table(binary_table_file)
+        write_material_tablereader_table(material_binary_table_file)
         common = [
             "time/tlim=0.05",
             "output1/dt=0.05",
@@ -127,6 +197,33 @@ def test_run():
             assert np.all(np.isfinite(table[field]))
             assert np.allclose(table[field], reference[field],
                                rtol=2.0e-10, atol=2.0e-12), field
+
+        # Exercise all forward/inverse device APIs and material availability metadata.
+        assert testutils.run(unit_input_file, flags=[
+            "job/basename=eos_material_native",
+            f"hydro/table_file={material_table_file}",
+        ]), "Native-v2 material EOS API test failed."
+        assert testutils.run(unit_input_file, flags=[
+            "job/basename=eos_material_binary",
+            f"hydro/table_file={material_binary_table_file}",
+        ]), "TableReader material EOS API test failed."
+
+        # A v1 table has no material metadata; it must not synthesize material values.
+        assert testutils.run(unit_input_file, flags=[
+            "job/basename=eos_material_v1",
+            f"hydro/table_file={table_file}",
+            "problem/query_density=1.0",
+            "problem/query_temperature=1.0",
+            "problem/expected_pressure=1.0",
+            "problem/expected_specific_eint=2.5",
+            "problem/expected_sound_speed2=1.4",
+            "problem/expected_has_gamma1=false",
+            "problem/expected_has_gamma3m1=false",
+            "problem/expected_has_zbar=false",
+            "problem/expected_has_zeff=false",
+            "problem/expected_has_abar=false",
+            "problem/expected_has_mu=false",
+        ]), "Native-v1 material availability test failed."
 
         assert testutils.run(input_file, flags=[
             "job/basename=eos_tablereader",
@@ -183,6 +280,31 @@ def test_run():
             table_file_handle.write(np.asarray([0.0], dtype="<f8").tobytes())
         assert not testutils.run_command(
             invalid_table_command(truncated_table_file))
+
+        # Optional material fields reject nonphysical, non-finite, and duplicate data.
+        write_native_v2_table(negative_material_table_file, [
+            ("gamma1", [-1.0, 1.3, 1.4, 1.5]),
+        ])
+        assert not testutils.run_command(
+            invalid_table_command(negative_material_table_file))
+
+        write_native_v2_table(nan_material_table_file, [
+            ("zbar", [0.0, "nan", 2.0, 3.0]),
+        ])
+        assert not testutils.run_command(
+            invalid_table_command(nan_material_table_file))
+
+        write_native_v2_table(duplicate_material_table_file, [
+            ("gamma1", [1.2, 1.3, 1.4, 1.5]),
+            ("gamma1", [1.2, 1.3, 1.4, 1.5]),
+        ])
+        assert not testutils.run_command(
+            invalid_table_command(duplicate_material_table_file))
+
+        write_material_tablereader_table(
+            negative_binary_material_table_file, negative_mu=True)
+        assert not testutils.run_command(
+            invalid_table_command(negative_binary_material_table_file))
 
         assert testutils.run(mhd_input_file, flags=[
             "job/basename=eos_table_mhd",

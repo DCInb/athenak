@@ -1,0 +1,70 @@
+# Device API unit test for the material-neutral density-temperature table EOS.
+
+<job>
+basename = ut_table_eos
+
+<mesh>
+nghost = 2
+nx1 = 4
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 1
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 4
+nx2 = 1
+nx3 = 1
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.4
+nlim = 0
+tlim = 0.0
+ndiag = 1
+
+<hydro>
+eos = table
+table_file = ../../../inputs/hydro/material_eos_table_v2.dat
+table_unit_system = code
+table_bounds = error
+reconstruct = plm
+rsolver = llf
+dfloor = 1.0e-8
+pfloor = 1.0e-8
+
+<problem>
+pgen_name = table_eos
+query_density = 2.0
+query_temperature = 3.0
+expected_pressure = 12.0
+expected_specific_eint = 12.727922061357855
+expected_sound_speed2 = 4.898979485566356
+expected_has_gamma1 = true
+expected_gamma1 = 1.35
+expected_has_gamma3m1 = true
+expected_gamma3m1 = 0.35
+expected_has_zbar = true
+expected_zbar = 1.5
+expected_has_zeff = true
+expected_zeff = 2.0
+expected_has_abar = true
+expected_abar = 7.0
+expected_has_mu = true
+expected_mu = 3.75
+tolerance = 2.0e-12
+
+<output1>
+file_type = hst
+dt = -1.0

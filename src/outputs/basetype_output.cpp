@@ -6,7 +6,9 @@
 //  \brief implements BaseTypeOutput constructor, and LoadOutputData functions
 //
 
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>    // std::string, to_string()
 #include <cstdio>    // snprintf
@@ -44,8 +46,23 @@
 BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters opar) :
     out_params(opar),
     derived_var("derived-var",1,1,1,1,1),
+    schedule_origin_(static_cast<long double>(opar.last_time)),
+    schedule_index_(0),
     outarray("cc_outvar",1,1,1,1,1),
     outfield("fc_outvar",1,1,1,1) {
+  // Old restart files can contain a cadence value accumulated by repeated Real
+  // additions. Snap it to the restart time only when that output was just written.
+  if (out_params.last_time >= 0.0 && out_params.dt > 0.0) {
+    const Real scale = std::max({std::abs(pm->time), std::abs(out_params.last_time),
+                                 std::abs(out_params.dt)});
+    const Real tolerance = std::min(
+        static_cast<Real>(256.0)*std::numeric_limits<Real>::epsilon()*scale,
+        static_cast<Real>(0.25)*std::abs(out_params.dt));
+    if (std::abs(out_params.last_time-pm->time) <= tolerance) {
+      out_params.last_time = pm->time;
+      schedule_origin_ = static_cast<long double>(pm->time);
+    }
+  }
   // exit for history, restart, or event log files
   if (out_params.file_type.compare("hst") == 0 ||
       out_params.file_type.compare("rst") == 0 ||
@@ -920,6 +937,25 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
   // initialize vector containing number of output MBs per rank
   noutmbs.assign(global_variable::nranks, 0);
+}
+
+//----------------------------------------------------------------------------------------
+//! Advance a time-based output schedule from one fixed origin. Multiplication in long
+//! double avoids the O(number of outputs) drift caused by repeated `last_time += dt`.
+
+void BaseTypeOutput::AdvanceOutputSchedule(Mesh *pm, ParameterInput *pin) {
+  if (out_params.last_time < 0.0) {
+    out_params.last_time = pm->time;
+    schedule_origin_ = static_cast<long double>(pm->time);
+    schedule_index_ = 0;
+  } else if (out_params.dt > 0.0) {
+    ++schedule_index_;
+    const long double scheduled = schedule_origin_ +
+        static_cast<long double>(schedule_index_)*
+        static_cast<long double>(out_params.dt);
+    out_params.last_time = static_cast<Real>(scheduled);
+  }
+  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
 }
 
 //----------------------------------------------------------------------------------------

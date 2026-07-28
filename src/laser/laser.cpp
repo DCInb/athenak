@@ -554,8 +554,6 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     LaserInputError("ray packet buffers exceed the MPI byte-count limit");
   }
 
-  RefreshGlobalBlockInfo();
-
 #if MPI_PARALLEL_ENABLED
   mpi_send_requests_.reset(new MPI_Request[nranks]);
   mpi_recv_requests_.reset(new MPI_Request[nranks]);
@@ -635,6 +633,22 @@ Real Laser::BeamPowerForStep(const BeamConfig &beam, Real time, Real dt) const {
   }
   Real average = integral/dt;
   return beam.pulse_is_absolute ? average : beam.power*average;
+}
+
+//----------------------------------------------------------------------------------------
+//! Update total beam powers before starting stage-wide laser work. When every beam is
+//! dark, leave the device view untouched because no ray kernel will consume it.
+
+bool Laser::UpdateBeamPowers(Real time, Real dt) {
+  auto host_beam_power = Kokkos::create_mirror_view(beam_power_);
+  bool any_power = false;
+  for (std::size_t b = 0; b < beams_.size(); ++b) {
+    const Real power = BeamPowerForStep(beams_[b], time, dt);
+    host_beam_power(static_cast<int>(b)) = power;
+    any_power = any_power || power > 0.0;
+  }
+  if (any_power) Kokkos::deep_copy(beam_power_, host_beam_power);
+  return any_power;
 }
 
 void Laser::RefreshGlobalBlockInfo() {

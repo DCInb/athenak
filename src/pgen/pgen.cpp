@@ -934,6 +934,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     EOSCompose(pin, is_restart);
   } else if (pgen_fun_name.compare("gauss_legendre") == 0) {
     GaussLegendre(pin, is_restart);
+  } else if (pgen_fun_name.compare("table_eos") == 0) {
+    TableEOSUnitTest(pin, is_restart);
 
   } else {
     // name not set on command line or input file, print warning and quit

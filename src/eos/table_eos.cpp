@@ -7,6 +7,7 @@
 //! \brief Portable EOS table readers and nonrelativistic Hydro/MHD closures.
 
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -79,6 +80,10 @@ class Tokens {
     return result;
   }
 
+  std::string String(const std::string &name) {
+    return Next(name);
+  }
+
   Real Number(const std::string &name) {
     std::string token = Next(name);
     std::size_t used = 0;
@@ -139,6 +144,53 @@ bool IsNativeTable(const std::string &filename) {
 std::size_t TableValueIndex(int field, int density, int temperature,
                             int ndensity, int ntemperature) {
   return (static_cast<std::size_t>(field)*ndensity+density)*ntemperature+temperature;
+}
+
+struct MaterialFieldDescriptor {
+  const char *name;
+  TableEOSData::Field field;
+  bool strictly_positive;
+};
+
+constexpr std::array<MaterialFieldDescriptor, TableEOSData::nmaterial_fields>
+    material_fields = {{
+      {"gamma1", TableEOSData::gamma1, true},
+      {"gamma3m1", TableEOSData::gamma3_minus_one, true},
+      {"zbar", TableEOSData::mean_ionization, false},
+      {"zeff", TableEOSData::effective_charge, false},
+      {"abar", TableEOSData::mean_atomic_mass, true},
+      {"mu", TableEOSData::mean_molecular_weight, true},
+    }};
+
+int MaterialFieldIndex(TableEOSData::Field field) {
+  return static_cast<int>(field)-static_cast<int>(TableEOSData::gamma1);
+}
+
+const MaterialFieldDescriptor *FindMaterialField(const std::string &name) {
+  for (const auto &field : material_fields) {
+    if (name == field.name) return &field;
+  }
+  return nullptr;
+}
+
+void ValidateMaterialValue(const std::string &filename,
+                           const MaterialFieldDescriptor &field, Real value) {
+  if (!std::isfinite(value) || (field.strictly_positive ? value <= 0.0 : value < 0.0)) {
+    TableEOSError(filename, std::string(field.name) +
+                  (field.strictly_positive ? " must be finite and positive" :
+                                             " must be finite and non-negative"));
+  }
+}
+
+std::string MaterialFieldSummary(
+    const std::array<int, TableEOSData::nmaterial_fields> &available) {
+  std::string result;
+  for (int i = 0; i < TableEOSData::nmaterial_fields; ++i) {
+    if (available[i] == 0) continue;
+    if (!result.empty()) result += ",";
+    result += material_fields[i].name;
+  }
+  return result.empty() ? "none" : result;
 }
 
 void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *pin,
@@ -209,6 +261,7 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
   std::vector<Real> density;
   std::vector<Real> temperature;
   std::vector<Real> values;
+  std::array<int, TableEOSData::nmaterial_fields> material_available{};
   std::string file_format;
   bool read_file = true;
 #if MPI_PARALLEL_ENABLED
@@ -217,12 +270,13 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
 
   if (read_file) {
     if (IsNativeTable(filename)) {
-      file_format = "native ASCII";
       Tokens tokens(filename);
       tokens.Expect("athenak_eos_table");
-      if (tokens.Integer("format version") != 1) {
+      int format_version = tokens.Integer("format version");
+      if (format_version != 1 && format_version != 2) {
         TableEOSError(filename, "unsupported format version");
       }
+      file_format = "native ASCII v" + std::to_string(format_version);
       tokens.Expect("dimensions");
       ndensity = tokens.Integer("density dimension");
       ntemperature = tokens.Integer("temperature dimension");
@@ -236,7 +290,7 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
       }
       density.resize(ndensity);
       temperature.resize(ntemperature);
-      values.resize(nvalues);
+      values.assign(nvalues, std::numeric_limits<Real>::quiet_NaN());
 
       tokens.Expect("density");
       for (int i = 0; i < ndensity; ++i) {
@@ -256,11 +310,12 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
         temperature[i] = std::log(value);
       }
 
-      const char *labels[TableEOSData::nfields] = {
+      constexpr int ncore_fields = 3;
+      const char *labels[ncore_fields] = {
           "pressure", "specific_internal_energy", "sound_speed_squared"};
-      Real scales[TableEOSData::nfields] = {
+      Real scales[ncore_fields] = {
           pressure_scale, specific_eint_scale, sound_speed2_scale};
-      for (int field = 0; field < TableEOSData::nfields; ++field) {
+      for (int field = 0; field < ncore_fields; ++field) {
         tokens.Expect(labels[field]);
         for (int ir = 0; ir < ndensity; ++ir) {
           for (int it = 0; it < ntemperature; ++it) {
@@ -271,6 +326,35 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
             }
             values[TableValueIndex(field, ir, it, ndensity, ntemperature)] =
                 std::log(value);
+          }
+        }
+      }
+      if (format_version == 2) {
+        tokens.Expect("material_fields");
+        int number_material_fields = tokens.Integer("material field count");
+        if (number_material_fields < 0 ||
+            number_material_fields > TableEOSData::nmaterial_fields) {
+          TableEOSError(filename, "material field count must be between 0 and " +
+                        std::to_string(TableEOSData::nmaterial_fields));
+        }
+        for (int n = 0; n < number_material_fields; ++n) {
+          std::string name = tokens.String("material field name");
+          const MaterialFieldDescriptor *descriptor = FindMaterialField(name);
+          if (descriptor == nullptr) {
+            TableEOSError(filename, "unknown material field '" + name + "'");
+          }
+          int availability_index = MaterialFieldIndex(descriptor->field);
+          if (material_available[availability_index] != 0) {
+            TableEOSError(filename, "duplicate material field '" + name + "'");
+          }
+          material_available[availability_index] = 1;
+          for (int ir = 0; ir < ndensity; ++ir) {
+            for (int it = 0; it < ntemperature; ++it) {
+              Real value = tokens.Number(name);
+              ValidateMaterialValue(filename, *descriptor, value);
+              values[TableValueIndex(descriptor->field, ir, it,
+                                     ndensity, ntemperature)] = value;
+            }
           }
         }
       }
@@ -313,7 +397,7 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
       }
       density.resize(ndensity);
       temperature.resize(ntemperature);
-      values.resize(nvalues);
+      values.assign(nvalues, std::numeric_limits<Real>::quiet_NaN());
       const Real axis_scales[2] = {density_scale, temperature_scale};
       const char *axis_names[2] = {"logrho", "logtemp"};
       std::vector<Real> *axes[2] = {&density, &temperature};
@@ -329,10 +413,11 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
           }
         }
       }
-      const char *fields[TableEOSData::nfields] = {"logpress", "logeps", "logcs2"};
-      const Real scales[TableEOSData::nfields] = {
+      constexpr int ncore_fields = 3;
+      const char *fields[ncore_fields] = {"logpress", "logeps", "logcs2"};
+      const Real scales[ncore_fields] = {
           pressure_scale, specific_eint_scale, sound_speed2_scale};
-      for (int field = 0; field < TableEOSData::nfields; ++field) {
+      for (int field = 0; field < ncore_fields; ++field) {
         const double *source = table[fields[field]];
         Real shift = std::log(scales[field]);
         for (int ir = 0; ir < ndensity; ++ir) {
@@ -343,6 +428,20 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
                             " contains a non-finite scaled value");
             }
             values[TableValueIndex(field, ir, it, ndensity, ntemperature)] = value;
+          }
+        }
+      }
+      for (const auto &descriptor : material_fields) {
+        if (!table.HasField(descriptor.name)) continue;
+        int availability_index = MaterialFieldIndex(descriptor.field);
+        material_available[availability_index] = 1;
+        const double *source = table[descriptor.name];
+        for (int ir = 0; ir < ndensity; ++ir) {
+          for (int it = 0; it < ntemperature; ++it) {
+            Real value = static_cast<Real>(source[ir*ntemperature+it]);
+            ValidateMaterialValue(filename, descriptor, value);
+            values[TableValueIndex(descriptor.field, ir, it,
+                                   ndensity, ntemperature)] = value;
           }
         }
       }
@@ -381,6 +480,13 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
   int dimensions[2] = {ndensity, ntemperature};
   int ierr = MPI_Bcast(dimensions, 2, MPI_INT, 0, MPI_COMM_WORLD);
   if (ierr != MPI_SUCCESS) TableEOSError(filename, "could not broadcast dimensions");
+  if (ierr == MPI_SUCCESS) {
+    ierr = MPI_Bcast(material_available.data(), TableEOSData::nmaterial_fields,
+                     MPI_INT, 0, MPI_COMM_WORLD);
+  }
+  if (ierr != MPI_SUCCESS) {
+    TableEOSError(filename, "could not broadcast material-field metadata");
+  }
   ndensity = dimensions[0];
   ntemperature = dimensions[1];
   if (ndensity < 2 || ntemperature < 2) {
@@ -412,14 +518,20 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
 
   eos.table.ndensity = ndensity;
   eos.table.ntemperature = ntemperature;
+  eos.table.has_gamma1 = material_available[0] != 0;
+  eos.table.has_gamma3_minus_one = material_available[1] != 0;
+  eos.table.has_mean_ionization = material_available[2] != 0;
+  eos.table.has_effective_charge = material_available[3] != 0;
+  eos.table.has_mean_atomic_mass = material_available[4] != 0;
+  eos.table.has_mean_molecular_weight = material_available[5] != 0;
   eos.table.log_density = DvceArray1D<Real>("eos-table-density", ndensity);
   eos.table.log_temperature = DvceArray1D<Real>("eos-table-temperature", ntemperature);
-  eos.table.log_values = DvceArray3D<Real>(
+  eos.table.values = DvceArray3D<Real>(
       "eos-table-values", TableEOSData::nfields, ndensity, ntemperature);
   eos.table.log_density_h = HostArray1D<Real>("eos-table-density-host", ndensity);
   eos.table.log_temperature_h =
       HostArray1D<Real>("eos-table-temperature-host", ntemperature);
-  eos.table.log_values_h = HostArray3D<Real>(
+  eos.table.values_h = HostArray3D<Real>(
       "eos-table-values-host", TableEOSData::nfields, ndensity, ntemperature);
   for (int ir = 0; ir < ndensity; ++ir) eos.table.log_density_h(ir) = density[ir];
   for (int it = 0; it < ntemperature; ++it) {
@@ -428,14 +540,14 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
   for (int field = 0; field < TableEOSData::nfields; ++field) {
     for (int ir = 0; ir < ndensity; ++ir) {
       for (int it = 0; it < ntemperature; ++it) {
-        eos.table.log_values_h(field, ir, it) =
+        eos.table.values_h(field, ir, it) =
             values[TableValueIndex(field, ir, it, ndensity, ntemperature)];
       }
     }
   }
   Kokkos::deep_copy(eos.table.log_density, eos.table.log_density_h);
   Kokkos::deep_copy(eos.table.log_temperature, eos.table.log_temperature_h);
-  Kokkos::deep_copy(eos.table.log_values, eos.table.log_values_h);
+  Kokkos::deep_copy(eos.table.values, eos.table.values_h);
   eos.is_ideal = true;
   eos.is_gamma_law = false;
   eos.is_table = true;
@@ -451,7 +563,8 @@ void LoadTableEOS(const std::string &block, MeshBlockPack *pp, ParameterInput *p
   if (global_variable::my_rank == 0) {
     std::cout << "Loaded " << ndensity << " x " << ntemperature
               << " tabulated EOS from " << filename << " (" << file_format
-              << ", " << bounds << " bounds)" << std::endl;
+              << ", " << bounds << " bounds, material fields: "
+              << MaterialFieldSummary(material_available) << ")" << std::endl;
   }
 }
 

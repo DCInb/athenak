@@ -26,6 +26,8 @@
 //! inside kernels.
 
 struct EOS_Data {
+  using ThermoState = TableEOSData::ThermoState;
+
   Real gamma;        // ratio of specific heats for ideal gas
   Real iso_cs;       // isothermal sound speed
   bool is_ideal;     // flag to denote ideal gas EOS
@@ -51,9 +53,30 @@ struct EOS_Data {
   }
 
   KOKKOS_INLINE_FUNCTION
+  Real PressureFromRhoTemperature(const Real density, const Real temperature) const {
+    if (is_table) return table.PressureFromRhoTemperature(density, temperature);
+    return density*(is_ideal ? temperature : SQR(iso_cs));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real SpecificEintFromRhoTemperature(const Real density,
+                                      const Real temperature) const {
+    if (is_table) return table.SpecificEintFromRhoTemperature(density, temperature);
+    if (is_ideal) return temperature/(gamma-1.0);
+    return Kokkos::Experimental::quiet_NaN<Real>::value;
+  }
+
+  KOKKOS_INLINE_FUNCTION
   Real TemperatureFromRhoEint(const Real density, const Real eint) const {
     if (is_table) return table.TemperatureFromRhoEint(density, eint);
     if (is_ideal) return (gamma-1.0)*eint/density;
+    return SQR(iso_cs);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real TemperatureFromRhoPressure(const Real density, const Real pressure) const {
+    if (is_table) return table.TemperatureFromRhoPressure(density, pressure);
+    if (is_ideal) return pressure/density;
     return SQR(iso_cs);
   }
 
@@ -75,6 +98,40 @@ struct EOS_Data {
     if (is_table) return table.SoundSpeed2FromRhoEint(density, eint);
     if (is_ideal) return gamma*IdealGasPressure(eint)/density;
     return SQR(iso_cs);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ThermoState EvalThermoStateFromRhoTemperature(const Real density,
+                                                const Real temperature) const {
+    if (is_table) return table.ThermoStateFromRhoTemperature(density, temperature);
+
+    ThermoState state;
+    state.temperature = is_ideal ? temperature : SQR(iso_cs);
+    state.pressure = density*state.temperature;
+    state.sound_speed_squared = is_ideal ? gamma*state.temperature : SQR(iso_cs);
+    if (is_ideal) {
+      state.specific_internal_energy = state.temperature/(gamma-1.0);
+      state.gamma1 = gamma;
+      state.gamma3_minus_one = gamma-1.0;
+      state.has_gamma1 = true;
+      state.has_gamma3_minus_one = true;
+    }
+    return state;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ThermoState EvalThermoStateFromRhoEint(const Real density, const Real eint) const {
+    if (is_table) return table.ThermoStateFromRhoEint(density, eint);
+    return EvalThermoStateFromRhoTemperature(
+        density, TemperatureFromRhoEint(density, eint));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ThermoState EvalThermoStateFromRhoPressure(const Real density,
+                                             const Real pressure) const {
+    if (is_table) return table.ThermoStateFromRhoPressure(density, pressure);
+    return EvalThermoStateFromRhoTemperature(
+        density, TemperatureFromRhoPressure(density, pressure));
   }
 
   KOKKOS_INLINE_FUNCTION

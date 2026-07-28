@@ -13,28 +13,63 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-#include <limits>
 
 #include "athena.hpp"
 
 struct TableEOSData {
-  enum Field : int {log_pressure = 0, log_specific_eint = 1, log_sound_speed2 = 2};
-  static constexpr int nfields = 3;
+  enum Field : int {
+    log_pressure = 0,
+    log_specific_eint = 1,
+    log_sound_speed2 = 2,
+    gamma1 = 3,
+    gamma3_minus_one = 4,
+    mean_ionization = 5,
+    effective_charge = 6,
+    mean_atomic_mass = 7,
+    mean_molecular_weight = 8
+  };
+  static constexpr int nfields = 9;
+  static constexpr int nmaterial_fields = 6;
 #if SINGLE_PRECISION_ENABLED
   static constexpr Real minimum_positive = FLT_MIN;
 #else
   static constexpr Real minimum_positive = DBL_MIN;
 #endif
 
+  struct ThermoState {
+    Real temperature = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real pressure = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real specific_internal_energy = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real sound_speed_squared = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real gamma1 = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real gamma3_minus_one = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real mean_ionization = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real effective_charge = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real mean_atomic_mass = Kokkos::Experimental::quiet_NaN<Real>::value;
+    Real mean_molecular_weight = Kokkos::Experimental::quiet_NaN<Real>::value;
+    bool has_gamma1 = false;
+    bool has_gamma3_minus_one = false;
+    bool has_mean_ionization = false;
+    bool has_effective_charge = false;
+    bool has_mean_atomic_mass = false;
+    bool has_mean_molecular_weight = false;
+  };
+
   int ndensity = 0;
   int ntemperature = 0;
   int bounds_error = 0;
+  bool has_gamma1 = false;
+  bool has_gamma3_minus_one = false;
+  bool has_mean_ionization = false;
+  bool has_effective_charge = false;
+  bool has_mean_atomic_mass = false;
+  bool has_mean_molecular_weight = false;
   DvceArray1D<Real> log_density;
   DvceArray1D<Real> log_temperature;
-  DvceArray3D<Real> log_values;
+  DvceArray3D<Real> values;
   HostArray1D<Real> log_density_h;
   HostArray1D<Real> log_temperature_h;
-  HostArray3D<Real> log_values_h;
+  HostArray3D<Real> values_h;
 
   KOKKOS_INLINE_FUNCTION
   Real SafeLog(Real value) const {
@@ -78,26 +113,33 @@ struct TableEOSData {
     int density_index;
     Real density_fraction;
     AxisWeights(log_density, ndensity, logrho, density_index, density_fraction);
-    return (1.0-density_fraction)*log_values(field, density_index, temperature_index)
-           + density_fraction*log_values(field, density_index+1, temperature_index);
+    return (1.0-density_fraction)*values(field, density_index, temperature_index)
+           + density_fraction*values(field, density_index+1, temperature_index);
   }
 
   KOKKOS_INLINE_FUNCTION
-  Real EvaluateLog(int field, Real logrho, Real logtemperature) const {
+  Real EvaluateWithWeights(int field, int density_index, int temperature_index,
+                           Real density_fraction, Real temperature_fraction) const {
+    Real low = (1.0-temperature_fraction)*
+                   values(field, density_index, temperature_index)
+               + temperature_fraction*
+                   values(field, density_index, temperature_index+1);
+    Real high = (1.0-temperature_fraction)*
+                    values(field, density_index+1, temperature_index)
+                + temperature_fraction*
+                    values(field, density_index+1, temperature_index+1);
+    return (1.0-density_fraction)*low+density_fraction*high;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real Evaluate(int field, Real logrho, Real logtemperature) const {
     int density_index, temperature_index;
     Real density_fraction, temperature_fraction;
     AxisWeights(log_density, ndensity, logrho, density_index, density_fraction);
     AxisWeights(log_temperature, ntemperature, logtemperature,
                 temperature_index, temperature_fraction);
-    Real low = (1.0-temperature_fraction)*
-                   log_values(field, density_index, temperature_index)
-               + temperature_fraction*
-                   log_values(field, density_index, temperature_index+1);
-    Real high = (1.0-temperature_fraction)*
-                    log_values(field, density_index+1, temperature_index)
-                + temperature_fraction*
-                    log_values(field, density_index+1, temperature_index+1);
-    return (1.0-density_fraction)*low+density_fraction*high;
+    return EvaluateWithWeights(field, density_index, temperature_index,
+                               density_fraction, temperature_fraction);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -132,12 +174,75 @@ struct TableEOSData {
 
   KOKKOS_INLINE_FUNCTION
   Real PressureFromRhoTemperature(Real density, Real temperature) const {
-    return exp(EvaluateLog(log_pressure, SafeLog(density), SafeLog(temperature)));
+    return exp(Evaluate(log_pressure, SafeLog(density), SafeLog(temperature)));
   }
 
   KOKKOS_INLINE_FUNCTION
   Real SpecificEintFromRhoTemperature(Real density, Real temperature) const {
-    return exp(EvaluateLog(log_specific_eint, SafeLog(density), SafeLog(temperature)));
+    return exp(Evaluate(log_specific_eint, SafeLog(density), SafeLog(temperature)));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ThermoState ThermoStateFromRhoTemperature(Real density, Real temperature) const {
+    int density_index, temperature_index;
+    Real density_fraction, temperature_fraction;
+    AxisWeights(log_density, ndensity, SafeLog(density),
+                density_index, density_fraction);
+    AxisWeights(log_temperature, ntemperature, SafeLog(temperature),
+                temperature_index, temperature_fraction);
+
+    ThermoState state;
+    Real bounded_log_temperature =
+        (1.0-temperature_fraction)*log_temperature(temperature_index) +
+        temperature_fraction*log_temperature(temperature_index+1);
+    state.temperature = exp(bounded_log_temperature);
+    state.pressure = exp(EvaluateWithWeights(
+        log_pressure, density_index, temperature_index,
+        density_fraction, temperature_fraction));
+    state.specific_internal_energy = exp(EvaluateWithWeights(
+        log_specific_eint, density_index, temperature_index,
+        density_fraction, temperature_fraction));
+    state.sound_speed_squared = exp(EvaluateWithWeights(
+        log_sound_speed2, density_index, temperature_index,
+        density_fraction, temperature_fraction));
+
+    state.has_gamma1 = has_gamma1;
+    state.has_gamma3_minus_one = has_gamma3_minus_one;
+    state.has_mean_ionization = has_mean_ionization;
+    state.has_effective_charge = has_effective_charge;
+    state.has_mean_atomic_mass = has_mean_atomic_mass;
+    state.has_mean_molecular_weight = has_mean_molecular_weight;
+    if (has_gamma1) {
+      state.gamma1 = EvaluateWithWeights(
+          gamma1, density_index, temperature_index,
+          density_fraction, temperature_fraction);
+    }
+    if (has_gamma3_minus_one) {
+      state.gamma3_minus_one = EvaluateWithWeights(
+          gamma3_minus_one, density_index, temperature_index,
+          density_fraction, temperature_fraction);
+    }
+    if (has_mean_ionization) {
+      state.mean_ionization = EvaluateWithWeights(
+          mean_ionization, density_index, temperature_index,
+          density_fraction, temperature_fraction);
+    }
+    if (has_effective_charge) {
+      state.effective_charge = EvaluateWithWeights(
+          effective_charge, density_index, temperature_index,
+          density_fraction, temperature_fraction);
+    }
+    if (has_mean_atomic_mass) {
+      state.mean_atomic_mass = EvaluateWithWeights(
+          mean_atomic_mass, density_index, temperature_index,
+          density_fraction, temperature_fraction);
+    }
+    if (has_mean_molecular_weight) {
+      state.mean_molecular_weight = EvaluateWithWeights(
+          mean_molecular_weight, density_index, temperature_index,
+          density_fraction, temperature_fraction);
+    }
+    return state;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -162,14 +267,26 @@ struct TableEOSData {
   KOKKOS_INLINE_FUNCTION
   Real SoundSpeed2FromRhoEint(Real density, Real eint_density) const {
     Real temperature = TemperatureFromRhoEint(density, eint_density);
-    return exp(EvaluateLog(
+    return exp(Evaluate(
         log_sound_speed2, SafeLog(density), SafeLog(temperature)));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ThermoState ThermoStateFromRhoEint(Real density, Real eint_density) const {
+    return ThermoStateFromRhoTemperature(
+        density, TemperatureFromRhoEint(density, eint_density));
   }
 
   KOKKOS_INLINE_FUNCTION
   Real EintDensityFromRhoPressure(Real density, Real pressure) const {
     Real temperature = TemperatureFromRhoPressure(density, pressure);
     return density*SpecificEintFromRhoTemperature(density, temperature);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ThermoState ThermoStateFromRhoPressure(Real density, Real pressure) const {
+    return ThermoStateFromRhoTemperature(
+        density, TemperatureFromRhoPressure(density, pressure));
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -222,8 +339,8 @@ struct TableEOSData {
     int density_index;
     Real density_fraction;
     HostAxisWeights(log_density_h, ndensity, logrho, density_index, density_fraction);
-    return (1.0-density_fraction)*log_values_h(field, density_index, temperature_index)
-           + density_fraction*log_values_h(field, density_index+1, temperature_index);
+    return (1.0-density_fraction)*values_h(field, density_index, temperature_index)
+           + density_fraction*values_h(field, density_index+1, temperature_index);
   }
 
   Real HostTemperatureFromLogField(int field, Real logrho, Real target) const {
@@ -267,13 +384,13 @@ struct TableEOSData {
     HostAxisWeights(log_temperature_h, ntemperature, std::log(temperature),
                     temperature_index, temperature_fraction);
     Real low = (1.0-temperature_fraction)*
-                   log_values_h(log_specific_eint, density_index, temperature_index)
+                   values_h(log_specific_eint, density_index, temperature_index)
                + temperature_fraction*
-                   log_values_h(log_specific_eint, density_index, temperature_index+1);
+                   values_h(log_specific_eint, density_index, temperature_index+1);
     Real high = (1.0-temperature_fraction)*
-                    log_values_h(log_specific_eint, density_index+1, temperature_index)
+                    values_h(log_specific_eint, density_index+1, temperature_index)
                 + temperature_fraction*
-                    log_values_h(log_specific_eint, density_index+1, temperature_index+1);
+                    values_h(log_specific_eint, density_index+1, temperature_index+1);
     return safe_density*std::exp(
         (1.0-density_fraction)*low+density_fraction*high);
   }
