@@ -1,0 +1,222 @@
+# Provisional DCI_3D case
+
+This directory is an executable first-version scaffold for a three-dimensional,
+laser-driven CH target with separate ion, electron, and multigroup-radiation energies,
+ion-electron exchange, dual-energy MHD, a Biermann battery, and a conservative material
+tracer.
+
+It is not yet a reconstruction of the supplied reference case.  On 2026-07-28,
+`/home/mengqi/Research/athenak-2t/3d_zb.zip` was replaced with a 4,006,600-byte archive
+containing 61 entries, including FLASH sources, parameter decks, and material tables
+(SHA-256 `952708009c9e3bc00dc645e11c9c0f804614def9c70cc999b78c92f16c8a96cf`).  This
+scaffold predates that populated archive and has not yet been reconciled with it.  Every
+choice below is therefore either inherited from the already validated
+`laser-shell`/`laser-target` cases or explicitly labelled as an assumption; audit the
+reference archive before making physical-fidelity claims.
+
+## Files
+
+- `dci_3d.cpp`: target initialization, vacuum FLD boundary, CH scalar, and 20 integrated
+  diagnostics.
+- `dci_3d.athinput`: production mesh and 5 ns laser-on phase.  The launcher restarts it
+  laser-off to 10 ns.
+- `dci_3d_calibration.athinput`: identical allocation and physics with `nlim=2` and every
+  output disabled.
+- `ch_surrogate.opacity`: provisional single-material CH-like opacity, not reference
+  data.
+- `run_case.py`: guarded eight-GPU builder/launcher.
+
+## Explicit assumptions
+
+### Target and normalization
+
+The code units are inherited from `laser-shell`:
+
+| Quantity | Code unit |
+| --- | ---: |
+| length | 1 mm |
+| time | 1 ns |
+| density | 1.1 g/cm3 |
+| velocity | 1.0e8 cm/s |
+| pressure | 1.1e16 erg/cm3 |
+| temperature | 1.737267449e8 K = 14.970613 keV |
+| power | 1.1e22 erg/s |
+| magnetic field | 3.71793e8 G |
+
+The target is the same far-side spherical cap as `laser-shell`, not a demonstrated
+double-cone target and not a full spherical shell with a polar hole.  It occupies
+
+```text
+0.8 mm <= r <= 1.0 mm,    -x1/r >= cos(25 degrees),
+```
+
+with density 1.1 g/cm3, 0.02 mm radial smoothing, and 0.01 smoothing in angular cosine.
+The full included opening is interpreted as 50 degrees.  The ambient density is
+1.1e-8 g/cm3.  Ion, electron, and radiation temperatures initially equal 300 K.
+
+Fully ionized equimolar CH is approximated by `gamma=5/3`, ion-averaged `Abar=6.5`,
+`Zbar=3.5`, electron heat-capacity fraction `7/9`, electron number
+`3.242691464e23/g`, and collision-weighted `Zeff=37/7`.  This fully ionized ideal-gas
+model is not a predictive cold-solid EOS.
+
+### Material scalar and mixed cells
+
+One user passive scalar stores CH partial mass density `rho*X_CH`; the ambient fraction is
+`1-X_CH`.  The smooth geometric field `alpha` is a volume fraction, so initialization is
+
+```text
+rho_CH  = alpha * rho_CH,pure
+rho_amb = (1-alpha) * rho_amb,pure
+rho     = rho_CH + rho_amb
+X_CH    = rho_CH/rho.
+```
+
+This avoids incorrectly treating a volume fraction as a mass fraction across the
+eight-order density jump.  The scalar is advected conservatively and `CH_mass` and a
+mixed-mass indicator are recorded in history output.
+
+The current AthenaK core cannot yet perform the requested FLASH-like material closure:
+
+- two-temperature laser MHD hard-requires a gamma-law EOS, while the existing tabulated
+  EOS is equilibrium, single-material, and incompatible with two-temperature/laser use;
+- thermal radiation accepts only one opacity table and has no multispecies opacity
+  mixing;
+- the laser and Biermann modules use global `fe`, electron-number, and `Zeff` values.
+
+Consequently, the deck uses ideal CH and a named, single-material surrogate opacity
+table.  The table contains constant values over a minimal density/temperature grid:
+transport opacities of 100, 10, and 1 cm2/g and Planck absorption/emission opacities of
+10, 5, and 1 cm2/g in the three groups.  These are numerical assumptions, not data from
+`3d_zb.zip`.  A tracer-only run must not be reported as satisfying material-specific EOS
+or FLASH mixing fidelity.
+
+When real tables become available, the intended mixed-cell closure is a common-pressure,
+common-temperature additive-volume EOS solve and FLASH-style opacity averaging by
+relative ion number density, with pure-material limits reproducing each source table.
+
+### Three-temperature physics
+
+- Three thermal groups have assumed boundaries `[0, 0.1, 1, 100] keV`, or
+  `[0, 0.00667975338, 0.06679753383, 6.679753383]` in code temperature.
+- `arad=626.50300896` follows the shared physical normalization.
+- `c_light=10` is a reduced light speed of 1.0e9 cm/s.  Physical light speed would be
+  `299.792458` in code units and is not practical for this explicit FLD first version.
+- The Levermore-Pomraning limiter, electron-radiation coupling, and a source CFL of 0.1
+  are enabled.
+- The constant ion-electron exchange time is assumed to be 0.05 ns.  Compact sensitivity
+  runs at 0.01 and 0.1 ns are required before physical interpretation.
+- The Biermann coefficient `4.026493224e-4` is dimensionally consistent with the CH unit
+  system.  Shock suppression is enabled at threshold 0.8.
+- All fluid boundaries are outflow.  The problem generator replaces only radiation-group
+  ghosts with zero energy, allowing FLD energy to escape instead of making the ordinary
+  zero-gradient outflow an insulated radiation wall.
+
+### Laser
+
+One 1.053 micrometre Nd:glass fundamental beam supplies 2 TW for exactly 5 ns: 10 kJ
+incident energy.  Its 1,024 deterministic rays deposit into electron energy through
+inverse bremsstrahlung, use a 1 keV absorption-only temperature floor, and permit one
+critical-surface reflection.
+
+The new lens geometry is used instead of the parallel bundle in `laser-shell`:
+
+```text
+lens center   = (+1.5, 0, 0) mm
+aperture      = 0.40 mm hard and Gaussian 1/e2 radius
+target center = (-0.8, 0, 0) mm
+target radius = 0.32 mm
+```
+
+The 20 percent convergence maps the Gaussian 1/e2 radius to 0.32 mm.  The projected
+inner-cap radius is `0.8*sin(25 deg)=0.3381 mm`, so the target spot covers 89.6 percent
+of its projected area.  Straight tracing is the robust first version; refractive tracing
+is a later sensitivity study.
+
+## Uniform eight-GPU mesh
+
+The production grid is `600 x 368 x 368` = 81,254,400 uniform cells.  MeshBlocks are
+`50 x 46 x 46`, producing a `12 x 8 x 8` block lattice: 768 blocks and exactly 96 per
+MPI rank/GPU.  Cell widths are 5.833, 5.435, and 5.435 micrometres, resolving the shell
+thickness with roughly 34--37 cells.
+
+The prior 2T laser-shell case measured 12,242 MiB/GPU for 112 `50^3` blocks.  Accounting
+for four additional transported scalars, radiation diagnostics, and Biermann scratch
+arrays predicts roughly 12.6--13.0 GiB, or 77--79 percent of each 16 GiB V100.  This is
+not acceptance evidence.  The full-allocation calibration must measure every GPU:
+
+```bash
+python3 DCI_3D/run_case.py --build --clean --mode calibrate
+```
+
+The launcher returns status 2 if any peak allocation is outside 60--80 percent.  If the
+mesh exceeds 80 percent, the documented fallback is `600 x 352 x 352` with
+`50 x 44 x 44` blocks, followed by a fresh measurement.
+
+## Build and safe validation
+
+The launcher uses the local AthenaK build helper, MPI/CUDA/NVHPC environment, Volta-70
+target, and one MPI rank per visible GPU.  It refuses duplicate GPU IDs, a rank count
+other than eight, nonempty production directories without its sentinel, and occupied
+GPUs unless explicitly overridden.
+
+Print the exact build/run command without changing state:
+
+```bash
+python3 DCI_3D/run_case.py --build --mode validate --dry-run
+```
+
+Compile and validate initialization on a compact `2 x 2 x 2` MeshBlock grid (`nlim=0`):
+
+```bash
+python3 DCI_3D/run_case.py --build --clean --mode validate
+```
+
+Advance the same compact grid for two steps with every output disabled:
+
+```bash
+python3 DCI_3D/run_case.py --clean --mode smoke
+```
+
+The compact modes change only global cell counts to `100 x 92 x 92`; production-size
+MeshBlocks and all physics allocations remain active.  `--nlim 0` or `--nlim 2` can
+override either non-production validation mode.
+
+Print the intended production command for the 5 ns laser phase and 10 ns restart with:
+
+```bash
+python3 DCI_3D/run_case.py --mode production --dry-run
+```
+
+An actual production launch is intentionally disabled.  In the `1e-8`-density ambient,
+the group-3 transport opacity and explicit FLD stability calculation give a production
+mesh timestep of approximately `4.25e-16 ns`, or roughly `2.35e16` steps to 10 ns.  The
+compact `nlim=0` validation measured the same failure mode at `dt=8.17e-15 ns`; `nlim=0`
+and `nlim=2` checks do not establish runtime feasibility.  Resolve this with a validated
+free-streaming timestep treatment, radiation subcycling, or an implicit transport method
+before enabling production.  Increasing `initial_dt` does not bypass the stability limit.
+
+The intended production staging directory is the local, ignored `DCI_3D/run`.  A
+dedicated non-deleting `/home/mengqi/Research/TranFile` configuration is still required
+to transfer verified outputs into `~/data/DCI_3D`.  The launcher deliberately does not
+invoke the existing TranFile daemon: its unrelated configuration can delete source
+`.bin` and `.rst` files.
+
+## Outputs and diagnostics
+
+History is written every 0.025 ns.  It records deposited laser energy/power, total and CH
+mass, material/kinetic/magnetic/ion/electron energy, all three radiation-group energies,
+matter-plus-radiation energy, integrated `|B|` and Biermann-source estimate, laser and
+radiation x1 moments, mixed mass, x1 momentum, and volume.
+
+Central `x1-x2` and `x1-x3` fluid/3T/laser slices are written every 0.1 ns.  Full-volume
+fluid, 3T, and laser fields are written every 0.5 ns, and restarts every 1 ns.  This lower
+cadence is intentional: the earlier 112-million-cell case paused for 194--487 seconds at
+each 0.1 ns full-volume output and produced 1.2 TiB.  Even after the radiation timestep
+blocker is resolved, reserve several hundred GiB and remeasure both compute and I/O cost
+before estimating the production runtime.
+
+Minimum acceptance requires exact 5 and 10 ns endpoints, 10 kJ incident energy, laser
+power closure, nonnegative component/group energies, conserved CH mass, nonzero
+ion-electron/radiation/Biermann coupling, matter-plus-radiation energy accounting including
+boundary loss, no NaNs or floor runaway, and measured 60--80 percent memory on all eight
+GPUs.

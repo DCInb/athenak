@@ -1,0 +1,9 @@
+build/
+logs/
+plots/
+runs/
+diagnostics.md
+results.csv
+results.json
+run_status.csv
+__pycache__/

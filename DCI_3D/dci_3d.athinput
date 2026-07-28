@@ -1,0 +1,215 @@
+# Provisional DCI_3D production deck.  This scaffold has not yet been reconciled with the
+# supplied 3d_zb.zip reference files, so the geometry, CH closure, radiation groups,
+# exchange time, and focused beam are explicit assumptions documented in DCI_3D/README.md.
+# The launcher intentionally blocks production because explicit FLD in the low-density
+# ambient currently imposes an impractical timestep; see the README.
+
+<job>
+basename = dci_3d
+
+<units>
+length_cgs = 1.0e-1
+mass_cgs = 1.1e-3
+time_cgs = 1.0e-9
+mu = 1.4444444444444444
+
+<mesh>
+nghost = 2
+nx1 = 600
+x1min = -2.0
+x1max = 1.5
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 368
+x2min = -1.0
+x2max = 1.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 368
+x3min = -1.0
+x3max = 1.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 50
+nx2 = 46
+nx3 = 46
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.25
+nlim = -1
+tlim = 5.0
+ndiag = 10
+align_outputs = true
+initial_dt = 5.0e-5
+
+<mhd>
+eos = ideal
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+dfloor = 1.0e-8
+pfloor = 1.0e-14
+tfloor = 1.7268498302462577e-6
+nscalars = 1
+two_temperature = true
+dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+electron_heat_capacity_fraction = 0.7777777777777778
+initial_electron_temperature_ratio = 1.0
+# Constant 0.05 ns is a provisional few-keV CH equilibration time.
+t_ei = 5.0e-2
+biermann_battery = true
+biermann_coefficient = 4.026493224150743e-4
+biermann_shock_suppression = true
+biermann_shock_threshold = 8.0e-1
+
+<thermal_radiation>
+enabled = true
+n_groups = 3
+arad = 6.265030089603521e2
+# Reduced speed of light: 1.0e9 cm/s = 0.03336 c.
+c_light = 1.0e1
+initial_radiation_temperature = 1.7268498302462577e-6
+flux_limiter = levermore-pomraning
+flux_limit_coefficient = 1.0
+source_cfl = 1.0e-1
+couple_matter = true
+opacity_model = table
+opacity_table_file = DCI_3D/ch_surrogate.opacity
+opacity_interpolation = log
+group_bound_0 = 0.0
+group_bound_1 = 6.679753382762793e-3
+group_bound_2 = 6.679753382762793e-2
+group_bound_3 = 6.679753382762793e0
+
+<laser>
+model = straight
+deposition_target = electron
+electron_temperature_model = two_temperature
+absorption_model = inverse_bremsstrahlung
+unit_system = cgs
+electron_number_per_gram = 3.242691463909014e23
+inverse_bremsstrahlung_coulomb_log = 5.0
+inverse_bremsstrahlung_temperature_floor = 1.160451812155008e7
+critical_reflection = true
+oblique_turning = true
+max_reflections_per_ray = 1
+reflection_offset_fraction = 1.0e-3
+nbeams = 1
+max_segments_per_launch = 64
+max_transport_iterations = 256
+max_mpi_waves = 64
+gpu_aware_mpi = false
+minimum_power_fraction = 1.0e-14
+conservation_tolerance = 1.0e-10
+periodic_transport = false
+report_diagnostics = true
+
+# Gaussian lens aperture converges by 20 percent onto 89.6 percent of the projected cap.
+beam0_power = 2.0e19
+beam0_wavelength = 1.053e-4
+beam0_nrays = 1024
+beam0_geometry = lens
+beam0_lens_x1 = 1.5
+beam0_lens_x2 = 0.0
+beam0_lens_x3 = 0.0
+beam0_target_x1 = -0.8
+beam0_target_x2 = 0.0
+beam0_target_x3 = 0.0
+beam0_aperture_radius = 0.40
+beam0_target_radius = 0.32
+beam0_profile = gaussian
+beam0_profile_radius = 0.40
+beam0_zeff = 5.285714285714286
+beam0_start_time = 0.0
+beam0_end_time = 5.0
+
+<problem>
+user_hist = true
+ambient_density = 1.0e-8
+solid_density = 1.0
+temperature = 1.7268498302462577e-6
+inner_radius = 0.8
+outer_radius = 1.0
+opening_half_angle_deg = 25.0
+transition_width = 2.0e-2
+angular_transition = 1.0e-2
+
+<output1>
+file_type = hst
+user_hist_only = true
+data_format = %20.12e
+dt = 2.5e-2
+
+# Frequent, inexpensive central slices for visualization.
+<output2>
+file_type = bin
+variable = mhd_w_bcc
+id = fluid_xy
+slice_x3 = 0.0
+dt = 1.0e-1
+
+<output3>
+file_type = bin
+variable = mhd_3t
+id = three_t_xy
+slice_x3 = 0.0
+dt = 1.0e-1
+
+<output4>
+file_type = bin
+variable = laser
+id = laser_xy
+slice_x3 = 0.0
+dt = 1.0e-1
+
+<output5>
+file_type = bin
+variable = mhd_w_bcc
+id = fluid_xz
+slice_x2 = 0.0
+dt = 1.0e-1
+
+<output6>
+file_type = bin
+variable = mhd_3t
+id = three_t_xz
+slice_x2 = 0.0
+dt = 1.0e-1
+
+<output7>
+file_type = bin
+variable = laser
+id = laser_xz
+slice_x2 = 0.0
+dt = 1.0e-1
+
+# Full-volume fields are intentionally sparse; 0.1 ns full dumps caused long I/O stalls.
+<output8>
+file_type = bin
+variable = mhd_w_bcc
+id = fluid
+dt = 5.0e-1
+
+<output9>
+file_type = bin
+variable = mhd_3t
+id = three_t
+dt = 5.0e-1
+
+<output10>
+file_type = bin
+variable = laser
+id = laser
+dt = 5.0e-1
+
+<output11>
+file_type = rst
+dt = 1.0

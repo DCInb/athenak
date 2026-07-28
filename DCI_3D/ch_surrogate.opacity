@@ -1,0 +1,26 @@
+# Provisional fully-ionized CH opacity; it is not derived from 3d_zb.zip.
+# Coordinates and values are in DCI_3D code units.  Physical source data must replace
+# this table before the case is interpreted as a material-fidelity calculation.
+athenak_opacity_table 1
+dimensions 2 2 3
+density 1.0e-8 1.0e1
+temperature 1.0e-6 1.0e1
+group_bound 0.0 6.679753382762793e-3 6.679753382762793e-2 6.679753382762793e0
+
+transport
+# 100, 10, and 1 cm^2/g after multiplication by rho0*L0 = 0.11 g/cm^2.
+1.1e1 1.1e1 1.1e1 1.1e1
+1.1e0 1.1e0 1.1e0 1.1e0
+1.1e-1 1.1e-1 1.1e-1 1.1e-1
+
+absorption
+# 10, 5, and 1 cm^2/g, constant over this deliberately minimal rho/Te grid.
+1.1e0 1.1e0 1.1e0 1.1e0
+5.5e-1 5.5e-1 5.5e-1 5.5e-1
+1.1e-1 1.1e-1 1.1e-1 1.1e-1
+
+emission
+1.1e0 1.1e0 1.1e0 1.1e0
+5.5e-1 5.5e-1 5.5e-1 5.5e-1
+1.1e-1 1.1e-1 1.1e-1 1.1e-1
+end
