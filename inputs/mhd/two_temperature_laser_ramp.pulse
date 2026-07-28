@@ -1,0 +1,5 @@
+# Relative laser power versus code time. Linear interpolation is used between rows.
+0.000000e+00  0.0
+2.500000e-05  1.0
+7.500000e-05  1.0
+1.000000e-04  0.0

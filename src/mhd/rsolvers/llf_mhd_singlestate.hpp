@@ -43,8 +43,8 @@ void SingleStateLLF_MHD(const MHDPrim1D &wl, const MHDPrim1D &wr, const Real &bx
 
   Real el=0.0, er=0.0, pl,pr;
   if (eos.is_ideal) {
-    pl = eos.IdealGasPressure(wl.e);
-    pr = eos.IdealGasPressure(wr.e);
+    pl = eos.PressureFromRhoEint(wl.d, wl.e);
+    pr = eos.PressureFromRhoEint(wr.d, wr.e);
     el = wl.e + 0.5*wl.d*(SQR(wl.vx)+SQR(wl.vy)+SQR(wl.vz)) + qc + SQR(bxi);
     er = wr.e + 0.5*wr.d*(SQR(wr.vx)+SQR(wr.vy)+SQR(wr.vz)) + qd + SQR(bxi);
     fsum.mx += (pl + pr);
@@ -58,8 +58,10 @@ void SingleStateLLF_MHD(const MHDPrim1D &wl, const MHDPrim1D &wr, const Real &bx
 
   // Compute max wave speed in L,R states (see Toro eq. 10.43)
   if (eos.is_ideal) {
-    qa = eos.IdealMHDFastSpeed(wl.d, pl, bxi, wl.by, wl.bz);
-    qb = eos.IdealMHDFastSpeed(wr.d, pr, bxi, wr.by, wr.bz);
+    qa = eos.FastMagnetosonicSpeedFromRhoEint(
+        wl.d, wl.e, bxi, wl.by, wl.bz);
+    qb = eos.FastMagnetosonicSpeedFromRhoEint(
+        wr.d, wr.e, bxi, wr.by, wr.bz);
   } else {
     qa = eos.IdealMHDFastSpeed(wl.d, bxi, wl.by, wl.bz);
     qb = eos.IdealMHDFastSpeed(wr.d, bxi, wr.by, wr.bz);

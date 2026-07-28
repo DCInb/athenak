@@ -200,6 +200,10 @@ beam0_start_time = 0.0
 beam0_end_time = 1.0
 ```
 
+The effective conservation tolerance is at least 128 times the `Real` machine epsilon,
+so the default remains strict in double precision without rejecting normal atomic-sum
+roundoff in single-precision builds.
+
 For inverse bremsstrahlung, a positive
 `inverse_bremsstrahlung_coulomb_log` fixes the Coulomb logarithm to that value.
 The default non-positive value evaluates the local FLASH Debye-number expression.
@@ -207,6 +211,62 @@ The default non-positive value evaluates the local FLASH Debye-number expression
 Beam parameters repeat as `beam1_*`, `beam2_*`, and so on. Direction vectors are
 normalized during construction. `uniform` and `gaussian` profiles are normalized so the
 sum of ray powers equals the specified beam power.
+
+### Lens and target geometry
+
+The legacy `direction` geometry above launches parallel rays and remains the default.
+Set `beamN_geometry=lens` to use FLASH-style lens and target coordinates. This implements
+the common circular, coaxial subset of FLASH geometry: the aperture is sampled at the
+lens, and each sample is paired with the same normalized sample on the target spot. A
+smaller target radius converges the beam; zero gives a point focus; equal aperture and
+target radii give a parallel beam. Lenses may be outside the mesh because rays are clipped
+to their first Cartesian-domain intersection.
+
+```text
+beam0_geometry = lens
+beam0_lens_x1 = -0.5
+beam0_lens_x2 = 0.0
+beam0_lens_x3 = 0.0
+beam0_target_x1 = 0.75
+beam0_target_x2 = 0.0
+beam0_target_x3 = 0.0
+beam0_aperture_radius = 0.30
+beam0_target_radius = 0.05
+beam0_profile = gaussian
+beam0_profile_radius = 0.20
+```
+
+`beamN_radius` is retained as an alias for `beamN_aperture_radius`.
+`beamN_profile_radius` is the Gaussian 1/e^2 intensity radius in
+`exp[-2 (r/profile_radius)^2]` and defaults to the aperture radius.
+
+### Pulse files
+
+`beamN_pulse_file` reads a comment-aware two-column `time power` table. Times must be
+strictly increasing and powers finite and non-negative. Power is zero outside the table.
+Linear interpolation is the default; `beamN_pulse_interpolation=step` selects a
+left-constant profile. The solver analytically averages the table over each complete
+hydro timestep and uses that same average in every RK stage, preserving incident energy
+when a step crosses one or more knots.
+
+```text
+beam0_pulse_file = inputs/mhd/two_temperature_laser_ramp.pulse
+beam0_pulse_mode = relative
+beam0_pulse_interpolation = linear
+beam0_pulse_time_scale = 1.0
+beam0_pulse_power_scale = 1.0
+```
+
+The default `relative` mode treats the second column as a multiplier on `beamN_power`.
+In `absolute` mode it is the total beam power in the selected `laser/unit_system`, matching
+FLASH power/time tables; `beamN_power` is then ignored while the file is active. The
+optional scales multiply the two file columns before use. `beamN_start_time` and
+`beamN_end_time` remain an additional gate. Under MPI, rank 0 reads and validates each
+file once and broadcasts the resulting table.
+
+`inputs/mhd/two_temperature_laser_lens.athinput` combines the focused geometry, a finite
+target spot, Gaussian aperture weights, and `two_temperature_laser_ramp.pulse` in a
+runnable example.
 
 ## Ray data fields
 

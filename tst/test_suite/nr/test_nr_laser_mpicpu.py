@@ -13,6 +13,7 @@ from test_suite.nr.test_nr_laser_cpu import (
 
 
 input_file = "../../../inputs/mhd/two_temperature_laser.athinput"
+pulse_file = "../../../tst/inputs/laser_multiknot.pulse"
 
 
 def run_mpi_case(basename, ranks, flags):
@@ -87,6 +88,34 @@ def test_run():
         direct_flags = slab_flags + ["laser/gpu_aware_mpi=true"]
         direct = fields(run_mpi_case("laser_mpi_direct_2", 2, direct_flags))
         compare_fields(direct, reference)
+
+        # A rank-0 pulse-file read and an external focused lens are invariant to
+        # the two-rank decomposition.
+        lens_flags = [
+            "mesh/nx1=32", "mesh/nx2=32", "mesh/nx3=1",
+            "meshblock/nx1=8", "meshblock/nx2=8", "meshblock/nx3=1",
+            "laser/beam0_nrays=37",
+            "laser/beam0_geometry=lens",
+            "laser/beam0_lens_x1=-0.25",
+            "laser/beam0_lens_x2=0.0",
+            "laser/beam0_target_x1=0.75",
+            "laser/beam0_target_x2=0.0",
+            "laser/beam0_radius=0.25",
+            "laser/beam0_target_radius=0.05",
+            "laser/beam0_profile=gaussian",
+            "laser/beam0_profile_radius=0.12",
+            f"laser/beam0_pulse_file={pulse_file}",
+            "laser/beam0_pulse_mode=relative",
+            "laser/absorption_coefficient=0.5",
+            "laser/max_segments_per_launch=4",
+            "laser/max_transport_iterations=16",
+            "laser/gpu_aware_mpi=false",
+        ]
+        lens_reference = fields(run_mpi_case(
+            "laser_mpi_lens_pulse_1", 1, lens_flags))
+        lens_parallel = fields(run_mpi_case(
+            "laser_mpi_lens_pulse_2", 2, lens_flags))
+        compare_fields(lens_parallel, lens_reference)
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

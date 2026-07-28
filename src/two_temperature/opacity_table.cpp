@@ -233,7 +233,8 @@ OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
       Real converted = group_scale*tokens.Number("radiation group boundary");
       Real expected = expected_group_bounds.h_view(g);
       Real magnitude =
-          std::max(1.0, std::max(std::abs(converted), std::abs(expected)));
+          std::max(static_cast<Real>(1.0),
+                   std::max(std::abs(converted), std::abs(expected)));
       if (std::abs(converted-expected) > 1.0e-10*magnitude) {
         throw std::runtime_error(
             "radiation group boundaries do not match the input file");

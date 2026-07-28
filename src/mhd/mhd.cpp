@@ -78,6 +78,11 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     }
     nmhd = 5;
 
+  // density-temperature table EOS
+  } else if (eqn_of_state == "table" || eqn_of_state == "tabulated") {
+    peos = new TabulatedMHD(ppack, pin);
+    nmhd = 5;
+
   // isothermal EOS
   } else if (eqn_of_state.compare("isothermal") == 0) {
     if (pmy_pack->pcoord->is_special_relativistic ||
@@ -102,7 +107,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   nscalars = nuser_scalars;
   bool use_two_temperature = pin->GetOrAddBoolean("mhd", "two_temperature", false);
   if (use_two_temperature) {
-    if (!peos->eos_data.is_ideal || pmy_pack->pcoord->is_special_relativistic ||
+    if (!peos->eos_data.is_gamma_law || pmy_pack->pcoord->is_special_relativistic ||
         pmy_pack->pcoord->is_general_relativistic ||
         pmy_pack->pcoord->is_dynamical_relativistic ||
         pin->DoesBlockExist("ion-neutral") || pin->DoesBlockExist("radiation")) {
@@ -187,7 +192,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pin->DoesParameterExist("mhd","alpha_iso") ||
       pin->DoesParameterExist("mhd","alpha_aniso") ||
       pin->DoesParameterExist("mhd","alpha_spitzer")) {
-    if (peos->eos_data.is_ideal) {
+    if (peos->eos_data.is_gamma_law) {
       pcond = new Conduction("mhd", ppack, pin);
     } else {
       std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
@@ -200,6 +205,14 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // Source terms (if needed)
   if (pin->DoesBlockExist("mhd_srcterms")) {
+    if (peos->eos_data.is_table &&
+        (pin->GetOrAddBoolean("mhd_srcterms", "ism_cooling", false) ||
+         pin->GetOrAddBoolean("mhd_srcterms", "rel_cooling", false))) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Tabulated EOS does not support gamma-law cooling "
+                << "source terms" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     psrc = new SourceTerms("mhd_srcterms", ppack, pin);
   }
 
@@ -352,6 +365,12 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
 
     // select Riemann solver (no default).  Test for compatibility of options
     std::string rsolver = pin->GetString("mhd","rsolver");
+    if (peos->eos_data.is_table && rsolver != "llf") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/eos=table currently requires rsolver=llf"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     // Special relativistic solvers
     if (pmy_pack->pcoord->is_special_relativistic) {
       if (evolution_t.compare("dynamic") == 0) {

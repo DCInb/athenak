@@ -130,12 +130,15 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
         Real &w_bz = bcc0_(m,IBZ,k,j,i);
         Real cf;
         if (eos.is_ideal) {
-          Real p = eos.IdealGasPressure(w0_(m,IEN,k,j,i));
-          cf = eos.IdealMHDFastSpeed(w_d, p, w_bx, w_by, w_bz);
+          Real eint = w0_(m,IEN,k,j,i);
+          cf = eos.FastMagnetosonicSpeedFromRhoEint(
+              w_d, eint, w_bx, w_by, w_bz);
           max_dv1 = fabs(w0_(m,IVX,k,j,i)) + cf;
-          cf = eos.IdealMHDFastSpeed(w_d, p, w_by, w_bz, w_bx);
+          cf = eos.FastMagnetosonicSpeedFromRhoEint(
+              w_d, eint, w_by, w_bz, w_bx);
           max_dv2 = fabs(w0_(m,IVY,k,j,i)) + cf;
-          cf = eos.IdealMHDFastSpeed(w_d, p, w_bz, w_bx, w_by);
+          cf = eos.FastMagnetosonicSpeedFromRhoEint(
+              w_d, eint, w_bz, w_bx, w_by);
           max_dv3 = fabs(w0_(m,IVZ,k,j,i)) + cf;
         } else {
           cf = eos.IdealMHDFastSpeed(w_d, w_bx, w_by, w_bz);

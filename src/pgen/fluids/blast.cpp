@@ -189,10 +189,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // initialize Hydro variables ----------------------------------------------------------
   if (pmbp->phydro != nullptr) {
     auto &w0_ = pmbp->phydro->w0;
-    Real gm1 = pmbp->phydro->peos->eos_data.gamma - 1.0;
-    if (pmbp->pcoord->is_dynamical_relativistic) {
-      gm1 = 1.0; // DynGRMHD uses pressure, not energy.
-    }
+    auto eos = pmbp->phydro->peos->eos_data;
+    bool dynamical_relativity = pmbp->pcoord->is_dynamical_relativistic;
     par_for("pgen_blast1",DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m,int k,int j,int i) {
       Real &x1min = size.d_view(m).x1min;
@@ -230,7 +228,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       w0_(m,IVX,k,j,i) = 0.0;
       w0_(m,IVY,k,j,i) = 0.0;
       w0_(m,IVZ,k,j,i) = 0.0;
-      w0_(m,IEN,k,j,i) = pres/gm1;
+      w0_(m,IEN,k,j,i) = dynamical_relativity
+          ? pres : eos.InternalEnergyDensityFromRhoPressure(den, pres);
     });
 
     // Convert primitives to conserved
@@ -242,10 +241,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // initialize MHD variables ------------------------------------------------------------
   if (pmbp->pmhd != nullptr) {
     auto &w0_ = pmbp->pmhd->w0;
-    Real gm1 = pmbp->pmhd->peos->eos_data.gamma - 1.0;
-    if (pmbp->pcoord->is_dynamical_relativistic) {
-      gm1 = 1.0; // DynGRMHD uses pressure, not energy.
-    }
+    auto eos = pmbp->pmhd->peos->eos_data;
+    bool dynamical_relativity = pmbp->pcoord->is_dynamical_relativistic;
     par_for("pgen_blast1",DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m,int k,int j,int i) {
       Real &x1min = size.d_view(m).x1min;
@@ -297,7 +294,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       w0_(m,IVX,k,j,i) = 0.0;
       w0_(m,IVY,k,j,i) = 0.0;
       w0_(m,IVZ,k,j,i) = 0.0;
-      w0_(m,IEN,k,j,i) = pres/gm1;
+      w0_(m,IEN,k,j,i) = dynamical_relativity
+          ? pres : eos.InternalEnergyDensityFromRhoPressure(den, pres);
     });
 
     // initialize magnetic fields

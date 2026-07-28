@@ -11,6 +11,7 @@ import test_suite.testutils as testutils
 
 input_file = "../../../inputs/mhd/two_temperature_laser.athinput"
 reflection_input = "../../../inputs/mhd/two_temperature_laser_reflection.athinput"
+pulse_file = "../../../tst/inputs/laser_multiknot.pulse"
 SOURCE_DT = 1.0e-6
 
 
@@ -324,6 +325,77 @@ def test_run():
                            rtol=2.0e-11, atol=2.0e-13)
         assert np.array_equal(data["laser_ray_count"], np.ones(8))
 
+        # A FLASH-style lens outside the mesh is clipped to the boundary and all
+        # aperture samples converge through the requested point-focus cell.
+        nrays_focus = 37
+        focus_flags = [
+            "job/basename=laser_lens_focus",
+            "mesh/nx1=16", "mesh/nx2=16", "mesh/nx3=16",
+            "meshblock/nx1=8", "meshblock/nx2=8", "meshblock/nx3=8",
+            "laser/absorption_coefficient=0.0",
+            f"laser/beam0_nrays={nrays_focus}",
+            "laser/beam0_geometry=lens",
+            "laser/beam0_lens_x1=-0.5",
+            "laser/beam0_lens_x2=0.03125",
+            "laser/beam0_lens_x3=0.03125",
+            "laser/beam0_target_x1=0.71875",
+            "laser/beam0_target_x2=0.03125",
+            "laser/beam0_target_x3=0.03125",
+            "laser/beam0_radius=0.25",
+            "laser/beam0_target_radius=0.0",
+            "laser/report_diagnostics=false",
+            "time/tlim=1.0e-7",
+            "output1/dt=-1.0", "output2/dt=-1.0", "output3/dt=-1.0",
+            "output4/dt=1.0e-7",
+        ]
+        assert testutils.run(input_file, flags=focus_flags), (
+            "Focused lens/target laser run failed.")
+        focus = read_laser_binary("bin/laser_lens_focus.laser_full.00001.bin")
+        focus_count = assemble_binary_field(focus, "laser_ray_count")
+        assert focus_count[8, 8, 11] == nrays_focus
+        assert np.count_nonzero(focus_count[:, :, 0]) > 1
+
+        # An external lens on the upper face enters in the negative direction.
+        # A finite target contracts, but does not collapse, its Gaussian aperture.
+        finite_flags = focus_flags.copy()
+        replacements = {
+            "job/basename": "job/basename=laser_lens_finite",
+            "laser/beam0_lens_x1": "laser/beam0_lens_x1=1.5",
+            "laser/beam0_target_x1": "laser/beam0_target_x1=0.28125",
+            "laser/beam0_target_radius": "laser/beam0_target_radius=0.0625",
+        }
+        for index, flag in enumerate(finite_flags):
+            key = flag.split("=", 1)[0]
+            if key in replacements:
+                finite_flags[index] = replacements[key]
+        finite_flags.extend([
+            "laser/beam0_profile=gaussian",
+            "laser/beam0_profile_radius=0.12",
+        ])
+        assert testutils.run(input_file, flags=finite_flags), (
+            "Finite-target upper-face lens run failed.")
+        finite = read_laser_binary("bin/laser_lens_finite.laser_full.00001.bin")
+        finite_count = assemble_binary_field(finite, "laser_ray_count")
+        launch_support = np.count_nonzero(finite_count[:, :, 15])
+        target_support = np.count_nonzero(finite_count[:, :, 4])
+        assert launch_support > 0
+        assert 1 < target_support < launch_support
+
+        # Log-space normalization keeps at least the nearest aperture sample active
+        # even when all unshifted Gaussian weights would underflow.
+        narrow_flags = focus_flags + [
+            "job/basename=laser_lens_narrow",
+            "laser/beam0_profile=gaussian",
+            "laser/beam0_profile_radius=1.0e-30",
+        ]
+        assert testutils.run(input_file, flags=narrow_flags), (
+            "Narrow-Gaussian lens run failed.")
+        narrow = read_laser_binary("bin/laser_lens_narrow.laser_full.00001.bin")
+        narrow_count = assemble_binary_field(narrow, "laser_ray_count")
+        assert np.sum(narrow_count) > 0.0
+        for field in narrow["mb_data"].values():
+            assert np.all(np.isfinite(np.asarray(field)))
+
         # Cover all direction signs, exact face/edge/corner starts, zero direction
         # components, diagonals, and a deterministic randomized ray set in 3D.
         geometry_cases = [
@@ -393,6 +465,48 @@ def test_run():
                            rtol=2.0e-12, atol=2.0e-13)
         assert np.allclose(final["tion"], 1.0,
                            rtol=2.0e-12, atol=2.0e-13)
+
+        # The prescribed pulse is averaged analytically over the full step. Its
+        # multi-knot integral gives a 1.5 power multiplier for every RK scheme.
+        for integrator in ("rk1", "rk2", "rk3"):
+            laser, _, _ = run_absorption_case(f"laser_pulse_{integrator}", [
+                f"time/integrator={integrator}",
+                f"laser/absorption_coefficient={coefficient}",
+                f"laser/beam0_pulse_file={pulse_file}",
+                "laser/beam0_pulse_mode=relative",
+                "laser/beam0_pulse_interpolation=linear",
+            ])
+            expected_q = 1.5*constant_absorption_profile(
+                laser["x1v"], coefficient)
+            assert np.allclose(laser["laser_q"], expected_q,
+                               rtol=2.0e-11, atol=2.0e-13)
+            assert np.allclose(laser["laser_energy"], expected_q*SOURCE_DT,
+                               rtol=2.0e-11, atol=2.0e-18)
+
+        # Absolute mode ignores beam0_power. Step interpolation and end_time are
+        # independently exercised because their integral differs over half the table.
+        laser, _, _ = run_absorption_case("laser_pulse_absolute", [
+            f"laser/absorption_coefficient={coefficient}",
+            f"laser/beam0_pulse_file={pulse_file}",
+            "laser/beam0_pulse_mode=absolute",
+            "laser/beam0_power=9.0",
+        ])
+        expected_q = 1.5*constant_absorption_profile(
+            laser["x1v"], coefficient)
+        assert np.allclose(laser["laser_q"], expected_q,
+                           rtol=2.0e-11, atol=2.0e-13)
+
+        laser, _, _ = run_absorption_case("laser_pulse_step_gate", [
+            f"laser/absorption_coefficient={coefficient}",
+            f"laser/beam0_pulse_file={pulse_file}",
+            "laser/beam0_pulse_mode=relative",
+            "laser/beam0_pulse_interpolation=step",
+            "laser/beam0_end_time=5.0e-7",
+        ])
+        expected_q = 0.5*constant_absorption_profile(
+            laser["x1v"], coefficient)
+        assert np.allclose(laser["laser_q"], expected_q,
+                           rtol=2.0e-11, atol=2.0e-13)
 
         # With B^2/2=5e17, the total-energy increment is below its floating-point
         # spacing. The dual 2T electron equation must still retain laser heating.

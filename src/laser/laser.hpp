@@ -29,6 +29,8 @@ namespace laser {
 enum class DepositionTarget {total, electron};
 enum class AbsorptionModel {constant, inverse_bremsstrahlung};
 enum class PropagationModel {straight, refractive};
+enum class BeamGeometry {direction, lens};
+enum class PulseInterpolation {linear, step};
 enum class RayStatus : int {inactive = -1, active = 0, escaped = 1, absorbed = 2,
                             off_rank = 3, remaining = 4, failed = 5};
 
@@ -68,12 +70,20 @@ struct BeamConfig {
   Real origin[3];
   Real direction[3];
   Real radius;
+  Real profile_radius;
+  Real target[3];
+  Real target_radius;
   Real start_time;
   Real end_time;
   Real zeff;
   Real constant_absorption;
   int nrays;
   std::string profile;
+  BeamGeometry geometry;
+  PulseInterpolation pulse_interpolation;
+  bool pulse_is_absolute;
+  std::vector<Real> pulse_time;
+  std::vector<Real> pulse_value;
 };
 
 struct LaserDiagnostics {
@@ -135,6 +145,8 @@ class Laser {
   // Public because CUDA extended device lambdas cannot be instantiated from private
   // member functions on all supported toolchains.
   void BuildInitialRays();
+  Real BeamPowerAtTime(const BeamConfig &beam, Real time) const;
+  Real BeamPowerForStep(const BeamConfig &beam, Real time, Real dt) const;
   void RefreshGlobalBlockInfo();
   void InitializeRays(Real time);
   void TraceStraightRays(bool preserve_off_rank = false);
@@ -188,10 +200,11 @@ class Laser {
 
   DvceArray1D<Real> ray_x0_, ray_y0_, ray_z0_;
   DvceArray1D<Real> ray_nx0_, ray_ny0_, ray_nz0_;
-  DvceArray1D<Real> ray_power0_, ray_wavelength_;
+  DvceArray1D<Real> ray_power0_, ray_power_fraction_, ray_wavelength_;
   DvceArray1D<Real> ray_zeff_, ray_constant_absorption_;
   DvceArray1D<Real> ray_start_time_, ray_end_time_;
   DvceArray1D<int> ray_beam_, ray_segments_, ray_reflections_;
+  DvceArray1D<Real> beam_power_;
   DvceArray1D<Real> ray_path_length_;
   DvceArray1D<Real> ray_kx_, ray_ky_, ray_kz_, ray_dispersion_error_;
   DvceArray1D<int> active_queue_a_, active_queue_b_;

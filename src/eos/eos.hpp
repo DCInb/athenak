@@ -15,6 +15,7 @@
 #include <string>
 
 #include "athena.hpp"
+#include "eos/table_eos.hpp"
 #include "mesh/meshblock.hpp"
 #include "parameter_input.hpp"
 
@@ -28,15 +29,76 @@ struct EOS_Data {
   Real gamma;        // ratio of specific heats for ideal gas
   Real iso_cs;       // isothermal sound speed
   bool is_ideal;     // flag to denote ideal gas EOS
+  bool is_gamma_law = false;
+  bool is_table = false;
   Real dfloor, pfloor, tfloor, sfloor;  // density, pressure, temperature, entropy floors
   Real gamma_max;    // ceiling on Lorentz factor in SR/GR
   Real sigma_max;    // ceiling on magnetization in MHD
+  TableEOSData table;
 
   // IDEAL GAS PRESSURE: converts primitive variable (either internal energy density e
   // or temperature e/d) into pressure.
   KOKKOS_INLINE_FUNCTION
   Real IdealGasPressure(const Real eint) const {
     return ((gamma-1.0)*eint);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real PressureFromRhoEint(const Real density, const Real eint) const {
+    if (is_table) return table.PressureFromRhoEint(density, eint);
+    if (is_ideal) return IdealGasPressure(eint);
+    return density*SQR(iso_cs);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real TemperatureFromRhoEint(const Real density, const Real eint) const {
+    if (is_table) return table.TemperatureFromRhoEint(density, eint);
+    if (is_ideal) return (gamma-1.0)*eint/density;
+    return SQR(iso_cs);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real InternalEnergyDensityFromRhoPressure(const Real density,
+                                            const Real pressure) const {
+    if (is_table) return table.EintDensityFromRhoPressure(density, pressure);
+    return pressure/(gamma-1.0);
+  }
+
+  Real HostInternalEnergyDensityFromRhoPressure(const Real density,
+                                                const Real pressure) const {
+    if (is_table) return table.HostEintDensityFromRhoPressure(density, pressure);
+    return pressure/(gamma-1.0);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real HydroSoundSpeed2FromRhoEint(const Real density, const Real eint) const {
+    if (is_table) return table.SoundSpeed2FromRhoEint(density, eint);
+    if (is_ideal) return gamma*IdealGasPressure(eint)/density;
+    return SQR(iso_cs);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real FastMagnetosonicSpeedFromRhoEint(const Real density, const Real eint,
+                                        const Real bx, const Real by,
+                                        const Real bz) const {
+    Real asq = density*HydroSoundSpeed2FromRhoEint(density, eint);
+    Real ct2 = by*by+bz*bz;
+    Real qsq = bx*bx+ct2+asq;
+    Real tmp = bx*bx+ct2-asq;
+    return sqrt(0.5*(qsq+sqrt(tmp*tmp+4.0*asq*ct2))/density);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real HydroInternalEnergyDensityFloor(const Real density) const {
+    if (is_table) {
+      return table.MinimumEintDensity(density, pfloor, tfloor);
+    }
+    Real floor = pfloor/(gamma-1.0);
+    if (tfloor > 0.0) floor = fmax(floor, density*tfloor/(gamma-1.0));
+    if (sfloor > 0.0) {
+      floor = fmax(floor, density*sfloor*pow(density, gamma-1.0)/(gamma-1.0));
+    }
+    return floor;
   }
 
   // NON-RELATIVISTIC IDEAL GAS HYDRO: inlined sound speed function
@@ -246,6 +308,25 @@ class IsothermalHydro : public EquationOfState {
 };
 
 //----------------------------------------------------------------------------------------
+//! \class TabulatedHydro
+//! \brief Density-temperature table EOS for nonrelativistic hydro
+
+class TabulatedHydro : public EquationOfState {
+ public:
+  using EquationOfState::ConsToPrim;
+  using EquationOfState::PrimToCons;
+
+  TabulatedHydro(MeshBlockPack *pp, ParameterInput *pin);
+  void ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
+                  const bool only_testfloors,
+                  const int il, const int iu, const int jl, const int ju,
+                  const int kl, const int ku) override;
+  void PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &cons,
+                  const int il, const int iu, const int jl, const int ju,
+                  const int kl, const int ku) override;
+};
+
+//----------------------------------------------------------------------------------------
 //! \class IdealHydro
 //! \brief Derived class for ideal gas EOS in nonrelativistic hydro
 
@@ -316,6 +397,26 @@ class IsothermalMHD : public EquationOfState {
   using EquationOfState::PrimToCons;
 
   IsothermalMHD(MeshBlockPack *pp, ParameterInput *pin);
+  void ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
+                  DvceArray5D<Real> &prim, DvceArray5D<Real> &bcc,
+                  const bool only_testfloors,
+                  const int il, const int iu, const int jl, const int ju,
+                  const int kl, const int ku) override;
+  void PrimToCons(const DvceArray5D<Real> &prim, const DvceArray5D<Real> &bcc,
+                  DvceArray5D<Real> &cons, const int il, const int iu,
+                  const int jl, const int ju, const int kl, const int ku) override;
+};
+
+//----------------------------------------------------------------------------------------
+//! \class TabulatedMHD
+//! \brief Density-temperature table EOS for nonrelativistic MHD
+
+class TabulatedMHD : public EquationOfState {
+ public:
+  using EquationOfState::ConsToPrim;
+  using EquationOfState::PrimToCons;
+
+  TabulatedMHD(MeshBlockPack *pp, ParameterInput *pin);
   void ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
                   DvceArray5D<Real> &prim, DvceArray5D<Real> &bcc,
                   const bool only_testfloors,

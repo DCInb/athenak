@@ -7,6 +7,7 @@
 //! \brief GPU-resident aperture initialization, DDA marching, and queue compaction.
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -26,6 +27,12 @@
 #endif
 
 namespace {
+
+#if SINGLE_PRECISION_ENABLED
+constexpr Real kRealMaximum = FLT_MAX;
+#else
+constexpr Real kRealMaximum = DBL_MAX;
+#endif
 
 KOKKOS_INLINE_FUNCTION
 bool ContainsPoint(const RegionSize &size, Real x, Real y, Real z,
@@ -69,13 +76,47 @@ int ActiveCellIndex(Real x, Real xmin, Real dx, int is, int ie) {
   return (index < is) ? is : ((index > ie) ? ie : index);
 }
 
+KOKKOS_INLINE_FUNCTION
+Real ProbeForward(Real coordinate, Real direction, Real distance) {
+  if (direction == 0.0) return coordinate;
+  Real result = coordinate+distance*direction;
+  if (result == coordinate) {
+    Real limit = (direction > 0.0) ? kRealMaximum : -kRealMaximum;
+    result = nextafter(coordinate, limit);
+  }
+  return result;
+}
+
+bool FirstDomainIntersection(const RegionSize &domain, bool multi_d, bool three_d,
+                             const Real origin[3], const Real direction[3],
+                             Real &distance) {
+  Real lower[3] = {domain.x1min, domain.x2min, domain.x3min};
+  Real upper[3] = {domain.x1max, domain.x2max, domain.x3max};
+  int dimensions = three_d ? 3 : (multi_d ? 2 : 1);
+  Real enter = 0.0;
+  Real leave = std::numeric_limits<Real>::max();
+  for (int n = 0; n < dimensions; ++n) {
+    if (direction[n] == 0.0) {
+      if (origin[n] < lower[n] || origin[n] > upper[n]) return false;
+      continue;
+    }
+    Real first = (lower[n]-origin[n])/direction[n];
+    Real second = (upper[n]-origin[n])/direction[n];
+    enter = std::max(enter, std::min(first, second));
+    leave = std::min(leave, std::max(first, second));
+  }
+  if (leave < enter || leave < 0.0) return false;
+  distance = enter;
+  return true;
+}
+
 } // namespace
 
 namespace laser {
 
 //----------------------------------------------------------------------------------------
-//! Build a deterministic equal-area Fibonacci aperture. Gaussian weights are evaluated
-//! at those equal-area samples and normalized exactly to the requested beam power.
+//! Build a deterministic equal-area Fibonacci aperture. Direction beams remain parallel;
+//! lens beams connect each aperture sample to the corresponding finite target spot.
 
 void Laser::BuildInitialRays() {
   auto hx = Kokkos::create_mirror_view(ray_x0_);
@@ -85,6 +126,7 @@ void Laser::BuildInitialRays() {
   auto hny = Kokkos::create_mirror_view(ray_ny0_);
   auto hnz = Kokkos::create_mirror_view(ray_nz0_);
   auto hp = Kokkos::create_mirror_view(ray_power0_);
+  auto hfraction = Kokkos::create_mirror_view(ray_power_fraction_);
   auto hlambda = Kokkos::create_mirror_view(ray_wavelength_);
   auto hzbar = Kokkos::create_mirror_view(ray_zeff_);
   auto hk = Kokkos::create_mirror_view(ray_constant_absorption_);
@@ -118,8 +160,8 @@ void Laser::BuildInitialRays() {
     std::vector<Real> offset_u(beam.nrays, 0.0);
     std::vector<Real> offset_v(beam.nrays, 0.0);
     std::vector<Real> sample_radius(beam.nrays, 0.0);
-    std::vector<Real> weight(beam.nrays, 1.0);
-    Real weight_sum = 0.0;
+    std::vector<long double> log_weight(beam.nrays, 0.0L);
+    long double maximum_log_weight = -std::numeric_limits<long double>::infinity();
     for (int n = 0; n < beam.nrays; ++n) {
       if (beam.radius > 0.0 && pmy_pack_->pmesh->three_d) {
         sample_radius[n] =
@@ -133,9 +175,28 @@ void Laser::BuildInitialRays() {
         sample_radius[n] = std::abs(offset_u[n]);
       }
       if (beam.profile == "gaussian" && beam.radius > 0.0) {
-        weight[n] = std::exp(-2.0*SQR(sample_radius[n]/beam.radius));
+        long double scaled_radius =
+            static_cast<long double>(sample_radius[n])/
+            static_cast<long double>(beam.profile_radius);
+        log_weight[n] = -2.0L*scaled_radius*scaled_radius;
+        maximum_log_weight = std::max(maximum_log_weight, log_weight[n]);
       }
-      weight_sum += weight[n];
+    }
+    std::vector<Real> weight(beam.nrays, 1.0);
+    long double weight_sum = static_cast<long double>(beam.nrays);
+    if (beam.profile == "gaussian" && beam.radius > 0.0) {
+      weight_sum = 0.0L;
+      for (int n = 0; n < beam.nrays; ++n) {
+        weight[n] = static_cast<Real>(
+            std::exp(log_weight[n]-maximum_log_weight));
+        weight_sum += static_cast<long double>(weight[n]);
+      }
+    }
+    if (!std::isfinite(weight_sum) || !(weight_sum > 0.0L)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<laser> could not normalize beam " << b
+                << " ray weights" << std::endl;
+      std::exit(EXIT_FAILURE);
     }
 
     for (int n = 0; n < beam.nrays; ++n, ++ray) {
@@ -144,9 +205,36 @@ void Laser::BuildInitialRays() {
       hx(ray) = beam.origin[0] + du*basis_u[0] + dv*basis_v[0];
       hy(ray) = beam.origin[1] + du*basis_u[1] + dv*basis_v[1];
       hz(ray) = beam.origin[2] + du*basis_u[2] + dv*basis_v[2];
-      hnx(ray) = beam.direction[0]; hny(ray) = beam.direction[1];
-      hnz(ray) = beam.direction[2];
-      hp(ray) = beam.power*weight[n]/weight_sum;
+      if (beam.geometry == BeamGeometry::lens) {
+        Real spot_scale = (beam.radius > 0.0) ? beam.target_radius/beam.radius : 0.0;
+        Real tx = beam.target[0] + spot_scale*(du*basis_u[0] + dv*basis_v[0]);
+        Real ty = beam.target[1] + spot_scale*(du*basis_u[1] + dv*basis_v[1]);
+        Real tz = beam.target[2] + spot_scale*(du*basis_u[2] + dv*basis_v[2]);
+        Real dx = tx-hx(ray);
+        Real dy = ty-hy(ray);
+        Real dz = tz-hz(ray);
+        Real dnorm = std::sqrt(SQR(dx)+SQR(dy)+SQR(dz));
+        hnx(ray) = dx/dnorm; hny(ray) = dy/dnorm; hnz(ray) = dz/dnorm;
+      } else {
+        hnx(ray) = beam.direction[0]; hny(ray) = beam.direction[1];
+        hnz(ray) = beam.direction[2];
+      }
+      if (beam.geometry == BeamGeometry::lens) {
+        Real origin[3] = {hx(ray), hy(ray), hz(ray)};
+        Real direction[3] = {hnx(ray), hny(ray), hnz(ray)};
+        Real distance = 0.0;
+        if (FirstDomainIntersection(pmy_pack_->pmesh->mesh_size,
+                                    pmy_pack_->pmesh->multi_d,
+                                    pmy_pack_->pmesh->three_d,
+                                    origin, direction, distance)) {
+          hx(ray) += distance*hnx(ray);
+          hy(ray) += distance*hny(ray);
+          hz(ray) += distance*hnz(ray);
+        }
+      }
+      hfraction(ray) = static_cast<Real>(
+          static_cast<long double>(weight[n])/weight_sum);
+      hp(ray) = beam.power*hfraction(ray);
       hlambda(ray) = beam.wavelength;
       hzbar(ray) = beam.zeff;
       hk(ray) = beam.constant_absorption;
@@ -158,7 +246,9 @@ void Laser::BuildInitialRays() {
   Kokkos::deep_copy(ray_x0_, hx); Kokkos::deep_copy(ray_y0_, hy);
   Kokkos::deep_copy(ray_z0_, hz); Kokkos::deep_copy(ray_nx0_, hnx);
   Kokkos::deep_copy(ray_ny0_, hny); Kokkos::deep_copy(ray_nz0_, hnz);
-  Kokkos::deep_copy(ray_power0_, hp); Kokkos::deep_copy(ray_wavelength_, hlambda);
+  Kokkos::deep_copy(ray_power0_, hp);
+  Kokkos::deep_copy(ray_power_fraction_, hfraction);
+  Kokkos::deep_copy(ray_wavelength_, hlambda);
   Kokkos::deep_copy(ray_zeff_, hzbar); Kokkos::deep_copy(ray_constant_absorption_, hk);
   Kokkos::deep_copy(ray_start_time_, ht0); Kokkos::deep_copy(ray_end_time_, ht1);
   Kokkos::deep_copy(ray_beam_, hb);
@@ -168,6 +258,13 @@ void Laser::BuildInitialRays() {
 //! Restore immutable launch data and map every live ray into a local MeshBlock/cell.
 
 void Laser::InitializeRays(Real time) {
+  auto host_beam_power = Kokkos::create_mirror_view(beam_power_);
+  Real dt = pmy_pack_->pmesh->dt;
+  for (std::size_t b = 0; b < beams_.size(); ++b) {
+    host_beam_power(static_cast<int>(b)) = BeamPowerForStep(beams_[b], time, dt);
+  }
+  Kokkos::deep_copy(beam_power_, host_beam_power);
+
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
   auto global_blocks = global_block_info_;
@@ -180,8 +277,10 @@ void Laser::InitializeRays(Real time) {
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
-  Real domain_scale = fmax(pmy_pack_->pmesh->mesh_size.x1max-
-                           pmy_pack_->pmesh->mesh_size.x1min, 1.0);
+  RegionSize domain = pmy_pack_->pmesh->mesh_size;
+  Real domain_scale = fmax(domain.x1max-domain.x1min, 1.0);
+  if (multi_d) domain_scale = fmax(domain_scale, domain.x2max-domain.x2min);
+  if (three_d) domain_scale = fmax(domain_scale, domain.x3max-domain.x3min);
   Real probe_eps = 128.0*std::numeric_limits<Real>::epsilon()*domain_scale;
 
   auto x = ray_x; auto y = ray_y; auto z = ray_z;
@@ -194,7 +293,9 @@ void Laser::InitializeRays(Real time) {
   auto x0 = ray_x0_; auto y0 = ray_y0_; auto z0 = ray_z0_;
   auto nx0 = ray_nx0_; auto ny0 = ray_ny0_; auto nz0 = ray_nz0_;
   auto power0 = ray_power0_;
-  auto start = ray_start_time_; auto end = ray_end_time_;
+  auto power_fraction = ray_power_fraction_;
+  auto beam_index = ray_beam_;
+  auto beam_power = beam_power_;
   auto segments = ray_segments_; auto reflections = ray_reflections_;
   auto path = ray_path_length_;
   auto destination_rank = ray_destination_rank_;
@@ -214,7 +315,8 @@ void Laser::InitializeRays(Real time) {
         nx(r) = nx0(r); ny(r) = ny0(r); nz(r) = nz0(r);
         wave_x(r) = 0.0; wave_y(r) = 0.0; wave_z(r) = 0.0;
         dispersion_error(r) = 0.0;
-        power(r) = (time >= start(r) && time <= end(r)) ? power0(r) : 0.0;
+        power0(r) = power_fraction(r)*beam_power(beam_index(r));
+        power(r) = power0(r);
         segments(r) = 0;
         reflections(r) = 0;
         path(r) = 0.0;
@@ -224,9 +326,9 @@ void Laser::InitializeRays(Real time) {
         status(r) = static_cast<int>(RayStatus::inactive);
         if (!(power(r) > 0.0)) return;
 
-        Real px = x(r) + probe_eps*nx(r);
-        Real py = y(r) + probe_eps*ny(r);
-        Real pz = z(r) + probe_eps*nz(r);
+        Real px = ProbeForward(x(r), nx(r), probe_eps);
+        Real py = ProbeForward(y(r), ny(r), probe_eps);
+        Real pz = ProbeForward(z(r), nz(r), probe_eps);
         int m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
         if (m < 0) {
           int global_m = FindGlobalBlock(

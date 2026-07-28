@@ -8,12 +8,13 @@
 //! \file tr_table.hpp
 //! \brief Declares Table class
 
-#include <string>
-#include <map>
-#include <vector>
+#include <exception>
 #include <fstream>
+#include <map>
 #include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace TableReader {
 
@@ -23,7 +24,7 @@ struct ReadResult {
     BAD_FILENAME,
     BAD_HEADER
   };
-  ErrorCode error;
+  ErrorCode error = SUCCESS;
   std::string message;
 };
 
@@ -92,7 +93,16 @@ class Table {
         result.message = ss.str();
         return result;
       } else {
-        add(key, value);
+        try {
+          add(key, value);
+        } catch (const std::exception &error) {
+          result.error = ReadResult::BAD_HEADER;
+          std::stringstream ss;
+          ss << "Invalid value in " << name << " line '" << line
+             << "': " << error.what() << "\n";
+          result.message = ss.str();
+          return result;
+        }
       }
     }
     result.error = ReadResult::SUCCESS;
@@ -111,7 +121,7 @@ class Table {
   std::vector<std::string> field_names;
   std::map<std::string, double> scalars;
   std::map<std::string, double*> fields;
-  double * data;
+  double *data;
   size_t ndim;
   size_t npoints;
   size_t mem_size;

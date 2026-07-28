@@ -54,7 +54,7 @@ void EOSHybrid<LogPolicy>::ReadTableFromFile(std::string fname) {
     HostArray2D<Real>::HostMirror host_table =  create_mirror_view(m_table);
 
     { // read nb
-      Real * table_nb = table["nb"];
+      const double *table_nb = table["nb"];
 
       for (size_t in=0; in<m_nn; ++in) {
         host_log_nb(in) = log2_(table_nb[in]);
@@ -66,7 +66,7 @@ void EOSHybrid<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q1 -> log(P)
-      Real * table_Q1 = table["Q1"];
+      const double *table_Q1 = table["Q1"];
       for (size_t in=0; in<m_nn; ++in) {
         Real p_current = table_Q1[in]*exp2_(host_log_nb(in));
         host_table(ECLOGP,in) = log2_(p_current);
@@ -74,35 +74,35 @@ void EOSHybrid<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q2 -> S
-      Real * table_Q2 = table["Q2"];
+      const double *table_Q2 = table["Q2"];
       for (size_t in=0; in<m_nn; ++in) {
         host_table(ECENT,in) = table_Q2[in];
       }
     }
 
     { // Read Q3-> mu_b
-      Real * table_Q3 = table["Q3"];
+      const double *table_Q3 = table["Q3"];
       for (size_t in=0; in<m_nn; ++in) {
         host_table(ECMUB,in) = (table_Q3[in]+1)*mb;
       }
     }
 
     { // Read Q4-> mu_q
-      Real * table_Q4 = table["Q4"];
+      const double *table_Q4 = table["Q4"];
       for (size_t in=0; in<m_nn; ++in) {
         host_table(ECMUQ,in) = table_Q4[in]*mb;
       }
     }
 
     { // Read Q5-> mu_le
-      Real * table_Q5 = table["Q5"];
+      const double *table_Q5 = table["Q5"];
       for (size_t in=0; in<m_nn; ++in) {
         host_table(ECMUL,in) = table_Q5[in]*mb;
       }
     }
 
     { // Read Q7-> log(e)
-      Real * table_Q7 = table["Q7"];
+      const double *table_Q7 = table["Q7"];
       for (size_t in=0; in<m_nn; ++in) {
         Real e_current = mb*(table_Q7[in] + 1)*exp2_(host_log_nb(in));
         host_table(ECLOGE,in) = log2_(e_current);
@@ -110,7 +110,7 @@ void EOSHybrid<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read cs2-> cs
-      Real * table_cs2 = table["cs2"];
+      const double *table_cs2 = table["cs2"];
       for (size_t in=0; in<m_nn; ++in) {
         host_table(ECCS,in) = sqrt(table_cs2[in]);
       }

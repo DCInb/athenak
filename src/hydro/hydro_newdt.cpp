@@ -106,8 +106,8 @@ TaskStatus Hydro::NewTimeStep(Driver *pdrive, int stage) {
       } else {
         Real cs;
         if (eos.is_ideal) {
-          Real p = eos.IdealGasPressure(w0_(m,IEN,k,j,i));
-          cs = eos.IdealHydroSoundSpeed(w0_(m,IDN,k,j,i), p);
+          cs = sqrt(eos.HydroSoundSpeed2FromRhoEint(
+              w0_(m,IDN,k,j,i), w0_(m,IEN,k,j,i)));
         } else         {
           cs = eos.iso_cs;
         }

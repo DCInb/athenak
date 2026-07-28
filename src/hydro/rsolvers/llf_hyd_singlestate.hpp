@@ -39,8 +39,8 @@ void SingleStateLLF_Hyd(const HydPrim1D &wl, const HydPrim1D &wr, const EOS_Data
 
   Real el,er,pl,pr;
   if (eos.is_ideal) {
-    pl = eos.IdealGasPressure(wl.e);
-    pr = eos.IdealGasPressure(wr.e);
+    pl = eos.PressureFromRhoEint(wl.d, wl.e);
+    pr = eos.PressureFromRhoEint(wr.d, wr.e);
     el = wl.e + 0.5*wl.d*(SQR(wl.vx) + SQR(wl.vy) + SQR(wl.vz));
     er = wr.e + 0.5*wr.d*(SQR(wr.vx) + SQR(wr.vy) + SQR(wr.vz));
     fsum.mx += (pl + pr);
@@ -51,8 +51,8 @@ void SingleStateLLF_Hyd(const HydPrim1D &wl, const HydPrim1D &wr, const EOS_Data
 
   // Compute max wave speed in L,R states (see Toro eq. 10.43)
   if (eos.is_ideal) {
-    qa = eos.IdealHydroSoundSpeed(wl.d, pl);
-    qb = eos.IdealHydroSoundSpeed(wr.d, pr);
+    qa = sqrt(eos.HydroSoundSpeed2FromRhoEint(wl.d, wl.e));
+    qb = sqrt(eos.HydroSoundSpeed2FromRhoEint(wr.d, wr.e));
   } else {
     qa = eos.iso_cs;
     qb = eos.iso_cs;

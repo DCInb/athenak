@@ -65,7 +65,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     // n[i], n[i+1], yq[j], and yq[j+1], where i and j are the indices providing the
     // nearest table values at or below a specified i and yq.
     { // read nb
-      Real * table_nb = table["nb"];
+      const double *table_nb = table["nb"];
 
       for (size_t in=0; in<m_nn; ++in) {
         host_log_nb(in) = log2_(table_nb[in]);
@@ -77,7 +77,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // read yq
-      Real * table_yq = table["yq"];
+      const double *table_yq = table["yq"];
       for (size_t iy=0; iy<m_ny; ++iy) {
         host_yq(iy) = table_yq[iy];
       }
@@ -87,7 +87,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // read T
-      Real * table_t = table["t"];
+      const double *table_t = table["t"];
 
       for (size_t it=0; it<m_nt; ++it) {
         host_log_t(it) = log2_(table_t[it]);
@@ -99,7 +99,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q1 -> log(P)
-      Real * table_Q1 = table["Q1"];
+      const double *table_Q1 = table["Q1"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -112,7 +112,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q2 -> S
-      Real * table_Q2 = table["Q2"];
+      const double *table_Q2 = table["Q2"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -124,7 +124,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q3-> mu_b
-      Real * table_Q3 = table["Q3"];
+      const double *table_Q3 = table["Q3"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -136,7 +136,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q4-> mu_q
-      Real * table_Q4 = table["Q4"];
+      const double *table_Q4 = table["Q4"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -148,7 +148,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q5-> mu_le
-      Real * table_Q5 = table["Q5"];
+      const double *table_Q5 = table["Q5"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -160,7 +160,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q7-> log(e)
-      Real * table_Q7 = table["Q7"];
+      const double *table_Q7 = table["Q7"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -173,7 +173,7 @@ void EOSCompOSE<LogPolicy>::ReadTableFromFile(std::string fname) {
     }
 
     { // Read cs2-> cs
-      Real * table_cs2 = table["cs2"];
+      const double *table_cs2 = table["cs2"];
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {

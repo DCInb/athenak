@@ -52,6 +52,10 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       peos = new IdealHydro(ppack, pin);
     }
     nhydro = 5;
+  // density-temperature table EOS
+  } else if (eqn_of_state == "table" || eqn_of_state == "tabulated") {
+    peos = new TabulatedHydro(ppack, pin);
+    nhydro = 5;
   // isothermal EOS
   } else if (eqn_of_state.compare("isothermal") == 0) {
     if (pmy_pack->pcoord->is_special_relativistic ||
@@ -76,7 +80,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   bool use_two_temperature =
       pin->GetOrAddBoolean("hydro", "two_temperature", false);
   if (use_two_temperature) {
-    if (!peos->eos_data.is_ideal || pmy_pack->pcoord->is_special_relativistic ||
+    if (!peos->eos_data.is_gamma_law || pmy_pack->pcoord->is_special_relativistic ||
         pmy_pack->pcoord->is_general_relativistic ||
         pmy_pack->pcoord->is_dynamical_relativistic ||
         pin->DoesBlockExist("ion-neutral") || pin->DoesBlockExist("radiation")) {
@@ -117,7 +121,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pin->DoesParameterExist("hydro","alpha_iso") ||
       pin->DoesParameterExist("hydro","alpha_aniso") ||
       pin->DoesParameterExist("hydro","alpha_spitzer")) {
-    if (peos->eos_data.is_ideal) {
+    if (peos->eos_data.is_gamma_law) {
       pcond = new Conduction("hydro", ppack, pin);
     } else {
       std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
@@ -130,6 +134,14 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // Source terms (if needed)
   if (pin->DoesBlockExist("hydro_srcterms")) {
+    if (peos->eos_data.is_table &&
+        (pin->GetOrAddBoolean("hydro_srcterms", "ism_cooling", false) ||
+         pin->GetOrAddBoolean("hydro_srcterms", "rel_cooling", false))) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Tabulated EOS does not support gamma-law cooling "
+                << "source terms" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     psrc = new SourceTerms("hydro_srcterms", ppack, pin);
   }
 
@@ -232,6 +244,12 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
 
     // select Riemann solver (no default).  Test for compatibility of options
     std::string rsolver = pin->GetString("hydro","rsolver");
+    if (peos->eos_data.is_table && rsolver != "llf") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/eos=table currently requires rsolver=llf"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     // Special relativistic dynamic solvers
     if (pmy_pack->pcoord->is_special_relativistic) {
       if (evolution_t.compare("dynamic") == 0) {

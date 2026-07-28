@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -32,11 +35,90 @@ std::string BeamKey(int beam, const std::string &name) {
 [[noreturn]] void LaserInputError(const std::string &message) {
   std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
             << std::endl << "<laser> " << message << std::endl;
+#if MPI_PARALLEL_ENABLED
+  int initialized = 0;
+  MPI_Initialized(&initialized);
+  if (initialized != 0) MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
   std::exit(EXIT_FAILURE);
 }
 
 bool Finite(Real value) {
   return std::isfinite(value);
+}
+
+void LoadPulseFile(const std::string &filename, Real time_scale, Real value_scale,
+                   std::vector<Real> &time, std::vector<Real> &value) {
+  bool read_file = true;
+#if MPI_PARALLEL_ENABLED
+  read_file = (global_variable::my_rank == 0);
+#endif
+
+  if (read_file) {
+    std::ifstream input(filename);
+    if (!input.is_open()) {
+      LaserInputError("could not open pulse file '" + filename + "'");
+    }
+
+    std::string line;
+    int line_number = 0;
+    while (std::getline(input, line)) {
+      ++line_number;
+      std::size_t comment = line.find('#');
+      if (comment != std::string::npos) line.erase(comment);
+      std::replace(line.begin(), line.end(), ',', ' ');
+      if (line.find_first_not_of(" \r\n") == std::string::npos) continue;
+
+      std::istringstream row(line);
+      Real t, v;
+      if (!(row >> t >> v)) {
+        LaserInputError("pulse file '" + filename + "' line " +
+                        std::to_string(line_number) +
+                        " must contain numeric time and power");
+      }
+      std::string extra;
+      if (row >> extra) {
+        LaserInputError("pulse file '" + filename + "' line " +
+                        std::to_string(line_number) + " has more than two columns");
+      }
+      t *= time_scale;
+      v *= value_scale;
+      if (!Finite(t) || !Finite(v) || v < 0.0) {
+        LaserInputError("pulse file '" + filename +
+                        "' requires finite times and finite non-negative powers");
+      }
+      if (!time.empty() && t <= time.back()) {
+        LaserInputError("pulse file '" + filename +
+                        "' times must be strictly increasing");
+      }
+      time.push_back(t);
+      value.push_back(v);
+    }
+    if (input.bad()) {
+      LaserInputError("failed while reading pulse file '" + filename + "'");
+    }
+    if (time.size() < 2) {
+      LaserInputError("pulse file '" + filename + "' must contain at least two rows");
+    }
+  }
+
+#if MPI_PARALLEL_ENABLED
+  int count = static_cast<int>(time.size());
+  if (read_file && static_cast<std::size_t>(count) != time.size()) {
+    LaserInputError("pulse file '" + filename + "' contains too many rows");
+  }
+  int ierr = MPI_Bcast(&count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  if (ierr != MPI_SUCCESS) LaserInputError("could not broadcast pulse table size");
+  if (!read_file) {
+    time.resize(count);
+    value.resize(count);
+  }
+  ierr = MPI_Bcast(time.data(), count, MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+  if (ierr == MPI_SUCCESS) {
+    ierr = MPI_Bcast(value.data(), count, MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+  }
+  if (ierr != MPI_SUCCESS) LaserInputError("could not broadcast pulse table values");
+#endif
 }
 
 } // namespace
@@ -55,11 +137,14 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_x0_("laser-ray-x0", 1), ray_y0_("laser-ray-y0", 1),
     ray_z0_("laser-ray-z0", 1), ray_nx0_("laser-ray-nx0", 1),
     ray_ny0_("laser-ray-ny0", 1), ray_nz0_("laser-ray-nz0", 1),
-    ray_power0_("laser-ray-power0", 1), ray_wavelength_("laser-ray-lambda", 1),
+    ray_power0_("laser-ray-power0", 1),
+    ray_power_fraction_("laser-ray-power-fraction", 1),
+    ray_wavelength_("laser-ray-lambda", 1),
     ray_zeff_("laser-ray-zeff", 1),
     ray_constant_absorption_("laser-ray-constant-k", 1),
     ray_start_time_("laser-ray-start", 1), ray_end_time_("laser-ray-end", 1),
-    ray_beam_("laser-ray-beam", 1), ray_segments_("laser-ray-segments", 1),
+    ray_beam_("laser-ray-beam", 1), beam_power_("laser-beam-power", 1),
+    ray_segments_("laser-ray-segments", 1),
     ray_reflections_("laser-ray-reflections", 1),
     ray_path_length_("laser-ray-path", 1),
     ray_kx_("laser-ray-kx", 1), ray_ky_("laser-ray-ky", 1),
@@ -82,10 +167,10 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   if (ppack->pmhd == nullptr || ppack->pmhd->ptwo_temp == nullptr) {
     LaserInputError("requires <mhd>/two_temperature=true");
   }
-  if (!ppack->pmhd->peos->eos_data.is_ideal ||
+  if (!ppack->pmhd->peos->eos_data.is_gamma_law ||
       ppack->pcoord->is_special_relativistic ||
       ppack->pcoord->is_general_relativistic) {
-    LaserInputError("currently supports only Newtonian ideal-gas MHD");
+    LaserInputError("currently supports only Newtonian gamma-law MHD");
   }
   electron_index_ = ppack->pmhd->ptwo_temp->iele;
   gamma_minus_one_ = ppack->pmhd->peos->eos_data.gamma - 1.0;
@@ -147,6 +232,11 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "temperature_scale_cgs", temperature_scale_cgs_);
   power_scale_cgs_ = pin->GetOrAddReal(
       "laser", "power_scale_cgs", power_scale_cgs_);
+  if (use_cgs_ &&
+      (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
+       !Finite(power_scale_cgs_) || !(power_scale_cgs_ > 0.0))) {
+    LaserInputError("unit_system=cgs requires finite positive length and power scales");
+  }
   inverse_bremsstrahlung_coulomb_log_ = pin->GetOrAddReal(
       "laser", "inverse_bremsstrahlung_coulomb_log", -1.0);
   inverse_bremsstrahlung_temperature_floor_ = pin->GetOrAddReal(
@@ -154,9 +244,11 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   electron_number_per_gram_ = pin->GetOrAddReal(
       "laser", "electron_number_per_gram", 0.0);
   if (absorption_model_ == AbsorptionModel::inverse_bremsstrahlung &&
-      (!(length_scale_cgs_ > 0.0) || !(density_scale_cgs_ > 0.0) ||
-       !(temperature_scale_cgs_ > 0.0) || !(electron_number_per_gram_ > 0.0))) {
-    LaserInputError("inverse_bremsstrahlung requires positive cgs scales and "
+      (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
+       !Finite(density_scale_cgs_) || !(density_scale_cgs_ > 0.0) ||
+       !Finite(temperature_scale_cgs_) || !(temperature_scale_cgs_ > 0.0) ||
+       !Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0))) {
+    LaserInputError("inverse_bremsstrahlung requires finite positive cgs scales and "
                     "electron_number_per_gram");
   }
   if (!Finite(inverse_bremsstrahlung_coulomb_log_)) {
@@ -213,24 +305,29 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   if (!Finite(conservation_tolerance_) || conservation_tolerance_ <= 0.0) {
     LaserInputError("conservation_tolerance must be positive");
   }
+  conservation_tolerance_ = std::max(
+      conservation_tolerance_,
+      static_cast<Real>(128.0)*std::numeric_limits<Real>::epsilon());
   if (max_reflections_per_ray_ < 0 ||
       !Finite(reflection_offset_fraction_) || reflection_offset_fraction_ <= 0.0) {
     LaserInputError("reflection limit must be non-negative and offset must be positive");
   }
   if (critical_reflection_ &&
-      (!(length_scale_cgs_ > 0.0) || !(density_scale_cgs_ > 0.0) ||
-       !(electron_number_per_gram_ > 0.0))) {
-    LaserInputError("critical reflection requires positive cgs density/length scales "
-                    "and electron_number_per_gram");
+      (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
+       !Finite(density_scale_cgs_) || !(density_scale_cgs_ > 0.0) ||
+       !Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0))) {
+    LaserInputError("critical reflection requires finite positive cgs density/length "
+                    "scales and electron_number_per_gram");
   }
   if (propagation_model_ == PropagationModel::refractive) {
     if (critical_reflection_) {
       LaserInputError("refractive model must not also enable critical_reflection");
     }
-    if (!(length_scale_cgs_ > 0.0) || !(density_scale_cgs_ > 0.0) ||
-        !(electron_number_per_gram_ > 0.0)) {
-      LaserInputError("refractive model requires positive cgs density/length scales "
-                      "and electron_number_per_gram");
+    if (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
+        !Finite(density_scale_cgs_) || !(density_scale_cgs_ > 0.0) ||
+        !Finite(electron_number_per_gram_) || !(electron_number_per_gram_ > 0.0)) {
+      LaserInputError("refractive model requires finite positive cgs density/length "
+                      "scales and electron_number_per_gram");
     }
     if (!Finite(refractive_cell_fraction_) || refractive_cell_fraction_ <= 0.0 ||
         refractive_cell_fraction_ > 1.0 ||
@@ -262,6 +359,13 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     beam.direction[1] = pin->GetOrAddReal("laser", BeamKey(b, "direction_x2"), 0.0);
     beam.direction[2] = pin->GetOrAddReal("laser", BeamKey(b, "direction_x3"), 0.0);
     beam.radius = pin->GetOrAddReal("laser", BeamKey(b, "radius"), 0.0);
+    if (pin->DoesParameterExist("laser", BeamKey(b, "aperture_radius"))) {
+      beam.radius = pin->GetReal("laser", BeamKey(b, "aperture_radius"));
+    }
+    beam.profile_radius = pin->GetOrAddReal(
+        "laser", BeamKey(b, "profile_radius"), beam.radius);
+    beam.target_radius = pin->GetOrAddReal(
+        "laser", BeamKey(b, "target_radius"), 0.0);
     beam.start_time = pin->GetOrAddReal("laser", BeamKey(b, "start_time"),
                                         -std::numeric_limits<Real>::max());
     beam.end_time = pin->GetOrAddReal("laser", BeamKey(b, "end_time"),
@@ -271,6 +375,62 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
         "laser", BeamKey(b, "absorption_coefficient"),
         pin->GetOrAddReal("laser", "absorption_coefficient", 0.0));
     beam.profile = pin->GetOrAddString("laser", BeamKey(b, "profile"), "uniform");
+    std::string geometry = pin->GetOrAddString(
+        "laser", BeamKey(b, "geometry"), "direction");
+    if (geometry == "direction" || geometry == "parallel") {
+      beam.geometry = BeamGeometry::direction;
+      for (int n = 0; n < 3; ++n) beam.target[n] = beam.origin[n] + beam.direction[n];
+    } else if (geometry == "lens" || geometry == "focused") {
+      beam.geometry = BeamGeometry::lens;
+      for (int n = 0; n < 3; ++n) {
+        const std::string axis = "_x" + std::to_string(n+1);
+        beam.origin[n] = pin->GetOrAddReal(
+            "laser", BeamKey(b, "lens" + axis), beam.origin[n]);
+        beam.target[n] = pin->GetOrAddReal(
+            "laser", BeamKey(b, "target" + axis),
+            beam.origin[n] + beam.direction[n]);
+        beam.direction[n] = beam.target[n] - beam.origin[n];
+      }
+    } else {
+      LaserInputError(BeamKey(b, "geometry") +
+                      " must be 'direction' or 'lens'");
+    }
+
+    beam.pulse_is_absolute = false;
+    std::string pulse_mode = pin->GetOrAddString(
+        "laser", BeamKey(b, "pulse_mode"), "relative");
+    if (pulse_mode == "relative" || pulse_mode == "multiplier") {
+      beam.pulse_is_absolute = false;
+    } else if (pulse_mode == "absolute" || pulse_mode == "power") {
+      beam.pulse_is_absolute = true;
+    } else {
+      LaserInputError(BeamKey(b, "pulse_mode") +
+                      " must be 'relative' or 'absolute'");
+    }
+    std::string pulse_interpolation = pin->GetOrAddString(
+        "laser", BeamKey(b, "pulse_interpolation"), "linear");
+    if (pulse_interpolation == "linear") {
+      beam.pulse_interpolation = PulseInterpolation::linear;
+    } else if (pulse_interpolation == "step") {
+      beam.pulse_interpolation = PulseInterpolation::step;
+    } else {
+      LaserInputError(BeamKey(b, "pulse_interpolation") +
+                      " must be 'linear' or 'step'");
+    }
+    Real pulse_time_scale = pin->GetOrAddReal(
+        "laser", BeamKey(b, "pulse_time_scale"), 1.0);
+    Real pulse_power_scale = pin->GetOrAddReal(
+        "laser", BeamKey(b, "pulse_power_scale"), 1.0);
+    if (!Finite(pulse_time_scale) || pulse_time_scale <= 0.0 ||
+        !Finite(pulse_power_scale) || pulse_power_scale < 0.0) {
+      LaserInputError("pulse time scale must be positive and power scale non-negative");
+    }
+    std::string pulse_file = pin->GetOrAddString(
+        "laser", BeamKey(b, "pulse_file"), "");
+    if (!pulse_file.empty()) {
+      LoadPulseFile(pulse_file, pulse_time_scale, pulse_power_scale,
+                    beam.pulse_time, beam.pulse_value);
+    }
 
     if (!Finite(beam.power) || beam.power < 0.0) {
       LaserInputError(BeamKey(b, "power") + " must be finite and non-negative");
@@ -284,7 +444,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     Real norm = sqrt(SQR(beam.direction[0]) + SQR(beam.direction[1]) +
                      SQR(beam.direction[2]));
     if (!Finite(norm) || norm <= 0.0) {
-      LaserInputError("beam direction vector must be finite and nonzero");
+      LaserInputError(
+          "beam direction, or lens-to-target vector, must be finite and nonzero");
     }
     for (int n = 0; n < 3; ++n) beam.direction[n] /= norm;
     if ((!ppack->pmesh->multi_d &&
@@ -292,11 +453,28 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
         (ppack->pmesh->two_d && beam.direction[2] != 0.0)) {
       LaserInputError("beam direction cannot point through a collapsed mesh dimension");
     }
-    if (!Finite(beam.radius) || beam.radius < 0.0) {
-      LaserInputError(BeamKey(b, "radius") + " must be finite and non-negative");
+    for (int n = 0; n < 3; ++n) {
+      if (!Finite(beam.origin[n]) || !Finite(beam.target[n])) {
+        LaserInputError("beam lens/origin and target coordinates must be finite");
+      }
+    }
+    if (!Finite(beam.radius) || beam.radius < 0.0 ||
+        !Finite(beam.profile_radius) || beam.profile_radius < 0.0 ||
+        !Finite(beam.target_radius) || beam.target_radius < 0.0) {
+      LaserInputError("beam aperture, profile, and target radii must be finite and "
+                      "non-negative");
     }
     if (beam.profile != "uniform" && beam.profile != "gaussian") {
       LaserInputError(BeamKey(b, "profile") + " must be 'uniform' or 'gaussian'");
+    }
+    if (beam.profile == "gaussian" && beam.radius > 0.0 &&
+        !(beam.profile_radius > 0.0)) {
+      LaserInputError(BeamKey(b, "profile_radius") +
+                      " must be positive for a finite Gaussian aperture");
+    }
+    if (beam.target_radius > 0.0 && !(beam.radius > 0.0)) {
+      LaserInputError(BeamKey(b, "target_radius") +
+                      " requires a positive aperture radius");
     }
     if (!Finite(beam.zeff) || beam.zeff <= 0.0) {
       LaserInputError(BeamKey(b, "zeff") + " must be finite and positive");
@@ -311,6 +489,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     if (use_cgs_) {
       beam.power /= power_scale_cgs_;
       beam.wavelength /= length_scale_cgs_;
+      if (beam.pulse_is_absolute) {
+        for (Real &value : beam.pulse_value) value /= power_scale_cgs_;
+      }
     }
     nrays_ += beam.nrays;
     beams_.push_back(beam);
@@ -340,10 +521,13 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_x0_, nrays_); Kokkos::realloc(ray_y0_, nrays_);
   Kokkos::realloc(ray_z0_, nrays_); Kokkos::realloc(ray_nx0_, nrays_);
   Kokkos::realloc(ray_ny0_, nrays_); Kokkos::realloc(ray_nz0_, nrays_);
-  Kokkos::realloc(ray_power0_, nrays_); Kokkos::realloc(ray_wavelength_, nrays_);
+  Kokkos::realloc(ray_power0_, nrays_);
+  Kokkos::realloc(ray_power_fraction_, nrays_);
+  Kokkos::realloc(ray_wavelength_, nrays_);
   Kokkos::realloc(ray_zeff_, nrays_); Kokkos::realloc(ray_constant_absorption_, nrays_);
   Kokkos::realloc(ray_start_time_, nrays_); Kokkos::realloc(ray_end_time_, nrays_);
-  Kokkos::realloc(ray_beam_, nrays_); Kokkos::realloc(ray_segments_, nrays_);
+  Kokkos::realloc(ray_beam_, nrays_); Kokkos::realloc(beam_power_, nbeams);
+  Kokkos::realloc(ray_segments_, nrays_);
   Kokkos::realloc(ray_reflections_, nrays_);
   Kokkos::realloc(ray_path_length_, nrays_);
   Kokkos::realloc(ray_kx_, nrays_); Kokkos::realloc(ray_ky_, nrays_);
@@ -388,6 +572,69 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::deep_copy(cell_data, 0.0);
   if (ppack->pmesh->multilevel) Kokkos::deep_copy(coarse_cell_data, 0.0);
   Kokkos::deep_copy(cumulative_energy_start_, 0.0);
+}
+
+//----------------------------------------------------------------------------------------
+//! Evaluate one beam's total power. Pulse files are zero outside their tabulated span;
+//! start_time/end_time remain an independent gate for backward compatibility.
+
+Real Laser::BeamPowerAtTime(const BeamConfig &beam, Real time) const {
+  if (time < beam.start_time || time > beam.end_time) return 0.0;
+  if (beam.pulse_time.empty()) return beam.power;
+  if (time < beam.pulse_time.front() || time > beam.pulse_time.back()) return 0.0;
+
+  Real pulse = beam.pulse_value.back();
+  if (time < beam.pulse_time.back()) {
+    auto upper = std::upper_bound(beam.pulse_time.begin(), beam.pulse_time.end(), time);
+    std::size_t hi = static_cast<std::size_t>(upper - beam.pulse_time.begin());
+    std::size_t lo = hi - 1;
+    pulse = beam.pulse_value[lo];
+    if (beam.pulse_interpolation == PulseInterpolation::linear) {
+      Real fraction = (time-beam.pulse_time[lo])/
+                      (beam.pulse_time[hi]-beam.pulse_time[lo]);
+      pulse += fraction*(beam.pulse_value[hi]-beam.pulse_value[lo]);
+    }
+  }
+  return beam.pulse_is_absolute ? pulse : beam.power*pulse;
+}
+
+//----------------------------------------------------------------------------------------
+//! Return the prescribed power averaged over a complete hydro step. All RK stages use
+//! this same value, so integrating the source preserves the pulse-file energy exactly.
+
+Real Laser::BeamPowerForStep(const BeamConfig &beam, Real time, Real dt) const {
+  if (!(dt > 0.0) || !Finite(dt)) return BeamPowerAtTime(beam, time);
+  Real lower = std::max(time, beam.start_time);
+  Real upper = std::min(time+dt, beam.end_time);
+  if (!(upper > lower)) return 0.0;
+
+  if (beam.pulse_time.empty()) {
+    return beam.power*(upper-lower)/dt;
+  }
+  lower = std::max(lower, beam.pulse_time.front());
+  upper = std::min(upper, beam.pulse_time.back());
+  if (!(upper > lower)) return 0.0;
+
+  auto next = std::upper_bound(beam.pulse_time.begin(), beam.pulse_time.end(), lower);
+  std::size_t segment = static_cast<std::size_t>(next-beam.pulse_time.begin())-1;
+  Real integral = 0.0;
+  Real left = lower;
+  while (left < upper && segment+1 < beam.pulse_time.size()) {
+    Real right = std::min(upper, beam.pulse_time[segment+1]);
+    Real value_left = beam.pulse_value[segment];
+    Real value_right = value_left;
+    if (beam.pulse_interpolation == PulseInterpolation::linear) {
+      Real inv_width = 1.0/(beam.pulse_time[segment+1]-beam.pulse_time[segment]);
+      Real slope = (beam.pulse_value[segment+1]-beam.pulse_value[segment])*inv_width;
+      value_left += slope*(left-beam.pulse_time[segment]);
+      value_right += slope*(right-beam.pulse_time[segment]);
+    }
+    integral += 0.5*(value_left+value_right)*(right-left);
+    left = right;
+    ++segment;
+  }
+  Real average = integral/dt;
+  return beam.pulse_is_absolute ? average : beam.power*average;
 }
 
 void Laser::RefreshGlobalBlockInfo() {

@@ -64,7 +64,7 @@ void ProblemGenerator::GaussLegendre(ParameterInput *pin, const bool restart) {
     ms.push_back(m);
   }
 
-  double ylmR1,ylmI1,ylmR2,ylmI2;
+  Real ylmR1, ylmI1, ylmR2, ylmI2;
   double int_r, int_i;
   bool failed = false;
   double max_err = 0;
