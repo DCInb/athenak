@@ -40,6 +40,14 @@ Real OutputTimeTolerance(const Real time, const Real interval) {
                   static_cast<Real>(0.25)*std::abs(interval));
 }
 
+Real OutputTerminalTolerance(const Real time, const Real interval) {
+  // last_time advances through repeated additions, so its nominal terminal value can
+  // accumulate more roundoff than the strict two-ULP cadence comparison above permits.
+  const Real scale = std::max(std::abs(time), std::abs(interval));
+  return std::min(static_cast<Real>(16.0)*std::numeric_limits<Real>::epsilon()*scale,
+                  static_cast<Real>(0.25)*std::abs(interval));
+}
+
 } // namespace
 
 //----------------------------------------------------------------------------------------
@@ -340,7 +348,9 @@ void Driver::LimitTimeStepToNextOutput(Mesh *pm, Outputs *pout) {
     if (!(params.dt > 0.0)) continue;
     const Real candidate = params.last_time + params.dt;
     const Real tolerance = OutputTimeTolerance(pm->time, params.dt);
-    if (candidate - pm->time > tolerance) {
+    const Real terminal_tolerance = OutputTerminalTolerance(tlim, params.dt);
+    if (candidate - pm->time > tolerance &&
+        tlim - candidate > terminal_tolerance) {
       next_event = std::min(next_event, candidate);
     }
   }
@@ -524,8 +534,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           if (align_outputs) {
             const Real next_time = params.last_time + params.dt;
             const Real tolerance = OutputTimeTolerance(pmesh->time, params.dt);
+            const Real terminal_tolerance = OutputTerminalTolerance(tlim, params.dt);
             time_output_due = ((next_time - pmesh->time <= tolerance) &&
-                               (tlim - next_time > tolerance));
+                               (tlim - next_time > terminal_tolerance));
           } else {
             // Preserve the legacy float32 comparison for non-aligned runs.
             const float time_32 = static_cast<float>(pmesh->time);
