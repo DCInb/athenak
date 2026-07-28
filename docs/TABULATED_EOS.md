@@ -30,6 +30,94 @@ overridden with positive `table_density_scale`, `table_temperature_scale`,
 `table_pressure_scale`, `table_specific_eint_scale`, and `table_sound_speed2_scale`.
 Each scale multiplies the corresponding stored value to obtain code units.
 
+## Converting FLASH IONMIX4/CN4 tables
+
+`scripts/flash_cn4_to_athenak.py` converts the EOS portion of a fixed-width FLASH
+IONMIX4/CN4 file to the native ASCII version-2 format. A typical conversion is:
+
+```bash
+python3 scripts/flash_cn4_to_athenak.py material.cn4 material.eos --abar 6.5
+```
+
+The mass per ion is required because it is not reliably self-described by CN4. Use
+`--abar AMU` when it is known in atomic mass units, or use `--mass-per-ion GRAMS` (also
+spelled `--mass-per-ion-g`) when an exact mass in grams is available. These options are
+mutually exclusive. For example, an explicitly selected logarithmic-grid table with an
+IONMIX6-style electron-entropy block can be converted with:
+
+```bash
+python3 scripts/flash_cn4_to_athenak.py material.cn4 material.eos \
+  --mass-per-ion 1.99264687992e-23 --grid-mode log \
+  --electron-entropy present --force
+```
+
+`--grid-mode auto` is the default. It distinguishes a manual grid, which stores the
+temperature and ion-number-density axes explicitly, from a logarithmic grid, which
+stores their base-10 starts and increments. Use `manual` or `log` when the automatic
+choice is ambiguous. Similarly, `--electron-entropy auto` uses the payload length to
+detect the optional IONMIX6 electron-entropy block; `present` and `absent` force the
+expected layout. The entropy data are validated but are not part of the AthenaK EOS
+output.
+
+To check the layout, units, monotonicity, and derived fields without creating a file,
+omit the output path and use `--validate-only`:
+
+```bash
+python3 scripts/flash_cn4_to_athenak.py material.cn4 --abar 6.5 --validate-only
+```
+
+The input axes are ion number density in cm^-3 and temperature in eV. The converter
+uses the selected mass per ion to form mass density, converts temperature to K,
+pressure from J/cm3 to erg/cm3, and specific internal energy from J/g to erg/g. The
+result must therefore be loaded with `table_unit_system=cgs` (and a valid `<units>`
+block), for example:
+
+```text
+<hydro>
+eos = table
+table_file = material.eos
+table_unit_system = cgs
+```
+
+The conversion is an equilibrium reduction of the two-temperature data: at every
+tabulated point it assumes `Te=Ti` and writes `P=Pion+Pele` and `e=eion+eele`. It does
+not produce a two-temperature closure. It also writes `zbar`, the supplied `abar`, and
+thermodynamic derivatives. Consistent with AthenaK's interpolation of the required
+fields, the converter takes local finite differences of `log(P)` and `log(e)` on the
+nonuniform log-density and log-temperature axes, then recovers the dimensional
+derivatives used to calculate
+
+```text
+Gamma3 - 1 = (P/rho - de/dlog(rho)) / (de/dlog(T))
+cs^2       = (dP/dlog(rho) + dP/dlog(T) * (Gamma3 - 1)) / rho
+Gamma1     = rho * cs^2 / P.
+```
+
+The converter rejects non-finite or non-positive required values and derivatives, and
+requires pressure and specific internal energy to increase strictly with temperature.
+It validates the CN4 opacity payload only to establish the file layout; group bounds
+and Rosseland, Planck-absorption, and Planck-emission opacities are not copied. AthenaK
+opacity tables are separate and are documented in `docs/THERMAL_RADIATION.md`.
+
+Two format limitations require particular care. First, CN4 does not carry an
+authoritative tag distinguishing manual and logarithmic grid layouts, so a file that
+satisfies both layouts needs an explicit `--grid-mode`. This option describes only the
+axis encoding. Some third-party tools can instead write selected axes, EOS fields, or
+opacity fields after applying `log10`, but CN4 records no flags identifying those
+transforms. The converter expects physical, linear-valued field blocks and cannot
+detect such files reliably; expand every transformed block before conversion.
+
+Second, CN4 energy zero points are material/generator dependent. The converter
+preserves the supplied energy zero and has an offset of zero by default.
+`--energy-offset-erg-g OFFSET` adds one finite constant, in erg/g, to every summed
+specific energy after unit conversion. Use a physically justified positive offset when
+the source reference leaves any value non-positive; the native EOS otherwise rejects
+the table. The offset is recorded in the output header. Because AthenaK interpolates
+`log(e)` and the converter derives slopes from that same surface, changing the offset
+also changes the interpolated energy surface and its finite-difference derivatives.
+Select it from the material's energy convention and re-run `--validate-only`, rather
+than treating it as an arbitrary numerical repair.
+
 ## Supported configurations
 
 The portable table closure currently supports single-level Newtonian Hydro and MHD with
