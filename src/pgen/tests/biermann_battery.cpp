@@ -14,6 +14,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
+#include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
 #include "pgen/pgen.hpp"
@@ -57,6 +58,21 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
   Real pressure_amplitude =
       pin->GetOrAddReal("problem", "pressure_amplitude", 0.2);
   Real wave_number = 2.0 * std::acos(-1.0);
+  int material_scalar = -1;
+  Real material0_fraction = 1.0;
+  if (pmbp->pmhd->pmaterials != nullptr) {
+    material_scalar = pmbp->pmhd->pmaterials->DeviceData().scalar_index;
+    material0_fraction = pin->GetOrAddReal(
+        "problem", "material0_fraction", 1.0);
+    if (!std::isfinite(material0_fraction) || material0_fraction < 0.0 ||
+        material0_fraction > 1.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "problem/material0_fraction must be finite and in [0,1]"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   Kokkos::deep_copy(w, 0.0);
   Kokkos::deep_copy(bcc, 0.0);
@@ -78,6 +94,9 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
         w(m, IVY, k, j, i) = 0.0;
         w(m, IVZ, k, j, i) = 0.0;
         w(m, IEN, k, j, i) = pressure / gm1;
+        if (material_scalar >= 0) {
+          w(m, material_scalar, k, j, i) = material0_fraction;
+        }
       });
 
   pmbp->pmhd->peos->PrimToCons(w, bcc, pmbp->pmhd->u0, is, ie, js, je, ks, ke);

@@ -27,6 +27,17 @@
 
 namespace mhd {
 
+KOKKOS_INLINE_FUNCTION
+Real TabularFastSpeed(const Real density, const Real sound_speed_squared,
+                      const Real bx, const Real by, const Real bz) {
+  const Real cs2 = fmax(sound_speed_squared, 0.0);
+  const Real va2 = (SQR(bx)+SQR(by)+SQR(bz))/density;
+  const Real vax2 = SQR(bx)/density;
+  const Real sum = cs2+va2;
+  const Real discriminant = fmax(sum*sum-4.0*cs2*vax2, 0.0);
+  return sqrt(0.5*(sum+sqrt(discriminant)));
+}
+
 //----------------------------------------------------------------------------------------
 // \!fn void MHD::NewTimeStep()
 // \brief calculate the minimum timestep within a MeshBlockPack for MHD problems
@@ -52,6 +63,11 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   auto &is_special_relativistic_ = pmy_pack->pcoord->is_special_relativistic;
   auto &is_general_relativistic_ = pmy_pack->pcoord->is_general_relativistic;
   auto &is_dynamical_relativistic_ = pmy_pack->pcoord->is_dynamical_relativistic;
+  const bool use_tabular_material_eos_ = use_tabular_material_eos;
+  DvceArray5D<Real> material_thermodynamics;
+  if (use_tabular_material_eos_) {
+    material_thermodynamics = ptwo_temp->thermodynamics;
+  }
   const int nmkji = (pmy_pack->nmb_thispack)*nx3*nx2*nx1;
   const int nkji = nx3*nx2*nx1;
   const int nji  = nx2*nx1;
@@ -129,7 +145,16 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
         Real &w_by = bcc0_(m,IBY,k,j,i);
         Real &w_bz = bcc0_(m,IBZ,k,j,i);
         Real cf;
-        if (eos.is_ideal) {
+        if (use_tabular_material_eos_) {
+          const Real cs2 = material_thermodynamics(
+              m, two_temperature::TwoTemperature::sound_speed_squared, k, j, i);
+          cf = TabularFastSpeed(w_d, cs2, w_bx, w_by, w_bz);
+          max_dv1 = fabs(w0_(m,IVX,k,j,i))+cf;
+          cf = TabularFastSpeed(w_d, cs2, w_by, w_bz, w_bx);
+          max_dv2 = fabs(w0_(m,IVY,k,j,i))+cf;
+          cf = TabularFastSpeed(w_d, cs2, w_bz, w_bx, w_by);
+          max_dv3 = fabs(w0_(m,IVZ,k,j,i))+cf;
+        } else if (eos.is_ideal) {
           Real eint = w0_(m,IEN,k,j,i);
           cf = eos.FastMagnetosonicSpeedFromRhoEint(
               w_d, eint, w_bx, w_by, w_bz);

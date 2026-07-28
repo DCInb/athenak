@@ -31,9 +31,25 @@ P0 = rho0*L0^2*v0^3       B0 = sqrt(4*pi*rho0)*v0
            c_light = chat_cgs / v0          # = 2.998e10/v0 if not reduced
            group_bound_g = (h*nu_g/kB) / T0
            kappa_* = kappa_cgs * rho0 * L0
-<mhd>      biermann_coefficient = 1.0364e-4 * mu_bar / (L0*sqrt(4*pi*rho0))
-           # mu_bar = fe/(Ne*m_u) = A/(Z+1); this is d_i/L0, the normalized ion inertial length
+<mhd>      biermann_coefficient = C_B
 ```
+
+Choose `C_B` to match the electron-density convention used by the run:
+
+```text
+without <materials>: C_B = 1.0364e-4*mu_bar/(L0*sqrt(4*pi*rho0))
+                     n_e,code = f_e*rho
+                     mu_bar = fe/(Ne*m_u) = A/(Z+1)
+
+with <materials>:    C_B = 1.0364e-4/(L0*sqrt(4*pi*rho0))
+                     n_e,code = rho*sum_s(Y_s*Zbar_s/A_s)
+```
+
+The legacy `mu_bar` factor converts from its fixed heat-capacity electron density to the
+physical electron population. An ideal or tabular `<materials>` closure already carries
+that population explicitly, including dynamic table ionization, so applying `mu_bar`
+again would double-count the conversion. Both expressions represent the same physical
+inverse-charge coefficient when paired with their respective `n_e,code` definition.
 
 **Worked case — `laser-target/laser_target.athinput`** (L0=100 um, rho0=1 g/cc,
 T0=1 keV, CH: N_e=3.243e23/g): v0=3.224e7 cm/s, t0=0.310 ns, p0=1.04 Gbar,
@@ -44,3 +60,6 @@ B0=114 MG. Consistent values (with the deck's f_e=0.5): `power_scale_cgs=3.35e18
 f_e=0.7778, not 0.5. The shipped deck is therefore a *code-unit demonstration* of
 the coupled physics (as its README states), not a calibrated physical scenario —
 use this recipe to build one.
+
+For comparison, the material-aware DCI case uses `L0=0.1 cm` and `rho0=1.1 g/cc`,
+giving `biermann_coefficient=2.7875722321043606e-4` without a `mu_bar` factor.

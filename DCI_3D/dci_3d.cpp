@@ -94,6 +94,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (!pmhd->peos->eos_data.is_gamma_law) {
     ProblemError("dci_3d tabular material mode requires its gamma-law MHD carrier");
   }
+  if (!NearlyEqual(pmhd->pbiermann->coefficient,
+                   2.7875722321043606e-4,
+                   2.7875722321043606e-4)) {
+    ProblemError("dci_3d requires the material-number-density Biermann normalization");
+  }
 
   const Real ambient_density =
       pin->GetOrAddReal("problem", "ambient_density", 9.090909090909091e-6);

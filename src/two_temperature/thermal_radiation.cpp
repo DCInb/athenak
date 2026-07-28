@@ -845,7 +845,15 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
       if (delta < 0.0) negative += delta;
     }
 
-    Real available = eele_old-negative;  // absorbed radiation is immediately available
+    Real eele_floor = 0.0;
+    if (use_materials && mixture.UsesTabularEOS()) {
+      const materials::MaterialThermodynamicState floor_state =
+          mixture.MinimumState(density, y0);
+      eele_floor = density*floor_state.electron_specific_internal_energy;
+    }
+    // Absorbed radiation is immediately available, but tabular emission may not draw
+    // the electron component below its native material-table energy floor.
+    Real available = fmax(eele_old-eele_floor-negative, 0.0);
     Real emission_scale = (positive > available && positive > 0.0)
         ? available/positive : 1.0;
     Real total_delta = 0.0;
@@ -872,15 +880,18 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
       total_radiation += value;
     }
 
-    Real eele_new = fmax(eele_old-total_delta, 0.0);
+    Real eele_new = fmax(eele_old-total_delta, eele_floor);
     Real matter_delta = eele_new-eele_old;
     cons(m, ie, k, j, i) = eele_new;
     prim(m, ie, k, j, i) = eele_new/density;
     cons(m, IEN, k, j, i) += matter_delta;
     prim(m, IEN, k, j, i) += matter_delta;
-    temperature(m, 1, k, j, i) = use_materials
-        ? mixture.ElectronTemperature(density, eele_new/density, y0)
-        : gm1*eele_new/(density*fe);
+    if (!use_materials) {
+      temperature(m, 1, k, j, i) = gm1*eele_new/(density*fe);
+    } else if (!mixture.UsesTabularEOS()) {
+      temperature(m, 1, k, j, i) =
+          mixture.ElectronTemperature(density, eele_new/density, y0);
+    }
     diag(m, 0, k, j, i) = total_radiation/density;
     diag(m, 1, k, j, i) = pow(total_radiation/arad, 0.25);
   });

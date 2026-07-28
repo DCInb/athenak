@@ -136,6 +136,28 @@ temperature multiplied by `temperature_scale_cgs`. The returned cgs coefficient 
 converted to inverse code length. The weak-collision expression is evaluated only below
 the critical surface.
 
+With an ideal-gas `<materials>` closure, the same expression instead uses the local
+material mixture for `ne`, the electron heat-capacity fraction, and `Zeff`. With tabular
+CH/He material EOS tables, ray kernels reuse the thermodynamic state cached by the
+two-temperature synchronization:
+
+```text
+ne   = cached physical electron density [cm^-3]
+Te   = cached tabular electron temperature * eos_table_temperature_to_kelvin
+Zeff = cached dynamic effective charge
+```
+
+The dynamic charge model rescales each configured fully ionized charge according to
+`Zeff_s(table) = (Zeff_s(input)/Zbar_s(input))*Zbar_s(table)` and then electron-population
+weights the species values. Consequently, a beam-level `beamN_zeff` does not override a
+tabular material state. The same cached `ne` is used for refractive gradients and
+critical reflection. No EOS inversion is performed per ray or per segment.
+
+These tabular optical coefficients are intentionally frozen at the stage-start material
+state for the operator-split ray trace. Energy deposited during that trace changes the
+next synchronized state; it does not trigger a whole-grid table refresh midway through
+the source update.
+
 | Quantity | Code-unit input | `unit_system=cgs` input |
 | --- | --- | --- |
 | Ray position/radius | code length | code length |

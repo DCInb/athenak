@@ -393,10 +393,10 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (use_tabular_material_eos && rsolver != "llf" && rsolver != "hlle") {
+    if (use_tabular_material_eos && rsolver != "llf") {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "tabular <materials> EOS currently requires "
-                << "rsolver=llf or rsolver=hlle" << std::endl;
+                << "rsolver=llf" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     // Special relativistic solvers

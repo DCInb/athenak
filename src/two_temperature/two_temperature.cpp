@@ -249,6 +249,7 @@ void TwoTemperature::Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim
           state.electron_number_density_cgs;
       thermo(m, mean_ionization, k, j, i) = state.mean_ionization;
       thermo(m, sound_speed_squared, k, j, i) = state.sound_speed_squared;
+      thermo(m, effective_charge, k, j, i) = state.effective_charge;
     });
   }
   if (pradiation != nullptr) {
@@ -369,6 +370,7 @@ void TwoTemperature::Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
           state.electron_number_density_cgs;
       thermo(m, mean_ionization, k, j, i) = state.mean_ionization;
       thermo(m, sound_speed_squared, k, j, i) = state.sound_speed_squared;
+      thermo(m, effective_charge, k, j, i) = state.effective_charge;
     });
   }
   if (pradiation != nullptr) {
@@ -476,32 +478,22 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
         const Real minimum_ion = density*floor.ion_specific_internal_energy;
         const Real minimum_electron =
             density*floor.electron_specific_internal_energy;
-        Real transfer_low = minimum_electron-eele;
-        Real transfer_high = eion-minimum_ion;
-        if (transfer_high < transfer_low) {
-          transfer_low = 0.0;
-          transfer_high = 0.0;
+        if (eint < minimum_ion+minimum_electron) return;
+        const materials::MaterialExchangeState exchange =
+            mixture.StateFromRhoTotalEnergyTemperatureDifference(
+                density, eint/density, old_state.ion_temperature,
+                old_state.electron_temperature, target_difference, y0);
+        Real eion_new = density*exchange.ion_specific_internal_energy;
+        eion_new = fmin(fmax(eion_new, minimum_ion), eint-minimum_electron);
+        const Real eele_new = eint-eion_new;
+        materials::MaterialThermodynamicState state = exchange.thermodynamics;
+        // The temperature-space solve respects component floors when Sync supplied a
+        // valid old state.  Retain a conservative inverse fallback only for a clamped,
+        // externally inconsistent cell.
+        if (eion_new != density*exchange.ion_specific_internal_energy) {
+          state = mixture.StateFromRhoSpecificEnergies(
+              density, eion_new/density, eele_new/density, y0);
         }
-        for (int iteration = 0; iteration < 32; ++iteration) {
-          const Real transfer = 0.5*(transfer_low+transfer_high);
-          const materials::MaterialThermodynamicState trial =
-              mixture.StateFromRhoSpecificEnergies(
-                  density, (eion-transfer)/density,
-                  (eele+transfer)/density, y0);
-          const Real residual = trial.electron_temperature-
-                                trial.ion_temperature-target_difference;
-          if (residual < 0.0) {
-            transfer_low = transfer;
-          } else {
-            transfer_high = transfer;
-          }
-        }
-        const Real transfer = 0.5*(transfer_low+transfer_high);
-        const Real eion_new = eion-transfer;
-        const Real eele_new = eele+transfer;
-        const materials::MaterialThermodynamicState state =
-            mixture.StateFromRhoSpecificEnergies(
-                density, eion_new/density, eele_new/density, y0);
         cons(m, iion_, k, j, i) = eion_new;
         cons(m, iele_, k, j, i) = eele_new;
         prim(m, iion_, k, j, i) = eion_new/density;
@@ -514,6 +506,7 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
             state.electron_number_density_cgs;
         thermo(m, mean_ionization, k, j, i) = state.mean_ionization;
         thermo(m, sound_speed_squared, k, j, i) = state.sound_speed_squared;
+        thermo(m, effective_charge, k, j, i) = state.effective_charge;
         return;
       }
 
@@ -562,7 +555,46 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
 
   if (pradiation != nullptr) {
     pradiation->Couple(dt, cons, prim, temperature, il, iu, jl, ju, kl, ku);
+    // Radiation coupling is the final operator-split source in this task.  It changes
+    // electron and total material energy after the cache filled above, so refresh the
+    // complete tabular state before the next MHD flux, timestep, laser, or Biermann use.
+    RefreshMaterialThermodynamics(cons, il, iu, jl, ju, kl, ku);
   }
+}
+
+//----------------------------------------------------------------------------------------
+
+void TwoTemperature::RefreshMaterialThermodynamics(
+    const DvceArray5D<Real> &cons, int il, int iu, int jl, int ju,
+    int kl, int ku) {
+  if (!use_material_mixture_ || !material_mixture_.UsesTabularEOS()) return;
+
+  const int nmb1 = pmy_pack_->nmb_thispack-1;
+  const int iion_ = iion;
+  const int iele_ = iele;
+  auto mixture = material_mixture_;
+  auto temp = temperature;
+  auto thermo = thermodynamics;
+  par_for("two_temp_refresh_material_thermodynamics", DevExeSpace(), 0, nmb1,
+          kl, ku, jl, ju, il, iu,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real density = cons(m, IDN, k, j, i);
+    const Real y0 = mixture.Material0MassFractionFromConserved(
+        cons, m, k, j, i);
+    const materials::MaterialThermodynamicState state =
+        mixture.StateFromRhoSpecificEnergies(
+            density, cons(m, iion_, k, j, i)/density,
+            cons(m, iele_, k, j, i)/density, y0);
+    temp(m, 0, k, j, i) = state.ion_temperature;
+    temp(m, 1, k, j, i) = state.electron_temperature;
+    thermo(m, ion_pressure, k, j, i) = state.ion_pressure;
+    thermo(m, electron_pressure, k, j, i) = state.electron_pressure;
+    thermo(m, electron_number_density_cgs, k, j, i) =
+        state.electron_number_density_cgs;
+    thermo(m, mean_ionization, k, j, i) = state.mean_ionization;
+    thermo(m, sound_speed_squared, k, j, i) = state.sound_speed_squared;
+    thermo(m, effective_charge, k, j, i) = state.effective_charge;
+  });
 }
 
 //----------------------------------------------------------------------------------------

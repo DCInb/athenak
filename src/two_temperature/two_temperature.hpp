@@ -38,9 +38,10 @@ class TwoTemperature {
     electron_pressure = 1,
     electron_number_density_cgs = 2,
     mean_ionization = 3,
-    sound_speed_squared = 4
+    sound_speed_squared = 4,
+    effective_charge = 5
   };
-  static constexpr int nthermodynamic_fields = 5;
+  static constexpr int nthermodynamic_fields = 6;
   TwoTemperature(const std::string &block, MeshBlockPack *ppack, ParameterInput *pin,
                  int first_component_index,
                  materials::MaterialMixture *material_mixture = nullptr);
@@ -75,9 +76,13 @@ class TwoTemperature {
 
   // Add multigroup FLD fluxes and compute their explicit stability limit.
   void AddRadiationFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx);
-  void RadiationNewTimeStep(const DvceArray5D<Real> &prim);
+ void RadiationNewTimeStep(const DvceArray5D<Real> &prim);
 
  private:
+  void RefreshMaterialThermodynamics(
+      const DvceArray5D<Real> &cons, int il, int iu, int jl, int ju,
+      int kl, int ku);
+
   MeshBlockPack *pmy_pack_;
   Real gamma_minus_one_;
   Real cv_i_fraction_;

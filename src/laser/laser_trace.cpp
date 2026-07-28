@@ -22,6 +22,7 @@
 #include "laser/laser_physics.hpp"
 #include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -86,6 +87,28 @@ Real ProbeForward(Real coordinate, Real direction, Real distance) {
     result = nextafter(coordinate, limit);
   }
   return result;
+}
+
+// Tabular material states are inverted once per cell by TwoTemperature::Sync.  Reuse the
+// resulting electron density throughout ray tracing; repeated IONMIX queries per segment
+// would otherwise dominate a many-ray calculation.  The ideal-material branch retains
+// its original arithmetic and honors the laser-specific density scale override.
+KOKKOS_INLINE_FUNCTION
+Real MaterialElectronDensityCgs(
+    const DvceArray5D<Real> &primitive,
+    const DvceArray5D<Real> &thermodynamics,
+    const materials::MaterialMixtureDevice &mixture,
+    bool use_tabular_materials, Real density_scale_cgs,
+    int m, int k, int j, int i) {
+  if (use_tabular_materials) {
+    return fmax(thermodynamics(
+        m, two_temperature::TwoTemperature::electron_number_density_cgs,
+        k, j, i), 0.0);
+  }
+  const Real y0 = mixture.Material0MassFractionFromPrimitive(
+      primitive, m, k, j, i);
+  return mixture.ElectronNumberDensityCgs(
+      primitive(m, IDN, k, j, i), density_scale_cgs, y0);
 }
 
 bool FirstDomainIntersection(const RegionSize &domain, bool multi_d, bool three_d,
@@ -297,12 +320,15 @@ void Laser::InitializeRays() {
   auto diag = device_diagnostics_;
   auto counters = device_counters_;
   auto primitive = pmy_pack_->pmhd->w0;
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
   auto wavelength = ray_wavelength_;
   bool refractive = propagation_model_ == PropagationModel::refractive;
   Real number_scale = density_scale_cgs_*electron_number_per_gram_;
   Real length_scale = length_scale_cgs_;
   bool use_materials = use_material_mixture_;
   auto material_mixture = material_mixture_;
+  bool use_tabular_materials =
+      use_materials && material_mixture.UsesTabularEOS();
   Real density_scale_cgs = density_scale_cgs_;
 
   Kokkos::parallel_for(
@@ -357,18 +383,15 @@ void Laser::InitializeRays() {
           Real offset_z = pz-center_z;
           Real electron_density;
           if (use_materials) {
-            Real y0 = material_mixture.Material0MassFractionFromPrimitive(
-                primitive, m, kk, jj, ii);
-            Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                primitive, m, kk, jj, ii+1);
-            Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                primitive, m, kk, jj, ii-1);
-            Real electron_density_center = material_mixture.ElectronNumberDensityCgs(
-                primitive(m, IDN, kk, jj, ii), density_scale_cgs, y0);
-            Real electron_density_p = material_mixture.ElectronNumberDensityCgs(
-                primitive(m, IDN, kk, jj, ii+1), density_scale_cgs, yp);
-            Real electron_density_m = material_mixture.ElectronNumberDensityCgs(
-                primitive(m, IDN, kk, jj, ii-1), density_scale_cgs, ym);
+            Real electron_density_center = MaterialElectronDensityCgs(
+                primitive, thermodynamics, material_mixture,
+                use_tabular_materials, density_scale_cgs, m, kk, jj, ii);
+            Real electron_density_p = MaterialElectronDensityCgs(
+                primitive, thermodynamics, material_mixture,
+                use_tabular_materials, density_scale_cgs, m, kk, jj, ii+1);
+            Real electron_density_m = MaterialElectronDensityCgs(
+                primitive, thermodynamics, material_mixture,
+                use_tabular_materials, density_scale_cgs, m, kk, jj, ii-1);
             Real grad_x = (electron_density_p-electron_density_m)/
                           (2.0*sizes(m).dx1);
             Real hess_x = (electron_density_p-2.0*electron_density_center+
@@ -376,14 +399,12 @@ void Laser::InitializeRays() {
             Real reconstructed_density = electron_density_center+
                 grad_x*offset_x+0.5*hess_x*SQR(offset_x);
             if (multi_d) {
-              Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, kk, jj+1, ii);
-              Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, kk, jj-1, ii);
-              electron_density_p = material_mixture.ElectronNumberDensityCgs(
-                  primitive(m, IDN, kk, jj+1, ii), density_scale_cgs, yp);
-              electron_density_m = material_mixture.ElectronNumberDensityCgs(
-                  primitive(m, IDN, kk, jj-1, ii), density_scale_cgs, ym);
+              electron_density_p = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, kk, jj+1, ii);
+              electron_density_m = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, kk, jj-1, ii);
               Real grad_y = (electron_density_p-electron_density_m)/
                             (2.0*sizes(m).dx2);
               Real hess_y = (electron_density_p-2.0*electron_density_center+
@@ -392,14 +413,12 @@ void Laser::InitializeRays() {
                   grad_y*offset_y+0.5*hess_y*SQR(offset_y);
             }
             if (three_d) {
-              Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, kk+1, jj, ii);
-              Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, kk-1, jj, ii);
-              electron_density_p = material_mixture.ElectronNumberDensityCgs(
-                  primitive(m, IDN, kk+1, jj, ii), density_scale_cgs, yp);
-              electron_density_m = material_mixture.ElectronNumberDensityCgs(
-                  primitive(m, IDN, kk-1, jj, ii), density_scale_cgs, ym);
+              electron_density_p = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, kk+1, jj, ii);
+              electron_density_m = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, kk-1, jj, ii);
               Real grad_z = (electron_density_p-electron_density_m)/
                             (2.0*sizes(m).dx3);
               Real hess_z = (electron_density_p-2.0*electron_density_center+
@@ -553,6 +572,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   auto path = ray_path_length_; auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
   auto primitive = pmy_pack_->pmhd->w0;
+  auto temperature = pmy_pack_->pmhd->ptwo_temp->temperature;
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
   auto constant_absorption = ray_constant_absorption_;
   auto wavelength = ray_wavelength_;
   auto zeff = ray_zeff_;
@@ -579,6 +600,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   int seg_per_launch = max_segments_per_launch_;
   bool use_materials = use_material_mixture_;
   auto material_mixture = material_mixture_;
+  bool use_tabular_materials =
+      use_materials && material_mixture.UsesTabularEOS();
 
   SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
@@ -646,18 +669,15 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               Real ne_m;
               Real grad_x;
               if (use_materials) {
-                Real y0 = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k, j, i);
-                Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k, j, i+1);
-                Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k, j, i-1);
-                ne_center = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k, j, i), density_scale_cgs, y0);
-                ne_p = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k, j, i+1), density_scale_cgs, yp);
-                ne_m = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k, j, i-1), density_scale_cgs, ym);
+                ne_center = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k, j, i);
+                ne_p = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k, j, i+1);
+                ne_m = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k, j, i-1);
                 grad_x = (ne_p-ne_m)/(2.0*size.dx1);
               } else {
                 ne_center = number_scale*primitive(m, IDN, k, j, i);
@@ -669,14 +689,12 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               Real grad_z = 0.0;
               if (multi_d) {
                 if (use_materials) {
-                  Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                      primitive, m, k, j+1, i);
-                  Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                      primitive, m, k, j-1, i);
-                  ne_p = material_mixture.ElectronNumberDensityCgs(
-                      primitive(m, IDN, k, j+1, i), density_scale_cgs, yp);
-                  ne_m = material_mixture.ElectronNumberDensityCgs(
-                      primitive(m, IDN, k, j-1, i), density_scale_cgs, ym);
+                  ne_p = MaterialElectronDensityCgs(
+                      primitive, thermodynamics, material_mixture,
+                      use_tabular_materials, density_scale_cgs, m, k, j+1, i);
+                  ne_m = MaterialElectronDensityCgs(
+                      primitive, thermodynamics, material_mixture,
+                      use_tabular_materials, density_scale_cgs, m, k, j-1, i);
                   grad_y = (ne_p-ne_m)/(2.0*size.dx2);
                 } else {
                   grad_y = number_scale*
@@ -686,14 +704,12 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               }
               if (three_d) {
                 if (use_materials) {
-                  Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                      primitive, m, k+1, j, i);
-                  Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                      primitive, m, k-1, j, i);
-                  ne_p = material_mixture.ElectronNumberDensityCgs(
-                      primitive(m, IDN, k+1, j, i), density_scale_cgs, yp);
-                  ne_m = material_mixture.ElectronNumberDensityCgs(
-                      primitive(m, IDN, k-1, j, i), density_scale_cgs, ym);
+                  ne_p = MaterialElectronDensityCgs(
+                      primitive, thermodynamics, material_mixture,
+                      use_tabular_materials, density_scale_cgs, m, k+1, j, i);
+                  ne_m = MaterialElectronDensityCgs(
+                      primitive, thermodynamics, material_mixture,
+                      use_tabular_materials, density_scale_cgs, m, k-1, j, i);
                   grad_z = (ne_p-ne_m)/(2.0*size.dx3);
                 } else {
                   grad_z = number_scale*
@@ -750,8 +766,19 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 Real local_fe = electron_heat_capacity_fraction;
                 Real local_temperature_scale = temperature_scale_cgs;
                 Real electron_density;
+                Real electron_temperature;
                 Real local_zeff = zeff(r);
-                if (use_materials) {
+                if (use_tabular_materials) {
+                  electron_density = fmax(thermodynamics(
+                      m, two_temperature::TwoTemperature::electron_number_density_cgs,
+                      k, j, i), 0.0);
+                  electron_temperature = fmax(
+                      temperature(m, 1, k, j, i)*material_mixture.temperature_to_kelvin,
+                      ib_temperature_floor);
+                  local_zeff = fmax(thermodynamics(
+                      m, two_temperature::TwoTemperature::effective_charge,
+                      k, j, i), 0.0);
+                } else if (use_materials) {
                   Real y0 = material_mixture.Material0MassFractionFromPrimitive(
                       primitive, m, k, j, i);
                   local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
@@ -760,13 +787,16 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                   electron_density = material_mixture.ElectronNumberDensityCgs(
                       density, density_scale_cgs, y0);
                   local_zeff = material_mixture.EffectiveCharge(y0);
+                  electron_temperature = fmax(
+                      gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
+                      ib_temperature_floor);
                 } else {
                   electron_density = density*density_scale_cgs*
                                      electron_number_per_gram;
+                  electron_temperature = fmax(
+                      gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
+                      ib_temperature_floor);
                 }
-                Real electron_temperature = fmax(
-                    gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
-                    ib_temperature_floor);
                 Real wavelength_cgs = wavelength(r)*length_scale_cgs;
                 coefficient = InverseBremsstrahlungCoefficient(
                     electron_density, electron_temperature, local_zeff, wavelength_cgs,
@@ -994,6 +1024,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
   auto primitive = pmy_pack_->pmhd->w0;
+  auto temperature = pmy_pack_->pmhd->ptwo_temp->temperature;
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
   auto constant_absorption = ray_constant_absorption_;
   auto wavelength = ray_wavelength_;
   auto zeff = ray_zeff_;
@@ -1019,6 +1051,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   int seg_per_launch = max_segments_per_launch_;
   bool use_materials = use_material_mixture_;
   auto material_mixture = material_mixture_;
+  bool use_tabular_materials =
+      use_materials && material_mixture.UsesTabularEOS();
 
   SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
@@ -1052,18 +1086,15 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             Real grad_x;
             Real hess_x;
             if (use_materials) {
-              Real y0 = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, k, j, i);
-              Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, k, j, i+1);
-              Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                  primitive, m, k, j, i-1);
-              electron_density_center = material_mixture.ElectronNumberDensityCgs(
-                  density, density_scale_cgs, y0);
-              Real ne_p = material_mixture.ElectronNumberDensityCgs(
-                  primitive(m, IDN, k, j, i+1), density_scale_cgs, yp);
-              Real ne_m = material_mixture.ElectronNumberDensityCgs(
-                  primitive(m, IDN, k, j, i-1), density_scale_cgs, ym);
+              electron_density_center = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, k, j, i);
+              Real ne_p = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, k, j, i+1);
+              Real ne_m = MaterialElectronDensityCgs(
+                  primitive, thermodynamics, material_mixture,
+                  use_tabular_materials, density_scale_cgs, m, k, j, i-1);
               grad_x = (ne_p-ne_m)/(2.0*size.dx1);
               hess_x = (ne_p-2.0*electron_density_center+ne_m)/SQR(size.dx1);
             } else {
@@ -1081,14 +1112,12 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             Real hess_z = 0.0;
             if (multi_d) {
               if (use_materials) {
-                Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k, j+1, i);
-                Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k, j-1, i);
-                Real ne_p = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k, j+1, i), density_scale_cgs, yp);
-                Real ne_m = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k, j-1, i), density_scale_cgs, ym);
+                Real ne_p = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k, j+1, i);
+                Real ne_m = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k, j-1, i);
                 grad_y = (ne_p-ne_m)/(2.0*size.dx2);
                 hess_y = (ne_p-2.0*electron_density_center+ne_m)/SQR(size.dx2);
               } else {
@@ -1102,14 +1131,12 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             }
             if (three_d) {
               if (use_materials) {
-                Real yp = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k+1, j, i);
-                Real ym = material_mixture.Material0MassFractionFromPrimitive(
-                    primitive, m, k-1, j, i);
-                Real ne_p = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k+1, j, i), density_scale_cgs, yp);
-                Real ne_m = material_mixture.ElectronNumberDensityCgs(
-                    primitive(m, IDN, k-1, j, i), density_scale_cgs, ym);
+                Real ne_p = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k+1, j, i);
+                Real ne_m = MaterialElectronDensityCgs(
+                    primitive, thermodynamics, material_mixture,
+                    use_tabular_materials, density_scale_cgs, m, k-1, j, i);
                 grad_z = (ne_p-ne_m)/(2.0*size.dx3);
                 hess_z = (ne_p-2.0*electron_density_center+ne_m)/SQR(size.dx3);
               } else {
@@ -1164,8 +1191,19 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               Real local_fe = electron_heat_capacity_fraction;
               Real local_temperature_scale = temperature_scale_cgs;
               Real ne;
+              Real electron_temperature;
               Real local_zeff = zeff(r);
-              if (use_materials) {
+              if (use_tabular_materials) {
+                ne = fmax(thermodynamics(
+                    m, two_temperature::TwoTemperature::electron_number_density_cgs,
+                    k, j, i), 0.0);
+                electron_temperature = fmax(
+                    temperature(m, 1, k, j, i)*material_mixture.temperature_to_kelvin,
+                    ib_temperature_floor);
+                local_zeff = fmax(thermodynamics(
+                    m, two_temperature::TwoTemperature::effective_charge,
+                    k, j, i), 0.0);
+              } else if (use_materials) {
                 Real y0 = material_mixture.Material0MassFractionFromPrimitive(
                     primitive, m, k, j, i);
                 local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
@@ -1174,12 +1212,15 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
                 ne = material_mixture.ElectronNumberDensityCgs(
                     density, density_scale_cgs, y0);
                 local_zeff = material_mixture.EffectiveCharge(y0);
+                electron_temperature = fmax(
+                    gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
+                    ib_temperature_floor);
               } else {
                 ne = density*density_scale_cgs*electron_number_per_gram;
+                electron_temperature = fmax(
+                    gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
+                    ib_temperature_floor);
               }
-              Real electron_temperature = fmax(
-                  gamma_minus_one*electron_energy/local_fe*local_temperature_scale,
-                  ib_temperature_floor);
               Real wavelength_cgs = wavelength(r)*length_scale_cgs;
               coefficient = InverseBremsstrahlungCoefficient(
                   ne, electron_temperature, local_zeff, wavelength_cgs,

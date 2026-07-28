@@ -19,6 +19,12 @@ listed below.  The archive audit and every user-versus-reference decision are re
   electron-ion exchange.
 - One conservative user scalar stores `rho*Y_CH`; `Y_He=1-Y_CH`.
 
+With tabular materials, the Biermann implementation evaluates electron number density as
+`n_e=rho sum_s(Y_s Z_s/A_s)`.  The pinned dimensionless coefficient is therefore
+`2.7875722321043606e-4 = 1.0364e-4/[0.1 sqrt(4 pi 1.1)]`; it does not include the legacy
+CH mean-particle-weight factor used when electron density was inferred from a constant
+electron heat-capacity fraction.
+
 The interface is smoothed over `0.02 mm` radially and `0.01` in angular cosine.  Its
 geometry field is a volume fraction `alpha`, while the advected scalar is a mass fraction:
 
@@ -120,6 +126,36 @@ convergence while the straight-ray propagation option keeps the prescribed focal
 unambiguous.  The `laser` slice/full-volume outputs contain path length, optical depth,
 segment count, and deposited-power fields for ray/deposition visualization.
 
+### Laser-ray visualization
+
+`plot_laser_rays.py` renders the cell-rasterized ray path or ray-segment count in either
+central plane and overlays the projected, path-weighted mean direction from
+`laser_dir1/2/3`.  These diagnostics do not contain individual ray polylines, so the
+figure and legend deliberately describe mean directions rather than reconstructed rays.
+Activate the Athena plotting environment first:
+
+```bash
+source /home/mengqi/miniconda3/etc/profile.d/conda.sh
+conda activate athena
+
+# Latest x1-x2 path map, with the nominal 0.8--1.0 mm, 50-degree CH cap.
+python DCI_3D/plot_laser_rays.py DCI_3D/runs/smoke \
+  --plane xy --latest --shell-outline
+
+# Latest x1-x3 segment-count map with direction streamlines.
+python DCI_3D/plot_laser_rays.py DCI_3D/runs/smoke \
+  --plane xz --quantity ray-count --vectors stream --latest --shell-outline
+```
+
+When passed a run directory, the plotter prefers its inexpensive `laser_xy` or
+`laser_xz` collective files and falls back to collective full-volume `laser` dumps.
+Explicit files and shell-style globs are also accepted.  PNGs are written deterministically
+under `DCI_3D/plots/laser_rays/` by default; use `--output` for one selected dump,
+`--output-dir` for a batch destination, and `--overwrite` to replace existing frames.
+The full-volume path is supported, but the production dump is much larger in memory than
+the plane-specific files because `bin_convert.py` loads its fields before extracting the
+requested plane.
+
 ## Mesh and output cadence
 
 The first memory-calibration candidate is `400 x 256 x 256` cells with `50 x 32 x 32`
@@ -159,10 +195,23 @@ python3 DCI_3D/run_case.py --build --clean --mode validate
 ```
 
 The default smoke mode advances 50 RK2 steps, crosses history/slice/restart boundaries,
-then restarts for ten more cycles with the same table copies/fingerprints:
+then restarts for ten more cycles with the same table copies/fingerprints.  The smoke
+overrides also write full-volume fluid, 3T, and laser dumps at the checkpoint so the gate
+checks every compact-mesh 3T cell rather than inferring positivity from a plane slice.
+Those volume blocks explicitly use AthenaK's collective single-file MPI layout; the gate
+requires all 20 `eradNN` fields and exactly `100*64*64` cells at cycle 50 or later:
 
 ```bash
 python3 DCI_3D/run_case.py --clean --mode smoke
+```
+
+Generate matched doubled-resolution and `c_hat=30` evidence in separate owned trees:
+
+```bash
+python3 DCI_3D/run_case.py --clean --mode smoke --compact-scale 2 \
+  --run-dir DCI_3D/runs/resolution2
+python3 DCI_3D/run_case.py --clean --mode smoke --radiation-c-light 30 \
+  --run-dir DCI_3D/runs/rsla30
 ```
 
 Measure the full candidate allocation for two steps:
@@ -176,24 +225,22 @@ Calibration returns status 2 unless every GPU's measured allocation increase is 
 
 ## Production gate and 5+5 ns staging
 
-An actual `--mode production` call requires local `DCI_3D/production_gate.json`.  The file
-is ignored by Git and must use schema 1.  Its `artifacts` mapping must exactly match the
-launcher's current binary, problem generator, both decks, launcher, and all four audited
-tables.  Each required check must be `passed: true` and cite at least one existing evidence
-file with a matching SHA-256:
+An actual `--mode production` call requires ignored local
+`DCI_3D/production_gate.json`.  It is generated from the four run trees above; it is never
+hand-authored.  Preview all derived metrics without writing, then create or update it:
 
-```json
-{
-  "schema": 1,
-  "artifacts": {"... exact output of the validated launcher ...": "..."},
-  "checks": {
-    "compact_20group_50step": {
-      "passed": true,
-      "evidence": [{"path": "runs/smoke/run_status.json", "sha256": "..."}]
-    }
-  }
-}
+```bash
+python3 DCI_3D/verify_production_gate.py --dry-run
+python3 DCI_3D/verify_production_gate.py
 ```
+
+The verifier writes schema 2 with hashes of the binary, problem generator, decks,
+launcher, verifier, material tables, every selected log/status/history/3T/restart artifact,
+the numerical tolerances, and computed metrics.  It exits 2 and records failed checks when
+evidence is incomplete or outside tolerance.  On an actual production request,
+`run_case.py` re-hashes every source and independently recomputes the checks; changing a
+run artifact, tolerance, executable, table, deck, launcher, or verifier invalidates the
+gate.
 
 The exact required check names are:
 
@@ -214,6 +261,12 @@ closure including integrated outward radiation; CH-mass conservation; continuous
 time/timestep/energies; a doubled-resolution or opacity-sensitivity result; acceptable
 `c_hat=10`/`30` (and short physical-`c`) sensitivity; and 60--80 percent memory on all
 eight V100s.
+
+The deterministic parser and gate-math tests do not substitute for GPU evidence:
+
+```bash
+python3 -m pytest -q DCI_3D/test_verify_production_gate.py
+```
 
 Only after that manifest validates does phase 1 evolve to the aligned `5 ns` checkpoint.
 Phase 2 restarts the exact checkpoint, leaves the square pulse naturally off at `t>=5 ns`,

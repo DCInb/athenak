@@ -1,0 +1,23 @@
+athenak_two_temperature_eos 1
+dimensions 2 3
+abar 6.5
+density
+1.0 4.0
+temperature
+10.0 100.0 1000.0
+ion_pressure
+10.0 100.0 1000.0
+40.0 400.0 4000.0
+electron_pressure
+20.0 200.0 2000.0
+80.0 800.0 8000.0
+ion_specific_internal_energy
+30.0 300.0 3000.0
+30.0 300.0 3000.0
+electron_specific_internal_energy
+40.0 400.0 4000.0
+40.0 400.0 4000.0
+mean_ionization
+0.2 2.0 20.0
+0.2 2.0 20.0
+end

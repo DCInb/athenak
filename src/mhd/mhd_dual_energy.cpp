@@ -237,6 +237,9 @@ void MHD::SynchronizeDualEnergyFromTotal() {
           eint_aux = eint_cons;
         }
         eint_aux = fmax(eint_aux, minimum_sum);
+        if (eint_cons < minimum_sum) {
+          u0_(m, IEN, k, j, i) += minimum_sum-eint_cons;
+        }
         const materials::MaterialThermodynamicState state =
             material_mixture.StateFromRhoSpecificEnergies(
                 dens, fmax(eion, eion_floor)/dens,

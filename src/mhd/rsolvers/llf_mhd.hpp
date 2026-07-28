@@ -17,9 +17,12 @@ namespace mhd {
 
 KOKKOS_INLINE_FUNCTION
 void LLF(TeamMember_t const &member, const EOS_Data &eos,
+     const bool use_tabular_material_eos,
      const RegionIndcs &indcs,const DualArray1D<RegionSize> &size,const CoordData &coord,
      const int m, const int k, const int j, const int il, const int iu, const int ivx,
      const ScrArray2D<Real> &wl, const ScrArray2D<Real> &wr,
+     const ScrArray2D<Real> &material_left,
+     const ScrArray2D<Real> &material_right,
      const ScrArray2D<Real> &bl, const ScrArray2D<Real> &br, const DvceArray4D<Real> &bx,
      DvceArray5D<Real> flx, DvceArray4D<Real> ey, DvceArray4D<Real> ez) {
   int ivy = IVX + ((ivx-IVX) + 1)%3;
@@ -44,7 +47,7 @@ void LLF(TeamMember_t const &member, const EOS_Data &eos,
     wri.by = br(iby,i);
     wri.bz = br(ibz,i);
 
-    if (eos.is_ideal) {
+    if (eos.is_ideal || use_tabular_material_eos) {
       wli.e = wl(IEN,i);
       wri.e = wr(IEN,i);
     }
@@ -54,14 +57,23 @@ void LLF(TeamMember_t const &member, const EOS_Data &eos,
 
     // Call LLF solver on single interface state
     MHDCons1D flux;
-    SingleStateLLF_MHD(wli,wri,bxi,eos,flux);
+    if (use_tabular_material_eos) {
+      SingleStateLLF_MHDMaterial(
+          wli, wri, bxi,
+          fmax(material_left(material_total_pressure, i), 0.0),
+          fmax(material_right(material_total_pressure, i), 0.0),
+          fmax(material_left(material_sound_speed_squared, i), 0.0),
+          fmax(material_right(material_sound_speed_squared, i), 0.0), flux);
+    } else {
+      SingleStateLLF_MHD(wli,wri,bxi,eos,flux);
+    }
 
     // Store results in 3D array of fluxes
     flx(m,IDN,k,j,i) = flux.d;
     flx(m,ivx,k,j,i) = flux.mx;
     flx(m,ivy,k,j,i) = flux.my;
     flx(m,ivz,k,j,i) = flux.mz;
-    if (eos.is_ideal) {flx(m,IEN,k,j,i) = flux.e;}
+    if (eos.is_ideal || use_tabular_material_eos) {flx(m,IEN,k,j,i) = flux.e;}
     ey(m,k,j,i) = flux.by;
     ez(m,k,j,i) = flux.bz;
   });

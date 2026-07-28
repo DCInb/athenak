@@ -16,15 +16,49 @@
 #include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
 #include "mhd/biermann_battery.hpp"
+#include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 namespace {
 
 KOKKOS_INLINE_FUNCTION
 Real ElectronPressure(const DvceArray5D<Real> &w, const int iele,
+                      const DvceArray5D<Real> &thermodynamics,
+                      const bool use_tabular_materials,
                       const Real gm1, const int m, const int k, const int j,
                       const int i) {
+  if (use_tabular_materials) {
+    return fmax(thermodynamics(
+        m, two_temperature::TwoTemperature::electron_pressure, k, j, i), 0.0);
+  }
   return gm1 * fmax(w(m, IDN, k, j, i) * w(m, iele, k, j, i), 0.0);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real TotalPressure(const DvceArray5D<Real> &w,
+                   const DvceArray5D<Real> &thermodynamics,
+                   const bool use_tabular_materials, const Real gm1,
+                   const int m, const int k, const int j, const int i) {
+  if (use_tabular_materials) {
+    return fmax(
+        thermodynamics(m, two_temperature::TwoTemperature::ion_pressure, k, j, i)+
+        thermodynamics(m, two_temperature::TwoTemperature::electron_pressure,
+                       k, j, i), 0.0);
+  }
+  return gm1*w(m, IEN, k, j, i);
+}
+
+// Convert the shared physical number-density cache back to the normalization used by
+// the Biermann coefficient: ne_code=rho*sum_s(Y_s Z_s/A_s).  This deliberately differs
+// from the legacy no-material convention ne_code=f_e*rho.
+KOKKOS_INLINE_FUNCTION
+Real CachedElectronDensityCode(
+    const DvceArray5D<Real> &thermodynamics, const Real cgs_to_code,
+    const int m, const int k, const int j, const int i) {
+  return fmax(thermodynamics(
+      m, two_temperature::TwoTemperature::electron_number_density_cgs,
+      k, j, i)*cgs_to_code, 1.0e-30);
 }
 
 } // namespace
@@ -137,23 +171,32 @@ void BiermannBattery::ComputeShockMask(const DvceArray5D<Real> &prim) {
   Real thr_hi = shock_threshold;
   Real thr_lo = 0.2 * shock_threshold;
   auto w = prim;
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
+  bool use_tabular_materials =
+      use_material_mixture_ && material_mixture_.UsesTabularEOS();
   par_for(
       "biermann_shock_mask", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
       KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
         Real mask = 1.0;
-        Real pm = fmax(gm1 * w(m, IEN, k, j, i - 1), pfloor);
-        Real pp = fmax(gm1 * w(m, IEN, k, j, i + 1), pfloor);
+        Real pm = fmax(TotalPressure(
+            w, thermodynamics, use_tabular_materials, gm1, m, k, j, i-1), pfloor);
+        Real pp = fmax(TotalPressure(
+            w, thermodynamics, use_tabular_materials, gm1, m, k, j, i+1), pfloor);
         Real jump = 2.0 * fabs(pp - pm) / fmax(pp + pm, 2.0 * pfloor);
         mask = fmin(mask, fmin(1.0, fmax(0.0, (thr_hi - jump)/(thr_hi - thr_lo))));
         if (multi_d) {
-          pm = fmax(gm1 * w(m, IEN, k, j - 1, i), pfloor);
-          pp = fmax(gm1 * w(m, IEN, k, j + 1, i), pfloor);
+          pm = fmax(TotalPressure(
+              w, thermodynamics, use_tabular_materials, gm1, m, k, j-1, i), pfloor);
+          pp = fmax(TotalPressure(
+              w, thermodynamics, use_tabular_materials, gm1, m, k, j+1, i), pfloor);
           jump = 2.0 * fabs(pp - pm) / fmax(pp + pm, 2.0 * pfloor);
           mask = fmin(mask, fmin(1.0, fmax(0.0, (thr_hi - jump)/(thr_hi - thr_lo))));
         }
         if (three_d) {
-          pm = fmax(gm1 * w(m, IEN, k - 1, j, i), pfloor);
-          pp = fmax(gm1 * w(m, IEN, k + 1, j, i), pfloor);
+          pm = fmax(TotalPressure(
+              w, thermodynamics, use_tabular_materials, gm1, m, k-1, j, i), pfloor);
+          pp = fmax(TotalPressure(
+              w, thermodynamics, use_tabular_materials, gm1, m, k+1, j, i), pfloor);
           jump = 2.0 * fabs(pp - pm) / fmax(pp + pm, 2.0 * pfloor);
           mask = fmin(mask, fmin(1.0, fmax(0.0, (thr_hi - jump)/(thr_hi - thr_lo))));
         }
@@ -194,6 +237,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
   int iele = iele_;
   bool use_materials = use_material_mixture_;
   auto material_mixture = material_mixture_;
+  bool use_tabular_materials =
+      use_materials && material_mixture.UsesTabularEOS();
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
+  Real electron_density_cgs_to_code = use_tabular_materials
+      ? materials::MaterialMixtureDevice::atomic_mass_unit_cgs/
+        material_mixture.density_to_cgs
+      : 1.0;
   // x1-face electric fields, including the transverse halo needed by flux-CT.
   int jl = multi_d ? js - 1 : js;
   int ju = multi_d ? je + 1 : je;
@@ -205,22 +255,40 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         Real dp2 = 0.0;
         Real dp3 = 0.0;
         if (multi_d) {
-          Real pp = ElectronPressure(w, iele, gm1, m, k, j + 1, i - 1) +
-                    ElectronPressure(w, iele, gm1, m, k, j + 1, i);
-          Real pm = ElectronPressure(w, iele, gm1, m, k, j - 1, i - 1) +
-                    ElectronPressure(w, iele, gm1, m, k, j - 1, i);
+          Real pp = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j+1, i-1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j+1, i);
+          Real pm = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j-1, i-1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j-1, i);
           dp2 = 0.25 * (pp - pm) / size.d_view(m).dx2;
         }
         if (three_d) {
-          Real pp = ElectronPressure(w, iele, gm1, m, k + 1, j, i - 1) +
-                    ElectronPressure(w, iele, gm1, m, k + 1, j, i);
-          Real pm = ElectronPressure(w, iele, gm1, m, k - 1, j, i - 1) +
-                    ElectronPressure(w, iele, gm1, m, k - 1, j, i);
+          Real pp = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k+1, j, i-1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k+1, j, i);
+          Real pm = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k-1, j, i-1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k-1, j, i);
           dp3 = 0.25 * (pp - pm) / size.d_view(m).dx3;
         }
         Real mask = fmin(smooth(m, k, j, i - 1), smooth(m, k, j, i));
         Real inv_ne;
-        if (use_materials) {
+        if (use_tabular_materials) {
+          const Real ne = 0.5*(CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i-1)+
+              CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i));
+          inv_ne = 1.0/ne;
+        } else if (use_materials) {
           const Real rho_l = fmax(w(m, IDN, k, j, i-1), dfloor);
           const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
           const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
@@ -247,22 +315,40 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         "biermann_face_e2", DevExeSpace(), 0, nmb1, kl, ku, js, je + 1, is - 1,
         ie + 1,
         KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-          Real pp = ElectronPressure(w, iele, gm1, m, k, j - 1, i + 1) +
-                    ElectronPressure(w, iele, gm1, m, k, j, i + 1);
-          Real pm = ElectronPressure(w, iele, gm1, m, k, j - 1, i - 1) +
-                    ElectronPressure(w, iele, gm1, m, k, j, i - 1);
+          Real pp = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j-1, i+1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j, i+1);
+          Real pm = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j-1, i-1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j, i-1);
           Real dp1 = 0.25 * (pp - pm) / size.d_view(m).dx1;
           Real dp3 = 0.0;
           if (three_d) {
-            pp = ElectronPressure(w, iele, gm1, m, k + 1, j - 1, i) +
-                 ElectronPressure(w, iele, gm1, m, k + 1, j, i);
-            pm = ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) +
-                 ElectronPressure(w, iele, gm1, m, k - 1, j, i);
+            pp = ElectronPressure(
+                w, iele, thermodynamics, use_tabular_materials,
+                gm1, m, k+1, j-1, i)+ElectronPressure(
+                w, iele, thermodynamics, use_tabular_materials,
+                gm1, m, k+1, j, i);
+            pm = ElectronPressure(
+                w, iele, thermodynamics, use_tabular_materials,
+                gm1, m, k-1, j-1, i)+ElectronPressure(
+                w, iele, thermodynamics, use_tabular_materials,
+                gm1, m, k-1, j, i);
             dp3 = 0.25 * (pp - pm) / size.d_view(m).dx3;
           }
           Real mask = fmin(smooth(m, k, j - 1, i), smooth(m, k, j, i));
           Real inv_ne;
-          if (use_materials) {
+          if (use_tabular_materials) {
+            const Real ne = 0.5*(CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j-1, i)+
+                CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
+            inv_ne = 1.0/ne;
+          } else if (use_materials) {
             const Real rho_l = fmax(w(m, IDN, k, j-1, i), dfloor);
             const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
             const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
@@ -288,19 +374,37 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         "biermann_face_e3", DevExeSpace(), 0, nmb1, ks, ke + 1, js - 1, je + 1,
         is - 1, ie + 1,
         KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-          Real pp = ElectronPressure(w, iele, gm1, m, k - 1, j, i + 1) +
-                    ElectronPressure(w, iele, gm1, m, k, j, i + 1);
-          Real pm = ElectronPressure(w, iele, gm1, m, k - 1, j, i - 1) +
-                    ElectronPressure(w, iele, gm1, m, k, j, i - 1);
+          Real pp = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k-1, j, i+1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j, i+1);
+          Real pm = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k-1, j, i-1)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j, i-1);
           Real dp1 = 0.25 * (pp - pm) / size.d_view(m).dx1;
-          pp = ElectronPressure(w, iele, gm1, m, k - 1, j + 1, i) +
-               ElectronPressure(w, iele, gm1, m, k, j + 1, i);
-          pm = ElectronPressure(w, iele, gm1, m, k - 1, j - 1, i) +
-               ElectronPressure(w, iele, gm1, m, k, j - 1, i);
+          pp = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k-1, j+1, i)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j+1, i);
+          pm = ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k-1, j-1, i)+ElectronPressure(
+              w, iele, thermodynamics, use_tabular_materials,
+              gm1, m, k, j-1, i);
           Real dp2 = 0.25 * (pp - pm) / size.d_view(m).dx2;
           Real mask = fmin(smooth(m, k - 1, j, i), smooth(m, k, j, i));
           Real inv_ne;
-          if (use_materials) {
+          if (use_tabular_materials) {
+            const Real ne = 0.5*(CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k-1, j, i)+
+                CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
+            inv_ne = 1.0/ne;
+          } else if (use_materials) {
             const Real rho_l = fmax(w(m, IDN, k-1, j, i), dfloor);
             const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
             const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
@@ -348,7 +452,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                 size.d_view(m).dx3;
         }
         Real drift;
-        if (use_materials) {
+        if (use_tabular_materials) {
+          const Real ne = 0.5*(CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i-1)+
+              CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i));
+          drift = -coeff*mask*j1/ne;
+        } else if (use_materials) {
           const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
               w, m, k, j, i-1);
           const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
@@ -368,7 +478,18 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         Real by = 0.5 * (b(m, IBY, k, j, i - 1) + b(m, IBY, k, j, i));
         Real bz = 0.5 * (b(m, IBZ, k, j, i - 1) + b(m, IBZ, k, j, i));
         flx1(m, IEN, k, j, i) += e21(m, k, j, i) * bz - e31(m, k, j, i) * by;
-        flx1(m, IEN, k, j, i) += gamma * eps * drift;
+        if (use_tabular_materials) {
+          const Real pe_l = fmax(thermodynamics(
+              m, two_temperature::TwoTemperature::electron_pressure,
+              k, j, i-1), 0.0);
+          const Real pe_r = fmax(thermodynamics(
+              m, two_temperature::TwoTemperature::electron_pressure,
+              k, j, i), 0.0);
+          flx1(m, IEN, k, j, i) +=
+              (eps+((drift >= 0.0) ? pe_l : pe_r))*drift;
+        } else {
+          flx1(m, IEN, k, j, i) += gamma*eps*drift;
+        }
       });
 
   // Active x2 faces.
@@ -392,7 +513,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                   size.d_view(m).dx3;
           }
           Real drift;
-          if (use_materials) {
+          if (use_tabular_materials) {
+            const Real ne = 0.5*(CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j-1, i)+
+                CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
+            drift = -coeff*mask*j2/ne;
+          } else if (use_materials) {
             const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
                 w, m, k, j-1, i);
             const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
@@ -412,7 +539,18 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           Real bx = 0.5 * (b(m, IBX, k, j - 1, i) + b(m, IBX, k, j, i));
           Real bz = 0.5 * (b(m, IBZ, k, j - 1, i) + b(m, IBZ, k, j, i));
           flx2(m, IEN, k, j, i) += e32(m, k, j, i) * bx - e12(m, k, j, i) * bz;
-          flx2(m, IEN, k, j, i) += gamma * eps * drift;
+          if (use_tabular_materials) {
+            const Real pe_l = fmax(thermodynamics(
+                m, two_temperature::TwoTemperature::electron_pressure,
+                k, j-1, i), 0.0);
+            const Real pe_r = fmax(thermodynamics(
+                m, two_temperature::TwoTemperature::electron_pressure,
+                k, j, i), 0.0);
+            flx2(m, IEN, k, j, i) +=
+                (eps+((drift >= 0.0) ? pe_l : pe_r))*drift;
+          } else {
+            flx2(m, IEN, k, j, i) += gamma*eps*drift;
+          }
         });
   }
 
@@ -435,7 +573,13 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                  b(m, IBX, k - 1, j - 1, i) - b(m, IBX, k, j - 1, i)) /
                 size.d_view(m).dx2;
           Real drift;
-          if (use_materials) {
+          if (use_tabular_materials) {
+            const Real ne = 0.5*(CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k-1, j, i)+
+                CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j, i));
+            drift = -coeff*mask*j3/ne;
+          } else if (use_materials) {
             const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
                 w, m, k-1, j, i);
             const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
@@ -455,7 +599,18 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           Real bx = 0.5 * (b(m, IBX, k - 1, j, i) + b(m, IBX, k, j, i));
           Real by = 0.5 * (b(m, IBY, k - 1, j, i) + b(m, IBY, k, j, i));
           flx3(m, IEN, k, j, i) += e13(m, k, j, i) * by - e23(m, k, j, i) * bx;
-          flx3(m, IEN, k, j, i) += gamma * eps * drift;
+          if (use_tabular_materials) {
+            const Real pe_l = fmax(thermodynamics(
+                m, two_temperature::TwoTemperature::electron_pressure,
+                k-1, j, i), 0.0);
+            const Real pe_r = fmax(thermodynamics(
+                m, two_temperature::TwoTemperature::electron_pressure,
+                k, j, i), 0.0);
+            flx3(m, IEN, k, j, i) +=
+                (eps+((drift >= 0.0) ? pe_l : pe_r))*drift;
+          } else {
+            flx3(m, IEN, k, j, i) += gamma*eps*drift;
+          }
         });
   }
 }
@@ -544,6 +699,9 @@ void BiermannBattery::ApplyElectronWork(Real dt, DvceArray5D<Real> &cons,
   int iele = iele_;
   Real gm1 = gamma_minus_one_;
   Real dfloor = density_floor_;
+  bool use_tabular_materials =
+      use_material_mixture_ && material_mixture_.UsesTabularEOS();
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
 
   par_for(
       "biermann_electron_work", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
@@ -556,7 +714,15 @@ void BiermannBattery::ApplyElectronWork(Real dt, DvceArray5D<Real> &cons,
         if (three_d) {
           divvd += (vd3(m, k + 1, j, i) - vd3(m, k, j, i)) / size.d_view(m).dx3;
         }
-        Real eele = fmax(u(m, iele, k, j, i), 0.0) * exp(-gm1 * divvd * dt);
+        Real eele = fmax(u(m, iele, k, j, i), 0.0);
+        if (use_tabular_materials) {
+          const Real pe = fmax(thermodynamics(
+              m, two_temperature::TwoTemperature::electron_pressure,
+              k, j, i), 0.0);
+          if (eele > 0.0) eele *= exp(-(pe/eele)*divvd*dt);
+        } else {
+          eele *= exp(-gm1*divvd*dt);
+        }
         Real density = fmax(u(m, IDN, k, j, i), dfloor);
         u(m, iele, k, j, i) = eele;
         w(m, iele, k, j, i) = eele / density;
@@ -593,6 +759,13 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
   int iele = iele_;
   bool use_materials = use_material_mixture_;
   auto material_mixture = material_mixture_;
+  bool use_tabular_materials =
+      use_materials && material_mixture.UsesTabularEOS();
+  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
+  Real electron_density_cgs_to_code = use_tabular_materials
+      ? materials::MaterialMixtureDevice::atomic_mass_unit_cgs/
+        material_mixture.density_to_cgs
+      : 1.0;
   Real dt1 = std::numeric_limits<float>::max();
   Real dt2 = std::numeric_limits<float>::max();
   Real dt3 = std::numeric_limits<float>::max();
@@ -615,7 +788,15 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real local_fe = fe;
         Real ne;
         Real dln1;
-        if (use_materials) {
+        if (use_tabular_materials) {
+          ne = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i);
+          const Real ne_p = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i+1);
+          const Real ne_m = CachedElectronDensityCode(
+              thermodynamics, electron_density_cgs_to_code, m, k, j, i-1);
+          dln1 = (log(ne_p)-log(ne_m))/(2.0*dx1);
+        } else if (use_materials) {
           const Real y0 = material_mixture.Material0MassFractionFromPrimitive(
               w, m, k, j, i);
           local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
@@ -637,7 +818,13 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real dln2 = 0.0;
         Real dln3 = 0.0;
         if (multi_d) {
-          if (use_materials) {
+          if (use_tabular_materials) {
+            const Real ne_p = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j+1, i);
+            const Real ne_m = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k, j-1, i);
+            dln2 = (log(ne_p)-log(ne_m))/(2.0*dx2);
+          } else if (use_materials) {
             const Real rho_p = fmax(w(m, IDN, k, j+1, i), dfloor);
             const Real rho_m = fmax(w(m, IDN, k, j-1, i), dfloor);
             const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
@@ -653,7 +840,13 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           }
         }
         if (three_d) {
-          if (use_materials) {
+          if (use_tabular_materials) {
+            const Real ne_p = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k+1, j, i);
+            const Real ne_m = CachedElectronDensityCode(
+                thermodynamics, electron_density_cgs_to_code, m, k-1, j, i);
+            dln3 = (log(ne_p)-log(ne_m))/(2.0*dx3);
+          } else if (use_materials) {
             const Real rho_p = fmax(w(m, IDN, k+1, j, i), dfloor);
             const Real rho_m = fmax(w(m, IDN, k-1, j, i), dfloor);
             const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
@@ -683,9 +876,17 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           j2 += (b(m, IBX, k + 1, j, i) - b(m, IBX, k - 1, j, i)) / (2.0 * dx3);
         }
 
-        Real tele = gm1*fmax(w(m, iele, k, j, i), 0.0)/local_fe;
         Real gradln = sqrt(SQR(dln1) + SQR(dln2) + SQR(dln3));
-        Real vtm = coeff * sqrt(gm1 * tele / ne) * gradln;
+        Real vtm;
+        if (use_tabular_materials) {
+          const Real pe = fmax(thermodynamics(
+              m, two_temperature::TwoTemperature::electron_pressure,
+              k, j, i), 0.0);
+          vtm = coeff*sqrt(gm1*pe/(ne*ne))*gradln;
+        } else {
+          Real tele = gm1*fmax(w(m, iele, k, j, i), 0.0)/local_fe;
+          vtm = coeff*sqrt(gm1*tele/ne)*gradln;
+        }
         Real vd1 = -coeff * j1 / ne;
         Real vd2 = -coeff * j2 / ne;
         Real vd3 = -coeff * j3 / ne;

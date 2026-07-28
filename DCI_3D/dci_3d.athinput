@@ -66,7 +66,7 @@ t_ei_coulomb_log = 1.0e1
 t_ei_spitzer_multiplier = 1.0
 t_ei_temperature_floor_kelvin = 1.0
 biermann_battery = true
-biermann_coefficient = 4.026493224150743e-4
+biermann_coefficient = 2.7875722321043606e-4
 biermann_shock_suppression = true
 biermann_shock_threshold = 8.0e-1
 
@@ -252,18 +252,21 @@ dt = 1.0e-1
 file_type = bin
 variable = mhd_w_bcc
 id = fluid
+single_file_per_rank = false
 dt = 5.0e-1
 
 <output9>
 file_type = bin
 variable = mhd_3t
 id = three_t
+single_file_per_rank = false
 dt = 5.0e-1
 
 <output10>
 file_type = bin
 variable = laser
 id = laser
+single_file_per_rank = false
 dt = 5.0e-1
 
 <output11>

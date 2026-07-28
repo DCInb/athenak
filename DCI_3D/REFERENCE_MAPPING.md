@@ -63,6 +63,10 @@ The newest laser/Biermann reference is `3d_zb/ParDir/1l_4beam_BB.par` together w
 - initial ion, electron, and radiation temperatures are 11,606 K (approximately 1 eV);
 - 3T MHD, electron-ion heat exchange, 20-group radiation, vacuum radiation boundaries,
   Biermann battery, and zero initial magnetic field are enabled;
+- the tabular-material Biermann coefficient is
+  `1.0364e-4/[0.1 sqrt(4 pi 1.1)] = 2.7875722321043606e-4`; material electron density is
+  `rho sum_s(Y_s Z_s/A_s)`, so the legacy constant-heat-capacity mean-weight factor is
+  not applied;
 - Hall and explicit resistivity are disabled;
 - all full-domain hydro boundaries are outflow;
 - the run ends at 10 ns;

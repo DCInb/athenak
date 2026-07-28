@@ -19,6 +19,19 @@ where `f_e` is `electron_heat_capacity_fraction` and `C_B` is
 faces and arithmetically averaged to constrained-transport edges. The same face fields
 add the Biermann Poynting flux `E_B x B` to total energy.
 
+When a `<materials>` closure is active, the electron-density normalization is instead
+
+```text
+n_e,code = rho * sum_s(Y_s Zbar_s/A_s).
+```
+
+For tabular material EOS tables, `Zbar_s` is the local table ionization. The
+two-temperature synchronization caches `p_i`, `p_e`, physical `n_e`, and the effective
+charge once per cell. Biermann kernels reuse that cache: `grad(p_e)` uses the tabular
+electron pressure, shock detection uses `p_i+p_e`, and both the electric field and
+electron drift use cached `n_e`. The physical cache is converted without an EOS query by
+`n_e,code = n_e,cgs*m_u/rho_0`, where `rho_0` is the code density unit in g cm^-3.
+
 As in FLASH's flux formulation, the electron component follows its full velocity:
 
 ```text
@@ -31,6 +44,11 @@ flux `(epsilon_e+p_e)(v_e-v)`. Together with the Biermann Poynting flux, this ke
 total-energy equation conservative while allowing magnetic and electron energy to
 exchange. The existing 2T dual-energy update remains active, including in magnetically
 dominated cells.
+
+For a tabular EOS, the upwind total-energy drift flux uses the cached
+`epsilon_e+p_e`. The positive exponential work update uses the same frozen `p_e`; source
+coefficients are deliberately held at the stage-start thermodynamic state until the next
+two-temperature synchronization. There are no per-face table inversions.
 
 ## Input
 
@@ -56,10 +74,32 @@ biermann_shock_threshold = 0.25
 must map the inverse electron charge consistently into both the induction and electron
 drift equations.
 
+There are two supported electron-density normalizations, so their coefficients are not
+interchangeable. For the material normalization above,
+
+```text
+C_B,material = 1.0364e-4 / (L_0 * sqrt(4*pi*rho_0)),
+```
+
+with `L_0` in cm and `rho_0` in g cm^-3. The legacy no-material model uses
+`n_e,code=f_e*rho`; for a fixed composition with
+`q_e=sum_s(Y_s Zbar_s/A_s)`, the equivalent value is
+`C_B,legacy=C_B,material*f_e/q_e`. For the DCI CH normalization
+(`L_0=0.1 cm`, `rho_0=1.1 g cm^-3`, `Abar=6.5`, `Zbar=3.5`) these are
+`2.7875722321043606e-4` and `4.026493224150743e-4`, respectively. A deck with
+`<materials>` must use the former.
+
 The explicit timestep includes the electron drift speed and FLASH's thermal-magnetic
 wave speed. FLASH recommends a lower CFL number for this formulation. It also recommends
 shock detection because a direct pressure-gradient discretization is not convergent
 inside a discontinuity; AthenaK therefore enables symmetric shock suppression by default.
+
+In the tabular branch the thermal-magnetic contribution is evaluated from cached
+thermodynamics as
+
+```text
+v_TM^2 = C_B^2 * (gamma-1) * p_e/n_e^2 * |grad(ln n_e)|^2.
+```
 
 **Mask shape (2026-07 validation):** the suppression mask ramps linearly from 1 at a
 pressure jump of `threshold/5` to 0 at `threshold`. The wide band is deliberate: the

@@ -28,9 +28,107 @@
 #include "mhd/rsolvers/hlle_srmhd.hpp"
 #include "mhd/rsolvers/llf_grmhd.hpp"
 #include "mhd/rsolvers/hlle_grmhd.hpp"
+#include "two_temperature/two_temperature.hpp"
 // #include "mhd/rsolvers/roe_mhd.hpp"
 
 namespace mhd {
+
+KOKKOS_INLINE_FUNCTION
+Real CachedMaterialPressure(const DvceArray5D<Real> &thermodynamics,
+                            const int m, const int k, const int j, const int i) {
+  return thermodynamics(
+             m, two_temperature::TwoTemperature::ion_pressure, k, j, i)+
+         thermodynamics(
+             m, two_temperature::TwoTemperature::electron_pressure, k, j, i);
+}
+
+KOKKOS_INLINE_FUNCTION
+void ReconstructMaterialThermodynamicsX1(
+    TeamMember_t const &member, const bool donor_cell,
+    const int m, const int k, const int j, const int il, const int iu,
+    const DvceArray5D<Real> &thermodynamics,
+    ScrArray2D<Real> &ql, ScrArray2D<Real> &qr) {
+  par_for_inner(member, il, iu, [&](const int i) {
+    const Real pressure = CachedMaterialPressure(thermodynamics, m, k, j, i);
+    const Real cs2 = thermodynamics(
+        m, two_temperature::TwoTemperature::sound_speed_squared, k, j, i);
+    if (donor_cell) {
+      ql(material_total_pressure, i+1) = pressure;
+      qr(material_total_pressure, i) = pressure;
+      ql(material_sound_speed_squared, i+1) = cs2;
+      qr(material_sound_speed_squared, i) = cs2;
+    } else {
+      PLM(CachedMaterialPressure(thermodynamics, m, k, j, i-1), pressure,
+          CachedMaterialPressure(thermodynamics, m, k, j, i+1),
+          ql(material_total_pressure, i+1), qr(material_total_pressure, i));
+      PLM(thermodynamics(m, two_temperature::TwoTemperature::sound_speed_squared,
+                         k, j, i-1), cs2,
+          thermodynamics(m, two_temperature::TwoTemperature::sound_speed_squared,
+                         k, j, i+1),
+          ql(material_sound_speed_squared, i+1),
+          qr(material_sound_speed_squared, i));
+    }
+  });
+}
+
+KOKKOS_INLINE_FUNCTION
+void ReconstructMaterialThermodynamicsX2(
+    TeamMember_t const &member, const bool donor_cell,
+    const int m, const int k, const int j, const int il, const int iu,
+    const DvceArray5D<Real> &thermodynamics,
+    ScrArray2D<Real> &ql_jp1, ScrArray2D<Real> &qr_j) {
+  par_for_inner(member, il, iu, [&](const int i) {
+    const Real pressure = CachedMaterialPressure(thermodynamics, m, k, j, i);
+    const Real cs2 = thermodynamics(
+        m, two_temperature::TwoTemperature::sound_speed_squared, k, j, i);
+    if (donor_cell) {
+      ql_jp1(material_total_pressure, i) = pressure;
+      qr_j(material_total_pressure, i) = pressure;
+      ql_jp1(material_sound_speed_squared, i) = cs2;
+      qr_j(material_sound_speed_squared, i) = cs2;
+    } else {
+      PLM(CachedMaterialPressure(thermodynamics, m, k, j-1, i), pressure,
+          CachedMaterialPressure(thermodynamics, m, k, j+1, i),
+          ql_jp1(material_total_pressure, i), qr_j(material_total_pressure, i));
+      PLM(thermodynamics(m, two_temperature::TwoTemperature::sound_speed_squared,
+                         k, j-1, i), cs2,
+          thermodynamics(m, two_temperature::TwoTemperature::sound_speed_squared,
+                         k, j+1, i),
+          ql_jp1(material_sound_speed_squared, i),
+          qr_j(material_sound_speed_squared, i));
+    }
+  });
+}
+
+KOKKOS_INLINE_FUNCTION
+void ReconstructMaterialThermodynamicsX3(
+    TeamMember_t const &member, const bool donor_cell,
+    const int m, const int k, const int j, const int il, const int iu,
+    const DvceArray5D<Real> &thermodynamics,
+    ScrArray2D<Real> &ql_kp1, ScrArray2D<Real> &qr_k) {
+  par_for_inner(member, il, iu, [&](const int i) {
+    const Real pressure = CachedMaterialPressure(thermodynamics, m, k, j, i);
+    const Real cs2 = thermodynamics(
+        m, two_temperature::TwoTemperature::sound_speed_squared, k, j, i);
+    if (donor_cell) {
+      ql_kp1(material_total_pressure, i) = pressure;
+      qr_k(material_total_pressure, i) = pressure;
+      ql_kp1(material_sound_speed_squared, i) = cs2;
+      qr_k(material_sound_speed_squared, i) = cs2;
+    } else {
+      PLM(CachedMaterialPressure(thermodynamics, m, k-1, j, i), pressure,
+          CachedMaterialPressure(thermodynamics, m, k+1, j, i),
+          ql_kp1(material_total_pressure, i), qr_k(material_total_pressure, i));
+      PLM(thermodynamics(m, two_temperature::TwoTemperature::sound_speed_squared,
+                         k-1, j, i), cs2,
+          thermodynamics(m, two_temperature::TwoTemperature::sound_speed_squared,
+                         k+1, j, i),
+          ql_kp1(material_sound_speed_squared, i),
+          qr_k(material_sound_speed_squared, i));
+    }
+  });
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn void MHD::CalculateFlux
 //! \brief Calculate fluxes of conserved variables, and face-centered area-averaged EMFs
@@ -60,12 +158,22 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
   auto &coord_ = pmy_pack->pcoord->coord_data;
   auto &w0_ = w0;
   auto &b0_ = bcc0;
+  const bool use_tabular_material_eos_ = use_tabular_material_eos;
+  DvceArray5D<Real> material_thermodynamics_;
+  if (use_tabular_material_eos_) {
+    material_thermodynamics_ = ptwo_temp->thermodynamics;
+  }
+  const int nmaterial_fields_ = use_tabular_material_eos_
+      ? nmaterial_face_fields : 0;
+  const bool material_donor_cell_ =
+      recon_method_ == ReconstructionMethod::dc;
 
   //--------------------------------------------------------------------------------------
   // i-direction
 
   size_t scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
-                     ScrArray2D<Real>::shmem_size(3, ncells1)) * 2;
+                     ScrArray2D<Real>::shmem_size(3, ncells1) +
+                     ScrArray2D<Real>::shmem_size(nmaterial_fields_, ncells1)) * 2;
   int scr_level = 0;
   auto &flx1_ = uflx.x1f;
   auto &vf1_ = dual_vf.x1f;
@@ -91,6 +199,10 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     ScrArray2D<Real> wr(member.team_scratch(scr_level), nvars, ncells1);
     ScrArray2D<Real> bl(member.team_scratch(scr_level), 3, ncells1);
     ScrArray2D<Real> br(member.team_scratch(scr_level), 3, ncells1);
+    ScrArray2D<Real> material_left(
+        member.team_scratch(scr_level), nmaterial_fields_, ncells1);
+    ScrArray2D<Real> material_right(
+        member.team_scratch(scr_level), nmaterial_fields_, ncells1);
 
     // Reconstruct qR[i] and qL[i+1], for both W and Bcc
     switch (recon_method_) {
@@ -114,6 +226,11 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
       default:
         break;
     }
+    if (use_tabular_material_eos_) {
+      ReconstructMaterialThermodynamicsX1(
+          member, material_donor_cell_, m, k, j, il-1, iu,
+          material_thermodynamics_, material_left, material_right);
+    }
     // Sync all threads in the team so that scratch memory is consistent
     member.team_barrier();
 
@@ -133,7 +250,9 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     if constexpr (rsolver_method_ == MHD_RSolver::advect) {
       Advect(member,eos,indcs,size,coord,m,k,j,il,iu,IVX,wl,wr,bl,br,bx,flx1,e31,e21);
     } else if constexpr (rsolver_method_ == MHD_RSolver::llf) {
-      LLF(member,eos,indcs,size,coord,m,k,j,il,iu,IVX,wl,wr,bl,br,bx,flx1,e31,e21);
+      LLF(member,eos,use_tabular_material_eos_,indcs,size,coord,
+          m,k,j,il,iu,IVX,wl,wr,material_left,material_right,
+          bl,br,bx,flx1,e31,e21);
     } else if constexpr (rsolver_method_ == MHD_RSolver::hlle) {
       HLLE(member,eos,indcs,size,coord,m,k,j,il,iu,IVX,wl,wr,bl,br,bx,flx1,e31,e21);
     } else if constexpr (rsolver_method_ == MHD_RSolver::hlld) {
@@ -172,7 +291,8 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
 
   if (pmy_pack->pmesh->multi_d) {
     scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
-                ScrArray2D<Real>::shmem_size(3, ncells1)) * 3;
+                ScrArray2D<Real>::shmem_size(3, ncells1) +
+                ScrArray2D<Real>::shmem_size(nmaterial_fields_, ncells1)) * 3;
     auto &flx2_ = uflx.x2f;
     auto &vf2_ = dual_vf.x2f;
     auto &by_ = b0.x2f;
@@ -196,6 +316,12 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
       ScrArray2D<Real> scr4(member.team_scratch(scr_level), 3, ncells1);
       ScrArray2D<Real> scr5(member.team_scratch(scr_level), 3, ncells1);
       ScrArray2D<Real> scr6(member.team_scratch(scr_level), 3, ncells1);
+      ScrArray2D<Real> scr7(
+          member.team_scratch(scr_level), nmaterial_fields_, ncells1);
+      ScrArray2D<Real> scr8(
+          member.team_scratch(scr_level), nmaterial_fields_, ncells1);
+      ScrArray2D<Real> scr9(
+          member.team_scratch(scr_level), nmaterial_fields_, ncells1);
 
       for (int j=jl; j<=ju; ++j) {
         // Permute scratch arrays.
@@ -205,11 +331,16 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
         auto bl     = scr4;
         auto bl_jp1 = scr5;
         auto br     = scr6;
+        auto material_left = scr7;
+        auto material_left_jp1 = scr8;
+        auto material_right = scr9;
         if ((j%2) == 0) {
           wl     = scr2;
           wl_jp1 = scr1;
           bl     = scr5;
           bl_jp1 = scr4;
+          material_left = scr8;
+          material_left_jp1 = scr7;
         }
 
         // Reconstruct qR[j] and qL[j+1], for both W and Bcc
@@ -234,6 +365,11 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
           default:
             break;
         }
+        if (use_tabular_material_eos_) {
+          ReconstructMaterialThermodynamicsX2(
+              member, material_donor_cell_, m, k, j, is-1, ie+1,
+              material_thermodynamics_, material_left_jp1, material_right);
+        }
         member.team_barrier();
 
         // compute fluxes over [js,je+1].  MHD RS also computes electric fields, where
@@ -254,8 +390,9 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
             Advect(member,eos,indcs,size,coord,
                     m,k,j,is-1,ie+1,IVY,wl,wr,bl,br,by,flx2,e12,e32);
           } else if constexpr (rsolver_method_ == MHD_RSolver::llf) {
-            LLF(member,eos,indcs,size,coord,
-                    m,k,j,is-1,ie+1,IVY,wl,wr,bl,br,by,flx2,e12,e32);
+            LLF(member,eos,use_tabular_material_eos_,indcs,size,coord,
+                    m,k,j,is-1,ie+1,IVY,wl,wr,material_left,material_right,
+                    bl,br,by,flx2,e12,e32);
           } else if constexpr (rsolver_method_ == MHD_RSolver::hlle) {
             HLLE(member,eos,indcs,size,coord,
                     m,k,j,is-1,ie+1,IVY,wl,wr,bl,br,by,flx2,e12,e32);
@@ -304,7 +441,8 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
 
   if (pmy_pack->pmesh->three_d) {
     scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
-                ScrArray2D<Real>::shmem_size(3, ncells1)) * 3;
+                ScrArray2D<Real>::shmem_size(3, ncells1) +
+                ScrArray2D<Real>::shmem_size(nmaterial_fields_, ncells1)) * 3;
     auto &flx3_ = uflx.x3f;
     auto &vf3_ = dual_vf.x3f;
     auto &bz_ = b0.x3f;
@@ -323,6 +461,12 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
       ScrArray2D<Real> scr4(member.team_scratch(scr_level), 3, ncells1);
       ScrArray2D<Real> scr5(member.team_scratch(scr_level), 3, ncells1);
       ScrArray2D<Real> scr6(member.team_scratch(scr_level), 3, ncells1);
+      ScrArray2D<Real> scr7(
+          member.team_scratch(scr_level), nmaterial_fields_, ncells1);
+      ScrArray2D<Real> scr8(
+          member.team_scratch(scr_level), nmaterial_fields_, ncells1);
+      ScrArray2D<Real> scr9(
+          member.team_scratch(scr_level), nmaterial_fields_, ncells1);
 
       for (int k=kl; k<=ku; ++k) {
         // Permute scratch arrays.
@@ -332,11 +476,16 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
         auto bl     = scr4;
         auto bl_kp1 = scr5;
         auto br     = scr6;
+        auto material_left = scr7;
+        auto material_left_kp1 = scr8;
+        auto material_right = scr9;
         if ((k%2) == 0) {
           wl     = scr2;
           wl_kp1 = scr1;
           bl     = scr5;
           bl_kp1 = scr4;
+          material_left = scr8;
+          material_left_kp1 = scr7;
         }
 
         // Reconstruct qR[k] and qL[k+1], for both W and Bcc
@@ -361,6 +510,11 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
           default:
             break;
         }
+        if (use_tabular_material_eos_) {
+          ReconstructMaterialThermodynamicsX3(
+              member, material_donor_cell_, m, k, j, is-1, ie+1,
+              material_thermodynamics_, material_left_kp1, material_right);
+        }
         member.team_barrier();
 
         // compute fluxes over [ks,ke+1].  MHD RS also computes electric fields, where
@@ -381,8 +535,9 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
             Advect(member,eos,indcs,size,coord,
                     m,k,j,is-1,ie+1,IVZ,wl,wr,bl,br,bz,flx3,e23,e13);
           } else if constexpr (rsolver_method_ == MHD_RSolver::llf) {
-            LLF(member,eos,indcs,size,coord,
-                    m,k,j,is-1,ie+1,IVZ,wl,wr,bl,br,bz,flx3,e23,e13);
+            LLF(member,eos,use_tabular_material_eos_,indcs,size,coord,
+                    m,k,j,is-1,ie+1,IVZ,wl,wr,material_left,material_right,
+                    bl,br,bz,flx3,e23,e13);
           } else if constexpr (rsolver_method_ == MHD_RSolver::hlle) {
             HLLE(member,eos,indcs,size,coord,
                     m,k,j,is-1,ie+1,IVZ,wl,wr,bl,br,bz,flx3,e23,e13);

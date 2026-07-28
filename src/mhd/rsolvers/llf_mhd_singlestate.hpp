@@ -18,8 +18,10 @@
 //!   Springer-Verlag, Berlin, (1999) chpt. 10.
 
 #include "coordinates/cartesian_ks.hpp"
+#include "mhd/rsolvers/material_llf_mhd.hpp"
 
 namespace mhd {
+
 //----------------------------------------------------------------------------------------
 //! \fn void SingleStateLLF_MHD
 //! \brief The LLF Riemann solver for MHD for a single L/R state
