@@ -159,12 +159,14 @@ inverse_bremsstrahlung_coulomb_log = 5.0
 inverse_bremsstrahlung_temperature_floor = 1.1606e4
 critical_reflection = true
 oblique_turning = true
-max_reflections_per_ray = 1
-reflection_offset_fraction = 1.0e-3
+# Compact and full-mesh sweeps give identical deposition for caps 32 and 64;
+# keep the doubled value.  Offsets 1e-5 and 1e-6 cell widths are converged.
+max_reflections_per_ray = 64
+reflection_offset_fraction = 1.0e-5
 nbeams = 1
 max_segments_per_launch = 64
 max_transport_iterations = 256
-max_mpi_waves = 64
+max_mpi_waves = 1024
 gpu_aware_mpi = false
 minimum_power_fraction = 1.0e-14
 conservation_tolerance = 1.0e-10

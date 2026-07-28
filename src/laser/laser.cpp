@@ -161,8 +161,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     mpi_recv_packets_("laser-mpi-recv-packets", 1),
     mpi_host_send_packets_("laser-mpi-host-send-packets", 1),
     mpi_host_recv_packets_("laser-mpi-host-recv-packets", 1),
-    device_diagnostics_("laser-diagnostics", 4),
-    device_counters_("laser-counters", 4),
+    device_diagnostics_("laser-diagnostics", 6),
+    device_counters_("laser-counters", 6),
     cumulative_energy_start_("laser-energy-start", 1, 1, 1, 1, 1),
     pmy_pack_(ppack) {
   if (ppack->pmhd == nullptr || ppack->pmhd->ptwo_temp == nullptr) {

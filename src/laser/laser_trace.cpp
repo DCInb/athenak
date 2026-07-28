@@ -536,7 +536,9 @@ void Laser::BookRemainingRays() {
             status(r) == static_cast<int>(RayStatus::off_rank)) {
           status(r) = static_cast<int>(RayStatus::remaining);
           Kokkos::atomic_add(&diag(3), power(r));
+          Kokkos::atomic_add(&diag(4), power(r));
           Kokkos::atomic_inc(&counters(0));
+          Kokkos::atomic_inc(&counters(4));
         }
       });
 }
@@ -849,7 +851,9 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               if (reflections(r) >= max_reflections) {
                 status(r) = static_cast<int>(RayStatus::remaining);
                 Kokkos::atomic_add(&diag(3), power(r));
+                Kokkos::atomic_add(&diag(5), power(r));
                 Kokkos::atomic_inc(&counters(0));
+                Kokkos::atomic_inc(&counters(5));
                 break;
               }
               Real normal_projection = nx(r)*normal_x + ny(r)*normal_y +
@@ -1437,8 +1441,12 @@ void Laser::FinalizeDiagnostics() {
   Kokkos::deep_copy(host_segments, ray_segments_);
   Kokkos::deep_copy(host_path, ray_path_length_);
   Kokkos::deep_copy(host_dispersion, ray_dispersion_error_);
-  Real global_diag[4] = {host_diag(0), host_diag(1), host_diag(2), host_diag(3)};
-  int global_count[4] = {host_count(0), host_count(1), host_count(2), host_count(3)};
+  Real global_diag[6] = {
+      host_diag(0), host_diag(1), host_diag(2),
+      host_diag(3), host_diag(4), host_diag(5)};
+  int global_count[6] = {
+      host_count(0), host_count(1), host_count(2),
+      host_count(3), host_count(4), host_count(5)};
   int segment_count = 0;
   Real path_length = 0.0;
   Real max_dispersion_error = 0.0;
@@ -1450,15 +1458,15 @@ void Laser::FinalizeDiagnostics() {
 
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {
-    Real reduced_diag[4] = {0.0, 0.0, 0.0, 0.0};
-    int reduced_count[4] = {0, 0, 0, 0};
+    Real reduced_diag[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    int reduced_count[6] = {0, 0, 0, 0, 0, 0};
     int reduced_segments = 0;
     Real reduced_path = 0.0;
     Real reduced_dispersion_error = 0.0;
-    int ierr = MPI_Allreduce(global_diag, reduced_diag, 4, MPI_ATHENA_REAL,
+    int ierr = MPI_Allreduce(global_diag, reduced_diag, 6, MPI_ATHENA_REAL,
                              MPI_SUM, mpi_comm_);
     if (ierr == MPI_SUCCESS) {
-      ierr = MPI_Allreduce(global_count, reduced_count, 4, MPI_INT,
+      ierr = MPI_Allreduce(global_count, reduced_count, 6, MPI_INT,
                            MPI_SUM, mpi_comm_);
     }
     if (ierr == MPI_SUCCESS) {
@@ -1480,7 +1488,7 @@ void Laser::FinalizeDiagnostics() {
       MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
-    for (int n = 0; n < 4; ++n) {
+    for (int n = 0; n < 6; ++n) {
       global_diag[n] = reduced_diag[n];
       global_count[n] = reduced_count[n];
     }
@@ -1494,7 +1502,11 @@ void Laser::FinalizeDiagnostics() {
   diagnostics_.deposited_power = global_diag[1];
   diagnostics_.escaped_power = global_diag[2];
   diagnostics_.remaining_power = global_diag[3];
+  diagnostics_.wave_remaining_power = global_diag[4];
+  diagnostics_.reflection_remaining_power = global_diag[5];
   diagnostics_.active_rays = global_count[0];
+  diagnostics_.wave_remaining_rays = global_count[4];
+  diagnostics_.reflection_remaining_rays = global_count[5];
   diagnostics_.reflected_rays = global_count[1];
   diagnostics_.off_rank_transfers = global_count[2];
   diagnostics_.transport_iterations = max_transport_iterations_*(mpi_wave_+1);
@@ -1505,8 +1517,22 @@ void Laser::FinalizeDiagnostics() {
                        diagnostics_.escaped_power-diagnostics_.remaining_power);
   diagnostics_.conservation_residual = (diagnostics_.launched_power > 0.0)
       ? mismatch/diagnostics_.launched_power : 0.0;
+  Real remaining_fraction = 0.0;
+  if (diagnostics_.launched_power > 0.0) {
+    remaining_fraction = diagnostics_.remaining_power/diagnostics_.launched_power;
+  } else if (diagnostics_.remaining_power > 0.0) {
+    remaining_fraction = std::numeric_limits<Real>::infinity();
+  }
+  bool dispersion_failed = propagation_model_ == PropagationModel::refractive &&
+      diagnostics_.max_dispersion_error > dispersion_tolerance_;
+  bool remaining_failed = remaining_fraction > conservation_tolerance_;
+  bool transport_failed = global_count[3] > 0 || remaining_failed ||
+      diagnostics_.conservation_residual > conservation_tolerance_ ||
+      dispersion_failed;
 
-  if (report_diagnostics_ && global_variable::my_rank == 0) {
+  // Fatal transport always reports the full accounting line, even when routine
+  // diagnostics were disabled, so the terminal cause is not hidden.
+  if ((report_diagnostics_ || transport_failed) && global_variable::my_rank == 0) {
     std::ios::fmtflags old_flags = std::cout.flags();
     std::streamsize old_precision = std::cout.precision();
     std::cout << std::scientific << std::setprecision(17)
@@ -1514,8 +1540,16 @@ void Laser::FinalizeDiagnostics() {
               << " deposited=" << diagnostics_.deposited_power
               << " escaped=" << diagnostics_.escaped_power
               << " remaining=" << diagnostics_.remaining_power
+              << " wave_remaining=" << diagnostics_.wave_remaining_power
+              << " reflection_remaining="
+              << diagnostics_.reflection_remaining_power
+              << " remaining_fraction=" << remaining_fraction
               << " residual=" << diagnostics_.conservation_residual
               << " active=" << diagnostics_.active_rays
+              << " remaining_rays=" << diagnostics_.active_rays
+              << " wave_remaining_rays=" << diagnostics_.wave_remaining_rays
+              << " reflection_remaining_rays="
+              << diagnostics_.reflection_remaining_rays
               << " reflected=" << diagnostics_.reflected_rays
               << " transfers=" << diagnostics_.off_rank_transfers
               << " segments=" << diagnostics_.traced_segments
@@ -1524,19 +1558,23 @@ void Laser::FinalizeDiagnostics() {
     std::cout.flags(old_flags);
     std::cout.precision(old_precision);
   }
-  bool dispersion_failed = propagation_model_ == PropagationModel::refractive &&
-      diagnostics_.max_dispersion_error > dispersion_tolerance_;
-  if (global_count[3] > 0 ||
-      diagnostics_.conservation_residual > conservation_tolerance_ ||
-      dispersion_failed) {
+  if (transport_failed) {
     if (global_variable::my_rank == 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Laser transport failed for " << global_count[3]
-                << " rays; conservation residual="
-                << diagnostics_.conservation_residual << " exceeds tolerance="
-                << conservation_tolerance_ << "; dispersion error="
-                << diagnostics_.max_dispersion_error << " exceeds tolerance="
-                << dispersion_tolerance_ << std::endl;
+                << std::endl << "Laser transport failed: failed_rays="
+                << global_count[3] << "; remaining_rays="
+                << diagnostics_.active_rays << " (wave="
+                << diagnostics_.wave_remaining_rays << ", reflection="
+                << diagnostics_.reflection_remaining_rays
+                << "); remaining fraction=" << remaining_fraction
+                << " (wave_power=" << diagnostics_.wave_remaining_power
+                << ", reflection_power="
+                << diagnostics_.reflection_remaining_power
+                << ") with tolerance=" << conservation_tolerance_
+                << "; conservation residual=" << diagnostics_.conservation_residual
+                << " with tolerance=" << conservation_tolerance_
+                << "; dispersion error=" << diagnostics_.max_dispersion_error
+                << " with tolerance=" << dispersion_tolerance_ << std::endl;
     }
     std::exit(EXIT_FAILURE);
   }

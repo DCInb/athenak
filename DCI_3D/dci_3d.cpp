@@ -146,6 +146,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const Real beam_start = pin->GetReal("laser", "beam0_start_time");
   const Real beam_end = pin->GetReal("laser", "beam0_end_time");
   const int beam_rays = pin->GetInteger("laser", "beam0_nrays");
+  const int max_reflections =
+      pin->GetInteger("laser", "max_reflections_per_ray");
+  const int max_mpi_waves = pin->GetInteger("laser", "max_mpi_waves");
+  const Real reflection_offset =
+      pin->GetReal("laser", "reflection_offset_fraction");
   const Real pi = std::acos(-1.0);
   const Real projected_inner_radius =
       inner_radius*std::sin(opening_half_angle_deg*pi/180.0);
@@ -162,8 +167,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       beam_rays < 4096 ||
       !NearlyEqual(beam_power, 2.0e19, 2.0e19) ||
       !NearlyEqual(wavelength, 1.053e-4, 1.053e-4) ||
-      !NearlyEqual(beam_start, 0.0) || !NearlyEqual(beam_end, 5.0, 5.0)) {
-    ProblemError("dci_3d requires the documented focused Gaussian 10 kJ beam");
+      !NearlyEqual(beam_start, 0.0) || !NearlyEqual(beam_end, 5.0, 5.0) ||
+      max_reflections < 64 || max_mpi_waves < 64 ||
+      !NearlyEqual(reflection_offset, 1.0e-5)) {
+    ProblemError("dci_3d requires the documented focused Gaussian 10 kJ beam "
+                 "and converged ray-transport limits");
   }
 
   auto &indcs = pmy_mesh_->mb_indcs;

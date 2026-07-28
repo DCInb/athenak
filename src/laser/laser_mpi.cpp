@@ -338,20 +338,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
       return TaskStatus::incomplete;
     }
     if (mpi_global_active_ > 0) {
-      auto status = ray_status;
-      auto power = ray_power;
-      auto diagnostics = device_diagnostics_;
-      auto counters = device_counters_;
-      Kokkos::parallel_for(
-          "laser_mark_mpi_remaining",
-          Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
-          KOKKOS_LAMBDA(int r) {
-            if (status(r) == static_cast<int>(RayStatus::active)) {
-              status(r) = static_cast<int>(RayStatus::remaining);
-              Kokkos::atomic_add(&diagnostics(3), power(r));
-              Kokkos::atomic_inc(&counters(0));
-            }
-          });
+      BookRemainingRays();
     }
     transport_state_ = LaserTransportState::finished;
     FinalizeDiagnostics();

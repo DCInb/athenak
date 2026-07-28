@@ -92,8 +92,13 @@ struct LaserDiagnostics {
   Real deposited_power = 0.0;
   Real escaped_power = 0.0;
   Real remaining_power = 0.0;
+  Real wave_remaining_power = 0.0;
+  Real reflection_remaining_power = 0.0;
   Real conservation_residual = 0.0;
+  // Legacy total terminal-remainder count. Retained for API/log compatibility.
   int active_rays = 0;
+  int wave_remaining_rays = 0;
+  int reflection_remaining_rays = 0;
   int reflected_rays = 0;
   int off_rank_transfers = 0;
   int transport_iterations = 0;
@@ -222,7 +227,11 @@ class Laser {
   DvceArray1D<LaserRayPacket> mpi_send_packets_, mpi_recv_packets_;
   Kokkos::View<LaserRayPacket *, LayoutWrapper, Kokkos::SharedHostPinnedSpace>
       mpi_host_send_packets_, mpi_host_recv_packets_;
+  // Diagnostics: launched, deposited, escaped, total remaining,
+  // wave-cap remaining, reflection-cap remaining.
   DvceArray1D<Real> device_diagnostics_;
+  // Counters: total remaining, reflections, transfers, failures,
+  // wave-cap remaining, reflection-cap remaining.
   DvceArray1D<int> device_counters_;
   DvceArray5D<Real> cumulative_energy_start_;
 

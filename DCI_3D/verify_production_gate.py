@@ -16,10 +16,23 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-SCHEMA = 4
+SCHEMA = 5
 PRODUCTION_C_LIGHT = 30.0
 RSLA_COMPARISON_C_LIGHT = 10.0
 PHYSICAL_C_LIGHT = 299.792458
+DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE = 1.0e-10
+LASER_DIAGNOSTIC_SOURCE_IDS = ("smoke_phase1_log", "smoke_phase2_log")
+LASER_REQUIRED_FIELDS = (
+    "launched",
+    "deposited",
+    "escaped",
+    "remaining",
+    "residual",
+)
+LASER_SPLIT_REMAINDER_FIELDS = (
+    "wave_remaining",
+    "reflection_remaining",
+)
 SENSITIVITY_RELATIVE_FIELDS = (
     "laser_Edep",
     "eion_E",
@@ -129,6 +142,206 @@ def parse_cycle_log(path: Path) -> list[dict[str, float | int]]:
     if not rows:
         raise ValueError(f"No cycle diagnostics in {path}")
     return rows
+
+
+def parse_laser_diagnostics(path: Path) -> list[dict[str, float | int]]:
+    """Parse every key/value field from each ``laser:`` record in a log."""
+    rows: list[dict[str, float | int]] = []
+    marker = re.compile(r"laser:\s*(.*)$")
+    nonnegative_fields = {
+        "launched", "deposited", "escaped", "remaining",
+        "wave_remaining", "reflection_remaining",
+    }
+    integer_fields = {
+        "active", "remaining_rays", "reflected", "transfers", "segments",
+        "wave_remaining_rays", "reflection_remaining_rays",
+    }
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        match = marker.search(line)
+        if match is None:
+            continue
+        fields: dict[str, float | int] = {"line_number": line_number}
+        tokens = match.group(1).split()
+        if not tokens:
+            raise ValueError(f"Empty laser diagnostic in {path}:{line_number}")
+        for token in tokens:
+            if token.count("=") != 1:
+                raise ValueError(
+                    f"Malformed laser diagnostic token {token!r} in "
+                    f"{path}:{line_number}"
+                )
+            name, text = token.split("=", 1)
+            if not name or name in fields:
+                raise ValueError(
+                    f"Duplicate or empty laser field {name!r} in "
+                    f"{path}:{line_number}"
+                )
+            try:
+                value = float(text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Non-numeric laser field {name}={text!r} in "
+                    f"{path}:{line_number}"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Nonfinite laser field {name} in {path}:{line_number}"
+                )
+            if name in integer_fields:
+                if value < 0.0 or not value.is_integer():
+                    raise ValueError(
+                        f"Invalid laser count {name}={text!r} in "
+                        f"{path}:{line_number}"
+                    )
+                fields[name] = int(value)
+            else:
+                fields[name] = value
+        missing = [name for name in LASER_REQUIRED_FIELDS if name not in fields]
+        if missing:
+            raise ValueError(
+                f"Missing laser fields {missing} in {path}:{line_number}"
+            )
+        negative = [
+            name for name in nonnegative_fields
+            if name in fields and float(fields[name]) < 0.0
+        ]
+        if negative:
+            raise ValueError(
+                f"Negative laser fields {negative} in {path}:{line_number}"
+            )
+        split_present = [name in fields for name in LASER_SPLIT_REMAINDER_FIELDS]
+        if any(split_present) and not all(split_present):
+            raise ValueError(
+                "Laser split remainder fields must appear together in "
+                f"{path}:{line_number}"
+            )
+        rows.append(fields)
+    return rows
+
+
+def laser_remainder_metrics(
+    logs: dict[str, Path], tolerance: float
+) -> tuple[bool, dict[str, Any]]:
+    """Evaluate every split ray-remainder and conservation diagnostic."""
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(
+            "Laser remainder relative tolerance must be finite and nonnegative"
+        )
+
+    counts: dict[str, int] = {}
+    parse_errors: dict[str, str] = {}
+    samples: list[tuple[str, dict[str, float | int]]] = []
+    for source_id, path in logs.items():
+        try:
+            rows = parse_laser_diagnostics(path)
+        except (OSError, ValueError) as exc:
+            rows = []
+            parse_errors[source_id] = str(exc)
+        counts[source_id] = len(rows)
+        samples.extend((source_id, row) for row in rows)
+
+    maxima = {
+        "total": 0.0,
+        "wave": 0.0,
+        "reflection": 0.0,
+        "split": 0.0,
+    }
+    split_count = 0
+    positive_launched_count = 0
+    violation_count = 0
+    maximum_residual = 0.0
+    maximum_split_mismatch = 0.0
+    worst_source: str | None = None
+    worst_line: int | None = None
+    worst_field: str | None = None
+    worst_fraction = 0.0
+
+    for source_id, row in samples:
+        launched = float(row["launched"])
+        if launched > 0.0:
+            positive_launched_count += 1
+
+        def fraction(value: float) -> float:
+            if launched > 0.0:
+                return value/launched
+            return 0.0 if value == 0.0 else sys.float_info.max
+
+        total_remainder = float(row["remaining"])
+        fractions = {"total": fraction(total_remainder)}
+        split_mismatch = sys.float_info.max
+        if all(name in row for name in LASER_SPLIT_REMAINDER_FIELDS):
+            split_count += 1
+            wave_power = float(row["wave_remaining"])
+            reflection_power = float(row["reflection_remaining"])
+            wave = fraction(wave_power)
+            reflection = fraction(reflection_power)
+            split_mismatch = fraction(abs(
+                total_remainder-wave_power-reflection_power
+            ))
+            fractions.update(
+                wave=wave,
+                reflection=reflection,
+                split=wave+reflection,
+            )
+        residual = abs(float(row["residual"]))
+        maximum_residual = max(maximum_residual, residual)
+        maximum_split_mismatch = max(maximum_split_mismatch, split_mismatch)
+        sample_max = max(fractions.values())
+        if (
+            launched <= 0.0
+            or sample_max > tolerance
+            or residual > tolerance
+            or split_mismatch > tolerance
+        ):
+            violation_count += 1
+        for name, value in fractions.items():
+            maxima[name] = max(maxima[name], value)
+            if value > worst_fraction:
+                worst_fraction = value
+                worst_source = source_id
+                worst_line = int(row["line_number"])
+                worst_field = name
+
+    diagnostics_present = bool(logs) and all(counts.get(name, 0) > 0 for name in logs)
+    split_diagnostics_complete = bool(samples) and split_count == len(samples)
+    positive_launched_complete = (
+        bool(samples) and positive_launched_count == len(samples)
+    )
+    passed = (
+        diagnostics_present
+        and split_diagnostics_complete
+        and positive_launched_complete
+        and not parse_errors
+        and violation_count == 0
+        and all(value <= tolerance for value in maxima.values())
+        and maximum_residual <= tolerance
+        and maximum_split_mismatch <= tolerance
+    )
+    metrics: dict[str, Any] = {
+        "diagnostics_present": diagnostics_present,
+        "diagnostic_count": len(samples),
+        "diagnostic_counts_by_source": counts,
+        "split_diagnostic_count": split_count,
+        "split_diagnostics_complete": split_diagnostics_complete,
+        "positive_launched_diagnostic_count": positive_launched_count,
+        "positive_launched_complete": positive_launched_complete,
+        "parse_errors": parse_errors,
+        "violating_diagnostic_count": violation_count,
+        "maximum_total_remainder_fraction": maxima["total"],
+        "maximum_wave_remainder_fraction": maxima["wave"],
+        "maximum_reflection_remainder_fraction": maxima["reflection"],
+        "maximum_split_remainder_fraction": maxima["split"],
+        "maximum_remainder_fraction": max(maxima.values()),
+        "maximum_laser_conservation_residual": maximum_residual,
+        "maximum_split_accounting_mismatch": maximum_split_mismatch,
+        "remainder_relative_tolerance": tolerance,
+        "worst_source_id": worst_source,
+        "worst_line_number": worst_line,
+        "worst_remainder_field": worst_field,
+    }
+    return passed, metrics
 
 
 def read_history(path: Path) -> dict[str, list[float]]:
@@ -480,13 +693,26 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     start = read_deck_value(sources["production_input"], "beam0_start_time")
     end = read_deck_value(sources["production_input"], "beam0_end_time")
     incident_joules = power*(end-start)*1.0e-9/1.0e7
-    energy_pass = energy_relative <= settings["energy_relative_tolerance"] and \
-        abs(incident_joules-10000.0) <= 1.0e-9
+    laser_remainder_tolerance = float(settings.get(
+        "laser_remainder_relative_tolerance",
+        DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE,
+    ))
+    laser_remainder_pass, laser_remainder = laser_remainder_metrics(
+        {name: sources[name] for name in LASER_DIAGNOSTIC_SOURCE_IDS},
+        laser_remainder_tolerance,
+    )
+    energy_pass = (
+        energy_relative <= settings["energy_relative_tolerance"]
+        and abs(incident_joules-10000.0) <= 1.0e-9
+        and laser_remainder_pass
+    )
     checks["laser_and_boundary_energy_closure"] = evidence_check(
-        energy_pass, ["production_input", "smoke_history"],
+        energy_pass,
+        ["production_input", "smoke_history", *LASER_DIAGNOSTIC_SOURCE_IDS],
         deposited=deposited, chain_delta=chain_delta, integrated_radiation_escape=escaped,
         residual=residual, relative_residual=energy_relative,
-        configured_incident_joules=incident_joules)
+        configured_incident_joules=incident_joules,
+        **laser_remainder)
 
     ch = history["CH_mass"]
     ch_relative = (max(ch)-min(ch))/max(abs(ch[0]), 1.0e-30)
@@ -673,6 +899,11 @@ def parse_args() -> argparse.Namespace:
                         default=CASE_DIR/"runs"/"calibrate")
     parser.add_argument("--output", type=Path, default=CASE_DIR/"production_gate.json")
     parser.add_argument("--energy-rtol", type=float, default=5.0e-4)
+    parser.add_argument(
+        "--laser-remainder-rtol", type=float,
+        default=DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE,
+        help="maximum remainder/launched fraction in every smoke laser diagnostic",
+    )
     parser.add_argument("--mass-rtol", type=float, default=1.0e-8)
     parser.add_argument("--resolution-rtol", type=float, default=0.35)
     parser.add_argument("--sensitivity-rtol", type=float, default=0.05)
@@ -701,6 +932,7 @@ def main() -> int:
         settings = {
             "artifacts": artifacts,
             "energy_relative_tolerance": args.energy_rtol,
+            "laser_remainder_relative_tolerance": args.laser_remainder_rtol,
             "mass_relative_tolerance": args.mass_rtol,
             "resolution_relative_tolerance": args.resolution_rtol,
             "sensitivity_relative_tolerance": args.sensitivity_rtol,

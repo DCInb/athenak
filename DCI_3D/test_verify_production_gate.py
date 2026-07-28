@@ -9,8 +9,37 @@ import verify_production_gate as gate
 import run_case
 
 
+def laser_diagnostic(
+    *, launched: float = 1.0, remaining: float = 0.0,
+    wave_remaining: float | None = None,
+    reflection_remaining: float | None = None,
+    residual: float = 0.0,
+) -> str:
+    fields = [
+        f"launched={launched:.17e}",
+        f"deposited={launched-remaining:.17e}",
+        "escaped=0.00000000000000000e+00",
+        f"remaining={remaining:.17e}",
+    ]
+    if wave_remaining is not None or reflection_remaining is not None:
+        assert wave_remaining is not None and reflection_remaining is not None
+        fields.extend((
+            f"wave_remaining={wave_remaining:.17e}",
+            f"reflection_remaining={reflection_remaining:.17e}",
+            f"wave_remaining_rays={int(wave_remaining > 0.0)}",
+            f"reflection_remaining_rays={int(reflection_remaining > 0.0)}",
+        ))
+    fields.extend((
+        f"residual={residual:.17e}",
+        "active=0", "reflected=0", "transfers=0", "segments=1",
+        "path=1.00000000000000000e+00",
+        "dispersion=0.00000000000000000e+00",
+    ))
+    return "laser: " + " ".join(fields) + "\n"
+
+
 def test_schema_and_required_checks_match_launcher():
-    assert gate.SCHEMA == 4
+    assert gate.SCHEMA == 5
     assert run_case.PRODUCTION_GATE_SCHEMA == gate.SCHEMA
     assert "physical_light_speed_sensitivity" in gate.CHECK_NAMES
     assert tuple(run_case.REQUIRED_PRODUCTION_CHECKS) == gate.CHECK_NAMES
@@ -89,6 +118,125 @@ def test_cycle_parser(tmp_path):
     rows = gate.parse_cycle_log(log)
     assert rows[0] == {"cycle": 0, "time": 0.0, "dt": 2.0e-4}
     assert rows[-1]["cycle"] == 50
+
+
+def test_laser_parser_reads_every_legacy_and_split_diagnostic(tmp_path):
+    log = tmp_path/"phase.log"
+    log.write_text(
+        "unrelated output\n"
+        + laser_diagnostic(remaining=1.0e-11)
+        + "cycle=1 time=1e-4 dt=1e-4\n"
+        + laser_diagnostic(
+            remaining=5.0e-11,
+            wave_remaining=2.0e-11,
+            reflection_remaining=3.0e-11,
+        )
+    )
+    rows = gate.parse_laser_diagnostics(log)
+    assert len(rows) == 2
+    assert rows[0]["line_number"] == 2
+    assert rows[0]["remaining"] == 1.0e-11
+    assert "wave_remaining" not in rows[0]
+    assert rows[1]["line_number"] == 4
+    assert rows[1]["wave_remaining"] == 2.0e-11
+    assert rows[1]["reflection_remaining"] == 3.0e-11
+    assert rows[1]["wave_remaining_rays"] == 1
+
+
+def test_laser_remainder_metrics_gate_every_record_and_require_each_log(tmp_path):
+    phase1 = tmp_path/"phase1.log"
+    phase2 = tmp_path/"phase2.log"
+    phase1.write_text(laser_diagnostic(
+        remaining=1.0e-10,
+        wave_remaining=1.0e-10,
+        reflection_remaining=0.0,
+    ))
+    phase2.write_text(laser_diagnostic(
+        remaining=1.0e-10,
+        wave_remaining=4.0e-11,
+        reflection_remaining=6.0e-11,
+    ))
+    passed, metrics = gate.laser_remainder_metrics(
+        {"smoke_phase1_log": phase1, "smoke_phase2_log": phase2}, 1.0e-10
+    )
+    assert passed
+    assert metrics["diagnostic_count"] == 2
+    assert metrics["split_diagnostic_count"] == 2
+    assert metrics["split_diagnostics_complete"]
+    assert metrics["maximum_total_remainder_fraction"] == 1.0e-10
+    assert 0.999e-10 <= metrics["maximum_split_remainder_fraction"] <= 1.0e-10
+
+    phase1.write_text(laser_diagnostic(remaining=0.0))
+    passed, metrics = gate.laser_remainder_metrics(
+        {"smoke_phase1_log": phase1, "smoke_phase2_log": phase2}, 1.0e-10
+    )
+    assert not passed
+    assert not metrics["split_diagnostics_complete"]
+
+    phase1.write_text(laser_diagnostic(
+        remaining=0.0,
+        wave_remaining=0.0,
+        reflection_remaining=0.0,
+        residual=2.0e-10,
+    ))
+    passed, metrics = gate.laser_remainder_metrics(
+        {"smoke_phase1_log": phase1, "smoke_phase2_log": phase2}, 1.0e-10
+    )
+    assert not passed
+    assert metrics["maximum_laser_conservation_residual"] == 2.0e-10
+
+    # This is the final diagnostic from the old production run. Its 44.08%
+    # remainder was included in conservation accounting and therefore masked by
+    # the old deposited-energy-only closure check.
+    phase1.write_text(
+        laser_diagnostic(
+            remaining=0.0,
+            wave_remaining=0.0,
+            reflection_remaining=0.0,
+        )
+        + "laser: launched=1.81818181818178609e-03 "
+        "deposited=4.64369493175387910e-04 "
+        "escaped=5.52403361617890502e-04 "
+        "remaining=8.01408963388458183e-04 "
+        "residual=2.71917904859369308e-14 active=2067 reflected=3929 "
+        "transfers=10890 segments=1965976 path=1.19796497351896141e+04 "
+        "dispersion=0.00000000000000000e+00\n"
+    )
+    passed, metrics = gate.laser_remainder_metrics(
+        {"smoke_phase1_log": phase1, "smoke_phase2_log": phase2}, 1.0e-10
+    )
+    assert not passed
+    assert metrics["diagnostic_count"] == 3
+    assert metrics["violating_diagnostic_count"] == 1
+    assert 0.4407 < metrics["maximum_total_remainder_fraction"] < 0.4409
+    assert metrics["worst_source_id"] == "smoke_phase1_log"
+    assert metrics["worst_line_number"] == 2
+
+    # A misleading zero aggregate cannot hide a nonzero split remainder.
+    phase2.write_text(laser_diagnostic(
+        remaining=0.0,
+        wave_remaining=0.0,
+        reflection_remaining=0.0,
+    ))
+    phase1.write_text(laser_diagnostic(
+        remaining=0.0,
+        wave_remaining=2.0e-10,
+        reflection_remaining=0.0,
+    ))
+    passed, metrics = gate.laser_remainder_metrics(
+        {"smoke_phase1_log": phase1, "smoke_phase2_log": phase2}, 1.0e-10
+    )
+    assert not passed
+    assert metrics["maximum_total_remainder_fraction"] == 0.0
+    assert metrics["maximum_split_remainder_fraction"] == 2.0e-10
+
+    phase2.write_text("cycle=1 time=1e-4 dt=1e-4\n")
+    passed, metrics = gate.laser_remainder_metrics(
+        {"smoke_phase1_log": phase1, "smoke_phase2_log": phase2}, 1.0e-10
+    )
+    assert not passed
+    assert not metrics["diagnostics_present"]
+    assert metrics["diagnostic_counts_by_source"]["smoke_phase2_log"] == 0
 
 
 def test_reset_aware_cumulative_delta():
@@ -239,9 +387,16 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         ("calibration_phase1_log", ((0, 0.0, 2e-4), (2, 4e-4, 2e-4))),
     ):
         path = tmp_path/f"{name}.log"
-        path.write_text("".join(
+        text = "".join(
             f"cycle={cycle} time={time:.8e} dt={dt:.8e}\n"
-            for cycle, time, dt in rows))
+            for cycle, time, dt in rows)
+        if name in gate.LASER_DIAGNOSTIC_SOURCE_IDS:
+            text += laser_diagnostic(
+                remaining=5.0e-11,
+                wave_remaining=2.0e-11,
+                reflection_remaining=3.0e-11,
+            )
+        path.write_text(text)
         sources[name] = path
 
     for name in (
@@ -288,6 +443,38 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     assert all(record["passed"] for record in checks.values()), checks
     assert checks["reduced_light_speed_sensitivity"]["metrics"]["erad_E"] == 0.0
     assert checks["physical_light_speed_sensitivity"]["metrics"]["final_cycle"] == 650
+    closure = checks["laser_and_boundary_energy_closure"]
+    assert closure["metrics"]["diagnostic_count"] == 2
+    assert closure["metrics"]["maximum_remainder_fraction"] == 5.0e-11
+
+    smoke_phase1_text = sources["smoke_phase1_log"].read_text()
+    sources["smoke_phase1_log"].write_text(
+        smoke_phase1_text
+        + "laser: launched=1.81818181818178609e-03 "
+        "deposited=4.64369493175387910e-04 "
+        "escaped=5.52403361617890502e-04 "
+        "remaining=8.01408963388458183e-04 "
+        "residual=2.71917904859369308e-14 active=2067 reflected=3929 "
+        "transfers=10890 segments=1965976 path=1.19796497351896141e+04 "
+        "dispersion=0.00000000000000000e+00\n"
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    closure = checks["laser_and_boundary_energy_closure"]
+    assert not closure["passed"]
+    assert closure["metrics"]["relative_residual"] <= settings["energy_relative_tolerance"]
+    assert 0.4407 < closure["metrics"]["maximum_remainder_fraction"] < 0.4409
+    sources["smoke_phase1_log"].write_text(smoke_phase1_text)
+
+    smoke_phase2_text = sources["smoke_phase2_log"].read_text()
+    sources["smoke_phase2_log"].write_text(
+        "cycle=50 time=8.00000000e-03 dt=2.00000000e-04\n"
+        "cycle=60 time=1.00000000e-02 dt=2.00000000e-04\n"
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    closure = checks["laser_and_boundary_energy_closure"]
+    assert not closure["passed"]
+    assert not closure["metrics"]["diagnostics_present"]
+    sources["smoke_phase2_log"].write_text(smoke_phase2_text)
 
     physical_status["phase1_mpi_command"] = ["time/nlim=649"]
     sources["physical_status"].write_text(json.dumps(physical_status))

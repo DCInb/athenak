@@ -113,7 +113,14 @@ never inflated to compensate for the reduced speed.
 One axial 1-omega beam (`1.053 micrometres`) supplies a square `2 TW` pulse from `0` to
 `5 ns`, exactly `10 kJ` incident energy.  It uses 4,096 deterministic rays, a Gaussian
 spatial profile, material-aware inverse-bremsstrahlung deposition into electron energy,
-and at most one critical-surface reflection.
+and converged repeated critical-surface reflections.  Compact and production-layout
+sweeps make caps 32 and 64 identical, so production retains 64 reflections and the
+default 1,024 distributed transport waves.  A `1e-5`-cell turning-point offset is in the
+offset-converged regime.  Any terminal ray power above `1e-10` of launched power is fatal
+and is independently rejected by the production gate; it cannot be hidden inside the
+ordinary conservation residual.
+The exact compact/full-mesh cap and turning-offset sweep is recorded in
+`LASER_TRANSPORT_CONVERGENCE.md`.
 
 ```text
 lens center             (+1.5, 0, 0) mm
@@ -259,7 +266,7 @@ python3 DCI_3D/verify_production_gate.py --dry-run
 python3 DCI_3D/verify_production_gate.py
 ```
 
-The verifier writes schema 4 with hashes of the binary, problem generator, decks,
+The verifier writes schema 5 with hashes of the binary, problem generator, decks,
 launcher, verifier, material tables, every selected log/status/history/3T/restart artifact,
 the numerical tolerances, and computed metrics.  It exits 2 and records failed checks when
 evidence is incomplete or outside tolerance.  On an actual production request,
@@ -283,7 +290,8 @@ The exact required check names are:
 
 The evidence must show finite, nonnegative ion/electron/group energies and no disallowed
 EOS-table clamps; a timestep of order `dx/c` without secular collapse; 10 kJ incident and
-laser power closure; chain-energy closure including integrated outward radiation; CH-mass
+laser power closure with no wave/reflection-cap remainder; chain-energy closure including
+integrated outward radiation; CH-mass
 conservation; continuous restart time/timestep/energies; a doubled-resolution or
 opacity-sensitivity result; acceptable `c_hat=30` versus `10` and physical-`c`
 sensitivity under the split matter/radiation limits above; and 60--80 percent memory on
