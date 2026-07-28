@@ -7,7 +7,7 @@ ConditionPathExists=/home/mengqi/Research/athenak-2t/DCI_3D/run/run_status.json
 [Service]
 Type=simple
 WorkingDirectory=/home/mengqi/Research/athenak-2t
-ExecStart=/home/mengqi/miniconda3/envs/athenak-vis/bin/python /home/mengqi/Research/athenak-2t/DCI_3D/run_case.py --mode production --resume --run-dir /home/mengqi/Research/athenak-2t/DCI_3D/run --segment-wall-time 23:30:00
+ExecStart=/home/mengqi/miniconda3/envs/athenak-vis/bin/python /home/mengqi/Research/athenak-2t/DCI_3D/run_case.py --mode production --resume --run-dir /home/mengqi/Research/athenak-2t/DCI_3D/run --segment-wall-time 11:30:00
 Restart=on-failure
 RestartSec=60
 KillMode=control-group

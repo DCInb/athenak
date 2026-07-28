@@ -307,23 +307,52 @@ Print those intended commands without satisfying or bypassing the gate:
 python3 DCI_3D/run_case.py --mode production --dry-run
 ```
 
-## Output transfer
+## Output transfer and persistent production
 
-The intended staging tree is local ignored `DCI_3D/run`.  The dedicated non-deleting
-`tranfile_config.json` recursively transfers it to `~/data/DCI_3D` on the configured host.
-Validate and then start the watcher from the repository root:
+The ignored local staging tree is `DCI_3D/run`.  First validate the production gate and
+stage a fresh immutable run without launching Athena:
 
 ```bash
-mkdir -p DCI_3D/run
-python3 /home/mengqi/Research/TranFile/file_watcher.py \
-  --config DCI_3D/tranfile_config.json --validate-only
-python3 /home/mengqi/Research/TranFile/file_watcher.py \
-  --config DCI_3D/tranfile_config.json
+python3 DCI_3D/run_case.py --mode production --prepare-only --clean
+```
+
+Provision the identity-bound, non-deleting TranFile configuration and its unique remote
+child below `~/data/DCI_3D`.  The controller binds the destination to the full gate hash
+and 128-bit production run ID; do not launch the shared watcher with the base
+`tranfile_config.json` directly.
+
+```bash
+python3 DCI_3D/transfer_control.py --run-dir DCI_3D/run prepare
+python3 DCI_3D/transfer_control.py --run-dir DCI_3D/run status
+```
+
+For a run that must survive logout, install the checked-in user services, enable user
+lingering, and start transfer before production:
+
+```bash
+install -Dm644 DCI_3D/systemd/dci-3d-production.service \
+  ~/.config/systemd/user/dci-3d-production.service
+install -Dm644 DCI_3D/systemd/dci-3d-transfer.service \
+  ~/.config/systemd/user/dci-3d-transfer.service
+systemctl --user daemon-reload
+loginctl enable-linger "$USER"
+systemctl --user enable --now dci-3d-transfer.service
+systemctl --user enable --now dci-3d-production.service
+```
+
+Production resumes automatically from an atomic rolling checkpoint every 11.5 hours and
+still lands exactly on the numbered 5 and 10 ns boundaries.  After status reaches
+`state=complete` at 10 ns, let the backlog drain and publish the checksum-verified local
+and remote completion seal:
+
+```bash
+python3 DCI_3D/transfer_control.py --run-dir DCI_3D/run status
+python3 DCI_3D/transfer_control.py --run-dir DCI_3D/run seal
 ```
 
 Do not use the unrelated global TranFile configuration: it can delete source `.bin` and
-`.rst` files.  The DCI configuration waits for four unchanged size/mtime checks, keeps
-separate logs/state, and retains every local file after transfer.
+`.rst` files.  The run-specific DCI configuration waits for four unchanged size/mtime
+checks, keeps separate logs/state/locks, and retains every local file after transfer.
 
 Electron heat conduction from the archive is not enabled in this first case because a
 material-aware conduction implementation is not yet available.  The archived Au cone and

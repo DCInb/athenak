@@ -4,7 +4,7 @@
   "remote_user": "mengqi",
   "remote_dir": "/home/mengqi/data/DCI_3D",
   "ssh_key_path": "~/.ssh/id_ed25519",
-  "file_stable_wait_seconds": 15,
+  "file_stable_wait_seconds": 5,
   "poll_interval_seconds": 10,
   "log_file": "./tranfile/logs/file_watcher.log",
   "state_file": "./tranfile/state/transfer_state.json",
