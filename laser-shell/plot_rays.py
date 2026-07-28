@@ -41,7 +41,7 @@ LAUNCH_PATH = CASE_DIR / "plots" / "laser_rays_launch.png"
 INPUT_PATH = CASE_DIR / "laser_shell.athinput"
 STATUS_PATH = CASE_DIR / "run_status.json"
 DEFAULT_RUN_DIR = Path("/home/mengqi/data/athenak-2t/laser-shell/run")
-DEFAULT_TIMES_NS = (2.5, 5.0)
+DEFAULT_TIMES_NS = (0.1, 0.7, 2.5, 5.0)
 
 # For fully ionized equimolar CH at 1.053 um (the case's 1-omega laser).
 CRITICAL_CH_DENSITY_G_CC = 3.10067e-3
