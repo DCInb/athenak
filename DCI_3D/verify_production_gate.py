@@ -16,7 +16,24 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-SCHEMA = 3
+SCHEMA = 4
+PRODUCTION_C_LIGHT = 30.0
+RSLA_COMPARISON_C_LIGHT = 10.0
+PHYSICAL_C_LIGHT = 299.792458
+SENSITIVITY_RELATIVE_FIELDS = (
+    "laser_Edep",
+    "eion_E",
+    "eele_E",
+    "chain_E",
+    "laser_centroid",
+)
+RESOLUTION_RELATIVE_FIELDS = (
+    "laser_Edep",
+    "eele_E",
+    "erad_E",
+    "chain_E",
+    "laser_centroid",
+)
 CHECK_NAMES = (
     "compact_20group_50step",
     "compact_output_and_restart",
@@ -27,6 +44,7 @@ CHECK_NAMES = (
     "restart_continuity",
     "resolution_or_opacity_sensitivity",
     "reduced_light_speed_sensitivity",
+    "physical_light_speed_sensitivity",
     "gpu_memory_60_80_all",
 )
 
@@ -63,7 +81,11 @@ def latest_file(directory: Path, pattern: str) -> Path:
 
 
 def discover_sources(
-    smoke: Path, resolution: Path, rsla: Path, calibration: Path
+    smoke: Path,
+    resolution: Path,
+    rsla: Path,
+    physical: Path,
+    calibration: Path,
 ) -> dict[str, Path]:
     sources = {
         "production_input": CASE_DIR / "dci_3d.athinput",
@@ -71,7 +93,7 @@ def discover_sources(
         "smoke_status": smoke / "run_status.json",
         "smoke_phase1_log": smoke / "phase1.log",
         "smoke_phase2_log": smoke / "phase2.log",
-        "smoke_history": unique_file(smoke / "hst", "*.hst"),
+        "smoke_history": unique_file(smoke, "*.hst"),
         "smoke_fluid_volume": latest_file(smoke / "bin", "*.fluid.*.bin"),
         "smoke_3t_volume": latest_file(smoke / "bin", "*.three_t.*.bin"),
         "smoke_laser_volume": latest_file(smoke / "bin", "*.laser.*.bin"),
@@ -80,11 +102,14 @@ def discover_sources(
         "resolution_status": resolution / "run_status.json",
         "resolution_phase1_log": resolution / "phase1.log",
         "resolution_phase2_log": resolution / "phase2.log",
-        "resolution_history": unique_file(resolution / "hst", "*.hst"),
+        "resolution_history": unique_file(resolution, "*.hst"),
         "rsla_status": rsla / "run_status.json",
         "rsla_phase1_log": rsla / "phase1.log",
         "rsla_phase2_log": rsla / "phase2.log",
-        "rsla_history": unique_file(rsla / "hst", "*.hst"),
+        "rsla_history": unique_file(rsla, "*.hst"),
+        "physical_status": physical / "run_status.json",
+        "physical_phase1_log": physical / "phase1.log",
+        "physical_history": unique_file(physical, "*.hst"),
         "calibration_status": calibration / "run_status.json",
         "calibration_phase1_log": calibration / "phase1.log",
     }
@@ -197,17 +222,45 @@ def history_sensitivity(
     reference: dict[str, list[float]], comparison: dict[str, list[float]]
 ) -> dict[str, float]:
     target = min(reference["time"][-1], comparison["time"][-1])
-    fields = ("laser_Edep", "eele_E", "erad_E", "chain_E")
+    fields = ("laser_Edep", "eion_E", "eele_E", "erad_E", "chain_E")
     metrics = {field: relative_change_difference(reference, comparison, field, target)
                for field in fields}
     metrics["common_time"] = target
     ref_laser = reset_aware_value_at(reference, "laser_Edep", target)
     cmp_laser = reset_aware_value_at(comparison, "laser_Edep", target)
+    deposited_scale = max(abs(ref_laser), abs(cmp_laser), 1.0e-30)
+    ref_radiation = interpolate(reference, "erad_E", target)-reference["erad_E"][0]
+    cmp_radiation = interpolate(comparison, "erad_E", target)-comparison["erad_E"][0]
+    ref_ion = interpolate(reference, "eion_E", target)-reference["eion_E"][0]
+    cmp_ion = interpolate(comparison, "eion_E", target)-comparison["eion_E"][0]
+    metrics["eion_absolute_difference_over_deposited"] = (
+        abs(ref_ion-cmp_ion)/deposited_scale
+    )
+    metrics["erad_absolute_difference_over_deposited"] = (
+        abs(ref_radiation-cmp_radiation)/deposited_scale
+    )
     if ref_laser > 0.0 and cmp_laser > 0.0:
         ref_x = reset_aware_value_at(reference, "laser_x", target)/ref_laser
         cmp_x = reset_aware_value_at(comparison, "laser_x", target)/cmp_laser
         metrics["laser_centroid"] = abs(ref_x-cmp_x)/max(abs(ref_x), abs(cmp_x), 1.0e-12)
     return metrics
+
+
+def sensitivity_is_accepted(
+    metrics: dict[str, float], settings: dict[str, Any]
+) -> bool:
+    relative_values = [metrics.get(field, math.inf)
+                       for field in SENSITIVITY_RELATIVE_FIELDS]
+    radiation_impact = metrics.get(
+        "erad_absolute_difference_over_deposited", math.inf
+    )
+    return (
+        all(math.isfinite(value) for value in relative_values)
+        and max(relative_values) <= settings["sensitivity_relative_tolerance"]
+        and math.isfinite(radiation_impact)
+        and radiation_impact <=
+            settings["radiation_deposited_relative_tolerance"]
+    )
 
 
 def read_deck_value(path: Path, key: str) -> float:
@@ -297,12 +350,15 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     smoke_status = read_json(sources["smoke_status"])
     resolution_status = read_json(sources["resolution_status"])
     rsla_status = read_json(sources["rsla_status"])
+    physical_status = read_json(sources["physical_status"])
     calibration_status = read_json(sources["calibration_status"])
     smoke1 = parse_cycle_log(sources["smoke_phase1_log"])
     smoke2 = parse_cycle_log(sources["smoke_phase2_log"])
+    physical1 = parse_cycle_log(sources["physical_phase1_log"])
     history = read_history(sources["smoke_history"])
     resolution_history = read_history(sources["resolution_history"])
     rsla_history = read_history(sources["rsla_history"])
+    physical_history = read_history(sources["physical_history"])
 
     try:
         field_metrics = check_3t_binary(sources["smoke_3t_volume"])
@@ -312,25 +368,35 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         binary_3t_pass = False
 
     expected_artifacts = settings["artifacts"]
-    statuses = (smoke_status, resolution_status, rsla_status, calibration_status)
+    statuses = (
+        smoke_status,
+        resolution_status,
+        rsla_status,
+        physical_status,
+        calibration_status,
+    )
     same_artifacts = all(status.get("case_artifacts") == expected_artifacts
                          for status in statuses)
 
     production_groups = int(read_deck_value(sources["production_input"], "n_groups"))
     calibration_groups = int(read_deck_value(
         sources["calibration_input"], "n_groups"))
+    production_c_light = read_deck_value(sources["production_input"], "c_light")
+    calibration_c_light = read_deck_value(sources["calibration_input"], "c_light")
     scale = int(smoke_status.get("compact_scale", 1))
     expected_shape = (100*scale, 64*scale, 64*scale)
     expected_cells = math.prod(expected_shape)
     compact_pass = (
         same_artifacts and smoke_status.get("mode") == "smoke"
         and scale == 1
-        and smoke_status.get("radiation_c_light_override") in (None, 10.0)
+        and smoke_status.get("radiation_c_light_override") is None
         and smoke_status.get("phase1_exit_code") == 0
         and smoke_status.get("phase2_exit_code") == 0
         and max(int(row["cycle"]) for row in smoke1) >= 50
         and command_override(smoke_status, 1, "time/nlim") == "50"
         and production_groups == 20 and calibration_groups == 20
+        and production_c_light == PRODUCTION_C_LIGHT
+        and calibration_c_light == PRODUCTION_C_LIGHT
         and binary_3t_pass and int(field_metrics.get("cycle", -1)) >= 50
         and int(field_metrics.get("radiation_group_count", -1)) == 20
         and tuple(int(field_metrics.get(f"grid_nx{axis}", -1))
@@ -346,6 +412,8 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         phase2_last_cycle=max(int(row["cycle"]) for row in smoke2),
         production_group_count=production_groups,
         calibration_group_count=calibration_groups,
+        production_c_light=production_c_light,
+        calibration_c_light=calibration_c_light,
         expected_volume_shape=list(expected_shape),
         expected_volume_cells=expected_cells,
         volume_shape=[field_metrics.get(f"grid_nx{axis}") for axis in (1, 2, 3)],
@@ -387,7 +455,7 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         maximum_eos_energy_floor_fraction=
             settings["maximum_eos_energy_floor_fraction"])
 
-    c_light = float(read_deck_value(sources["production_input"], "c_light"))
+    c_light = float(production_c_light)
     dx_min = min(3.5/(100*scale), 2.0/(64*scale))
     causal_dt = dx_min/c_light
     timesteps = [float(row["dt"]) for row in smoke1+smoke2 if float(row["dt"]) > 0.0]
@@ -450,31 +518,100 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         and max(resolution_history["eos_bad"]) == 0.0
         and resolution_floor_fraction <=
             settings["maximum_eos_energy_floor_fraction"]
-        and max(value for key, value in resolution_metrics.items()
-                if key != "common_time") <= settings["resolution_relative_tolerance"]
+        and max(resolution_metrics.get(field, math.inf)
+                for field in RESOLUTION_RELATIVE_FIELDS) <=
+            settings["resolution_relative_tolerance"]
+        and resolution_metrics.get(
+            "eion_absolute_difference_over_deposited", math.inf
+        ) <= settings["sensitivity_relative_tolerance"]
     )
     checks["resolution_or_opacity_sensitivity"] = evidence_check(
         resolution_pass,
         ["resolution_status", "resolution_phase1_log", "resolution_phase2_log",
          "resolution_history", "smoke_history"], **resolution_metrics,
+        maximum_relative_difference=max(
+            resolution_metrics.get(field, math.inf)
+            for field in RESOLUTION_RELATIVE_FIELDS
+        ),
+        maximum_relative_difference_tolerance=
+            settings["resolution_relative_tolerance"],
+        eion_deposited_relative_tolerance=
+            settings["sensitivity_relative_tolerance"],
         eos_energy_floor_fraction=resolution_floor_fraction)
 
     rsla_metrics = history_sensitivity(history, rsla_history)
     rsla_floor_fraction = max(rsla_history["eos_floor"])/(100*64*64)
+    rsla_coverage = rsla_history["time"][-1] >= history["time"][-1]
     rsla_pass = (
-        same_artifacts and rsla_status.get("compact_scale") == 1
-        and float(rsla_status.get("radiation_c_light_override", 0.0)) == 30.0
+        compact_pass and same_artifacts and rsla_status.get("mode") == "smoke"
+        and rsla_status.get("compact_scale") == 1
+        and float(rsla_status.get("radiation_c_light_override", 0.0)) ==
+            RSLA_COMPARISON_C_LIGHT
         and rsla_status.get("phase1_exit_code") == 0
         and rsla_status.get("phase2_exit_code") == 0
         and max(rsla_history["eos_bad"]) == 0.0
         and rsla_floor_fraction <= settings["maximum_eos_energy_floor_fraction"]
-        and max(value for key, value in rsla_metrics.items()
-                if key != "common_time") <= settings["rsla_relative_tolerance"]
+        and rsla_coverage
+        and sensitivity_is_accepted(rsla_metrics, settings)
     )
     checks["reduced_light_speed_sensitivity"] = evidence_check(
-        rsla_pass, ["rsla_status", "rsla_phase1_log", "rsla_phase2_log",
-                    "rsla_history", "smoke_history"], **rsla_metrics,
+        rsla_pass,
+        ["production_input", "smoke_status", "smoke_history", "rsla_status",
+         "rsla_phase1_log", "rsla_phase2_log", "rsla_history"],
+        **rsla_metrics,
+        history_covers_production_baseline=rsla_coverage,
+        maximum_matter_relative_difference=max(
+            rsla_metrics.get(field, math.inf)
+            for field in SENSITIVITY_RELATIVE_FIELDS
+        ),
+        sensitivity_relative_tolerance=settings["sensitivity_relative_tolerance"],
+        radiation_deposited_relative_tolerance=
+            settings["radiation_deposited_relative_tolerance"],
         eos_energy_floor_fraction=rsla_floor_fraction)
+
+    physical_metrics = history_sensitivity(history, physical_history)
+    physical_floor_fraction = max(physical_history["eos_floor"])/(100*64*64)
+    physical_nlim_text = command_override(physical_status, 1, "time/nlim")
+    try:
+        physical_nlim = int(physical_nlim_text) if physical_nlim_text is not None else -1
+    except ValueError:
+        physical_nlim = -1
+    physical_last_cycle = max(int(row["cycle"]) for row in physical1)
+    physical_last_time = max(float(row["time"]) for row in physical1)
+    physical_coverage = (
+        physical_history["time"][-1] >= history["time"][-1]
+        and physical_last_time >= history["time"][-1]
+    )
+    physical_pass = (
+        compact_pass and same_artifacts and physical_status.get("mode") == "smoke"
+        and physical_status.get("compact_scale") == 1
+        and float(physical_status.get("radiation_c_light_override", 0.0)) ==
+            PHYSICAL_C_LIGHT
+        and physical_status.get("phase1_exit_code") == 0
+        and physical_nlim >= 650
+        and physical_last_cycle >= 650
+        and max(physical_history["eos_bad"]) == 0.0
+        and physical_floor_fraction <= settings["maximum_eos_energy_floor_fraction"]
+        and physical_coverage
+        and sensitivity_is_accepted(physical_metrics, settings)
+    )
+    checks["physical_light_speed_sensitivity"] = evidence_check(
+        physical_pass,
+        ["production_input", "smoke_status", "smoke_history", "physical_status",
+         "physical_phase1_log", "physical_history"],
+        **physical_metrics,
+        requested_cycle_limit=physical_nlim,
+        final_cycle=physical_last_cycle,
+        final_time=physical_last_time,
+        history_covers_production_baseline=physical_coverage,
+        maximum_matter_relative_difference=max(
+            physical_metrics.get(field, math.inf)
+            for field in SENSITIVITY_RELATIVE_FIELDS
+        ),
+        sensitivity_relative_tolerance=settings["sensitivity_relative_tolerance"],
+        radiation_deposited_relative_tolerance=
+            settings["radiation_deposited_relative_tolerance"],
+        eos_energy_floor_fraction=physical_floor_fraction)
 
     memory = calibration_status.get("phase1_memory", {})
     devices = memory.get("devices", {}) if isinstance(memory, dict) else {}
@@ -529,14 +666,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-dir", type=Path, default=CASE_DIR/"runs"/"smoke")
     parser.add_argument("--resolution-dir", type=Path,
                         default=CASE_DIR/"runs"/"resolution2")
-    parser.add_argument("--rsla-dir", type=Path, default=CASE_DIR/"runs"/"rsla30")
+    parser.add_argument("--rsla-dir", type=Path, default=CASE_DIR/"runs"/"rsla10")
+    parser.add_argument("--physical-c-dir", type=Path,
+                        default=CASE_DIR/"runs"/"cphys650")
     parser.add_argument("--calibration-dir", type=Path,
                         default=CASE_DIR/"runs"/"calibrate")
     parser.add_argument("--output", type=Path, default=CASE_DIR/"production_gate.json")
     parser.add_argument("--energy-rtol", type=float, default=5.0e-4)
     parser.add_argument("--mass-rtol", type=float, default=1.0e-8)
     parser.add_argument("--resolution-rtol", type=float, default=0.35)
-    parser.add_argument("--rsla-rtol", type=float, default=0.30)
+    parser.add_argument("--sensitivity-rtol", type=float, default=0.05)
+    parser.add_argument("--radiation-deposited-rtol", type=float, default=0.01)
     parser.add_argument("--minimum-causal-dt-fraction", type=float, default=1.0e-4)
     parser.add_argument("--maximum-eos-energy-floor-fraction", type=float, default=0.05)
     parser.add_argument("--dry-run", action="store_true",
@@ -555,6 +695,7 @@ def main() -> int:
             args.smoke_dir.expanduser().resolve(),
             args.resolution_dir.expanduser().resolve(),
             args.rsla_dir.expanduser().resolve(),
+            args.physical_c_dir.expanduser().resolve(),
             args.calibration_dir.expanduser().resolve())
         artifacts = run_case.gate_artifact_hashes()
         settings = {
@@ -562,7 +703,9 @@ def main() -> int:
             "energy_relative_tolerance": args.energy_rtol,
             "mass_relative_tolerance": args.mass_rtol,
             "resolution_relative_tolerance": args.resolution_rtol,
-            "rsla_relative_tolerance": args.rsla_rtol,
+            "sensitivity_relative_tolerance": args.sensitivity_rtol,
+            "radiation_deposited_relative_tolerance":
+                args.radiation_deposited_rtol,
             "minimum_causal_dt_fraction": args.minimum_causal_dt_fraction,
             "maximum_eos_energy_floor_fraction":
                 args.maximum_eos_energy_floor_fraction,

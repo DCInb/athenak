@@ -58,11 +58,13 @@ class Driver {
   void InitBoundaryValuesAndPrimitives(Mesh *pm);
 
  private:
+  enum class StopReason { none, cycle, time, walltime };
   Kokkos::Timer run_time_;      // generalized timer for cpu/gpu/etc
   std::uint64_t nmb_updated_;   // running total of MB updated during run
   std::uint64_t npart_updated_; // running total of particles updated during run
   float lb_efficiency_;         // measure of how efficient was load balancing
   Real physics_dt_;             // timestep before output/terminal event alignment
+  StopReason stop_reason_;
   void OutputCycleDiagnostics(Mesh *pm);
   void LimitTimeStepToNextOutput(Mesh *pm, Outputs *pout);
   Real UpdateWallClock();

@@ -64,4 +64,10 @@ class IOWrapper {
   MPI_Comm comm_;
 #endif
 };
+
+// Publish a fully closed temporary output under its final name.  For collective files
+// rank zero renames and all ranks observe the result; per-rank files are renamed by their
+// owning ranks.  Returns zero on success or a nonzero errno value on any rank.
+int PublishFileAtomically(const std::string &temporary, const std::string &final_name,
+                          bool single_file_per_rank = false);
 #endif // OUTPUTS_IO_WRAPPER_HPP_

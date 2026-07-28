@@ -8,8 +8,10 @@
   "poll_interval_seconds": 10,
   "log_file": "./tranfile/logs/file_watcher.log",
   "state_file": "./tranfile/state/transfer_state.json",
+  "lock_file": "./tranfile/state/file_watcher.lock",
   "allowed_extensions": [],
   "ignore_patterns": [
+    "*.lock",
     "*.part",
     "*.tmp"
   ],
@@ -18,6 +20,9 @@
   "recursive": true,
   "watch_mode": "polling",
   "transfer_method": "rsync",
+  "rsync_compress": false,
+  "rsync_io_timeout_seconds": 300,
+  "transfer_wall_timeout_seconds": 7200,
   "stable_checks_required": 4,
   "delete_after_transfer": false,
   "delete_extensions": []

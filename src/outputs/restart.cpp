@@ -134,9 +134,23 @@ void RestartOutput::LoadOutputData(Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void RestartOutput:::WriteOutputFile(Mesh *pm)
-//  \brief Cycles over all MeshBlocks and writes everything to a single restart file
+//  \brief Cycles over all MeshBlocks and writes everything to a restart file
 
 void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
+  WriteRestartFile(pm, pin, false);
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Write a rolling wall-time checkpoint without advancing the output cadence.
+
+void RestartOutput::WriteCheckpointFile(Mesh *pm, ParameterInput *pin) {
+  WriteRestartFile(pm, pin, true);
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Shared numbered-restart and rolling-checkpoint implementation.
+
+void RestartOutput::WriteRestartFile(Mesh *pm, ParameterInput *pin, bool checkpoint) {
   // get spatial dimensions of arrays, including ghost zones
   auto &indcs = pm->pmb_pack->pmesh->mb_indcs;
   int nout1 = indcs.nx1 + 2*(indcs.ng);
@@ -166,7 +180,16 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   }
   bool single_file_per_rank = out_params.single_file_per_rank;
   std::string fname;
-  if (single_file_per_rank) {
+  if (checkpoint) {
+    if (single_file_per_rank) {
+      char rank_dir[20];
+      std::snprintf(rank_dir, sizeof(rank_dir), "rank_%08d/", global_variable::my_rank);
+      fname = std::string("rst/") + std::string(rank_dir) + out_params.file_basename
+            + ".walltime.rst";
+    } else {
+      fname = std::string("rst/") + out_params.file_basename + ".walltime.rst";
+    }
+  } else if (single_file_per_rank) {
     // Generate a directory and filename for each rank
     // create filename: "rst/rank_YYYYYYY/file_basename" + "." + XXXXX + ".rst"
     // where YYYYYYY = 8-digit rank number
@@ -189,10 +212,14 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     std::snprintf(number, sizeof(number), ".%05d", out_params.file_number);
     fname = std::string("rst/") + out_params.file_basename + number + ".rst";
   }
-  // increment counters now so values for *next* dump are stored in restart file
-  out_params.file_number++;
-  AdvanceOutputSchedule(pm, pin);
-  pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
+  // Numbered outputs consume their regular schedule before serializing ParameterInput.
+  // A rolling wall-time checkpoint preserves it exactly, so resuming does not postpone
+  // the next requested production restart.
+  if (!checkpoint) {
+    out_params.file_number++;
+    AdvanceOutputSchedule(pm, pin);
+    pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
+  }
 
   // create string holding input parameters (copy of input file)
   std::stringstream ost;
@@ -204,8 +231,10 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // variables are read in Mesh::BuildTreeFromRestart()
 
   // open file and  write the header; this part is serial
+  const bool atomic_write = checkpoint || out_params.atomic_write;
+  const std::string write_name = atomic_write ? fname+".part" : fname;
   IOWrapper resfile;
-  resfile.Open(fname.c_str(), IOWrapper::FileMode::write, single_file_per_rank);
+  resfile.Open(write_name.c_str(), IOWrapper::FileMode::write, single_file_per_rank);
   if (global_variable::my_rank == 0 || single_file_per_rank) {
     // output the input parameters (input file)
     resfile.Write_any_type(sbuf.c_str(), sbuf.size(), "byte", single_file_per_rank);
@@ -620,6 +649,16 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
   // close file, clean up
   resfile.Close(single_file_per_rank);
+  if (atomic_write) {
+    const int publish_error = PublishFileAtomically(
+        write_name, fname, single_file_per_rank);
+    if (publish_error != 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Could not atomically publish restart output '" << fname
+                << "' (errno=" << publish_error << ")" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   return;
 }

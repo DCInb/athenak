@@ -13,7 +13,7 @@ mu = 1.4444444444444444
 
 <mesh>
 nghost = 2
-nx1 = 400
+nx1 = 500
 x1min = -2.0
 x1max = 1.5
 ix1_bc = outflow
@@ -45,6 +45,7 @@ tlim = 5.0
 ndiag = 10
 align_outputs = true
 initial_dt = 5.0e-5
+walltime_restart_only = true
 
 <mhd>
 eos = ideal
@@ -114,8 +115,9 @@ material1_opacity_emission_scale = 1.1e-1
 enabled = true
 n_groups = 20
 arad = 6.265030089603521e2
-# Reduced light speed: 1.0e9 cm/s.  Production requires a c_hat sensitivity gate.
-c_light = 1.0e1
+# Reduced light speed: 3.0e9 cm/s (about c/10).  Production requires matched
+# c_hat=10 and physical-c sensitivity gates.
+c_light = 3.0e1
 initial_radiation_temperature = 6.680606376612690e-5
 flux_limiter = harmonic
 flux_limit_coefficient = 1.0
@@ -208,6 +210,7 @@ dt = 2.5e-2
 # Frequent, inexpensive central slices for visualization.
 <output2>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid_xy
 slice_x3 = 0.0
@@ -215,6 +218,7 @@ dt = 1.0e-1
 
 <output3>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t_xy
 slice_x3 = 0.0
@@ -222,6 +226,7 @@ dt = 1.0e-1
 
 <output4>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser_xy
 slice_x3 = 0.0
@@ -229,6 +234,7 @@ dt = 1.0e-1
 
 <output5>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid_xz
 slice_x2 = 0.0
@@ -236,6 +242,7 @@ dt = 1.0e-1
 
 <output6>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t_xz
 slice_x2 = 0.0
@@ -243,6 +250,7 @@ dt = 1.0e-1
 
 <output7>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser_xz
 slice_x2 = 0.0
@@ -251,6 +259,7 @@ dt = 1.0e-1
 # Full-volume fields are intentionally sparse; 0.1 ns full dumps caused long I/O stalls.
 <output8>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid
 single_file_per_rank = false
@@ -258,6 +267,7 @@ dt = 5.0e-1
 
 <output9>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t
 single_file_per_rank = false
@@ -265,6 +275,7 @@ dt = 5.0e-1
 
 <output10>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser
 single_file_per_rank = false
@@ -272,4 +283,5 @@ dt = 5.0e-1
 
 <output11>
 file_type = rst
+atomic_write = true
 dt = 1.0

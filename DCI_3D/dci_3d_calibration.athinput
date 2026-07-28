@@ -13,7 +13,7 @@ mu = 1.4444444444444444
 
 <mesh>
 nghost = 2
-nx1 = 400
+nx1 = 500
 x1min = -2.0
 x1max = 1.5
 ix1_bc = outflow
@@ -43,6 +43,7 @@ tlim = 1.0e-3
 ndiag = 1
 align_outputs = true
 initial_dt = 5.0e-5
+walltime_restart_only = true
 
 <mhd>
 eos = ideal
@@ -108,7 +109,9 @@ material1_opacity_emission_scale = 1.1e-1
 enabled = true
 n_groups = 20
 arad = 6.265030089603521e2
-c_light = 1.0e1
+# Match the production reduced light speed; separate compact runs exercise c_hat=10
+# and physical c without changing the calibration deck.
+c_light = 3.0e1
 initial_radiation_temperature = 6.680606376612690e-5
 flux_limiter = harmonic
 flux_limit_coefficient = 1.0
@@ -199,6 +202,7 @@ dt = -1.0
 
 <output2>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid_xy
 slice_x3 = 0.0
@@ -206,6 +210,7 @@ dt = -1.0
 
 <output3>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t_xy
 slice_x3 = 0.0
@@ -213,6 +218,7 @@ dt = -1.0
 
 <output4>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser_xy
 slice_x3 = 0.0
@@ -220,6 +226,7 @@ dt = -1.0
 
 <output5>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid_xz
 slice_x2 = 0.0
@@ -227,6 +234,7 @@ dt = -1.0
 
 <output6>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t_xz
 slice_x2 = 0.0
@@ -234,6 +242,7 @@ dt = -1.0
 
 <output7>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser_xz
 slice_x2 = 0.0
@@ -241,6 +250,7 @@ dt = -1.0
 
 <output8>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid
 single_file_per_rank = false
@@ -248,6 +258,7 @@ dt = -1.0
 
 <output9>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t
 single_file_per_rank = false
@@ -255,6 +266,7 @@ dt = -1.0
 
 <output10>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser
 single_file_per_rank = false
@@ -262,4 +274,5 @@ dt = -1.0
 
 <output11>
 file_type = rst
+atomic_write = true
 dt = -1.0

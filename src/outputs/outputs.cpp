@@ -86,6 +86,8 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       opar.file_number = pin->GetOrAddInteger(opar.block_name,"file_number",0);
       opar.file_basename = pin->GetString("job","basename");
       opar.file_type = pin->GetString(opar.block_name,"file_type");
+      opar.atomic_write = pin->GetOrAddBoolean(
+          opar.block_name, "atomic_write", false);
 
       // set output variable and optional file id (default is output variable name)
       // but only for those output types that use them

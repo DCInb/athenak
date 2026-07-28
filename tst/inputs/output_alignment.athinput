@@ -36,6 +36,7 @@ nlim          = -1
 tlim          = 10.0
 ndiag         = 100000
 align_outputs = true
+walltime_restart_only = true
 
 <hydro>
 eos         = ideal
@@ -77,4 +78,5 @@ dcycle      = 1
 
 <output3>
 file_type   = rst
+atomic_write = true
 dt          = 0.3

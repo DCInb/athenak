@@ -6,6 +6,7 @@
 //! \file io_wrapper.cpp
 //! \brief functions that provide wrapper for MPI-IO versus serial input/output
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <iomanip>
@@ -16,6 +17,31 @@
 
 #include "athena.hpp"
 #include "io_wrapper.hpp"
+
+//----------------------------------------------------------------------------------------
+//! \brief Atomically publish a completed MPI or per-rank output file.
+
+int PublishFileAtomically(const std::string &temporary, const std::string &final_name,
+                          bool single_file_per_rank) {
+  int local_error = 0;
+#if MPI_PARALLEL_ENABLED
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (single_file_per_rank || rank == 0) {
+    if (std::rename(temporary.c_str(), final_name.c_str()) != 0) {
+      local_error = errno == 0 ? EIO : errno;
+    }
+  }
+  int global_error = 0;
+  MPI_Allreduce(&local_error, &global_error, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  return global_error;
+#else
+  if (std::rename(temporary.c_str(), final_name.c_str()) != 0) {
+    local_error = errno == 0 ? EIO : errno;
+  }
+  return local_error;
+#endif
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn int IOWrapper::Open(const char* fname, FileMode rw)

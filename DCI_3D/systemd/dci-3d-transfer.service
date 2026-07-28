@@ -1,0 +1,18 @@
+[Unit]
+Description=Resume identity-bound DCI_3D TranFile watcher
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/home/mengqi/Research/athenak-2t/DCI_3D/run/TRANSFER_IDENTITY.json
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mengqi/Research/athenak-2t
+ExecStart=/home/mengqi/miniconda3/envs/athenak-vis/bin/python /home/mengqi/Research/athenak-2t/DCI_3D/transfer_control.py --run-dir /home/mengqi/Research/athenak-2t/DCI_3D/run watch
+Restart=always
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=120
+UMask=0077
+
+[Install]
+WantedBy=default.target

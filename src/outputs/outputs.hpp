@@ -157,6 +157,8 @@ struct OutputParameters {
   bool logscale=true, logscale2=true;
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
+  // Publish completed binary/restart files with a final atomic rename.
+  bool atomic_write=false;
   // write bin/cbin cell data as 8-byte doubles instead of 4-byte floats
   // (readers key on the "size of variable" header field and support both)
   bool double_precision_binary=false;
@@ -408,6 +410,12 @@ class RestartOutput : public BaseTypeOutput {
   RestartOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
   void LoadOutputData(Mesh *pm) override;
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+  // Write a fixed rolling wall-time checkpoint without consuming the numbered restart
+  // cadence stored in ParameterInput.
+  void WriteCheckpointFile(Mesh *pm, ParameterInput *pin);
+
+ private:
+  void WriteRestartFile(Mesh *pm, ParameterInput *pin, bool checkpoint);
 };
 
 // Forward declaration

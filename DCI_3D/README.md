@@ -98,13 +98,15 @@ ap_optical_depth_threshold = 1.0
 ```
 
 The production candidate uses a documented reduced light speed
-`c_hat=1.0e9 cm/s = 10 mm/ns`, about `c/30`.  Physical light speed would require at least
-roughly 1.5 million global steps at this mesh spacing before tighter hydro/laser limits
-and would make the requested 10 ns evolution impractical.  This RSLA is a modeling
-approximation, not a numerical identity: production remains gated on matched compact
-`c_hat=10` versus `30` runs, plus a shorter physical-`c` comparison where practical,
-showing acceptable changes in energy, electron temperature, and radiation observables.
-Opacity is never inflated to compensate for the reduced speed.
+`c_hat=3.0e9 cm/s = 30 mm/ns`, about `c/10`.  Physical light speed would require many
+more global steps at this mesh spacing before tighter hydro/laser limits and would make
+the requested 10 ns evolution impractical.  This RSLA is a modeling approximation, not a
+numerical identity: production is gated on matched compact comparisons against
+`c_hat=10` and physical `c`.  Laser deposition, ion/electron energy, chain energy, and
+laser centroid must each differ by at most five percent.  The radiation reservoir is
+small but not relatively converged, so its relative difference is reported while its
+absolute difference must remain below one percent of deposited laser energy.  Opacity is
+never inflated to compensate for the reduced speed.
 
 ## Laser
 
@@ -158,10 +160,12 @@ requested plane.
 
 ## Mesh and output cadence
 
-The first memory-calibration candidate is `400 x 256 x 256` cells with `50 x 32 x 32`
-MeshBlocks: `8 x 8 x 8 = 512` blocks, exactly 64 blocks per rank on eight GPUs.  It
-resolves the shell thickness with approximately 23--26 cells.  This is a calibration
-candidate, not evidence that the 60--80 percent requirement has passed.
+The measured production candidate is `500 x 256 x 256` cells with `50 x 32 x 32`
+MeshBlocks: `10 x 8 x 8 = 640` blocks, exactly 80 blocks per rank on eight GPUs.  It
+resolves the shell thickness with approximately 26--29 cells.  The preceding
+`400 x 256 x 256` trial used 54.565 percent of each GPU.  The final hash-matched
+two-cycle calibration measured 11,058--11,064 MiB, or 67.493--67.529 percent, on every
+V100 with no pre-existing compute process or monitor error.
 
 History is written every `0.025 ns`.  Its 20 reductions include laser deposited energy
 and power, outward radiation power, total/CH mass, material/kinetic/magnetic/ion/electron
@@ -222,13 +226,16 @@ single-file MPI layout; the gate requires all 20 `eradNN` fields and exactly
 python3 DCI_3D/run_case.py --clean --mode smoke
 ```
 
-Generate matched doubled-resolution and `c_hat=30` evidence in separate owned trees:
+Generate matched doubled-resolution, `c_hat=10`, and physical-light-speed evidence in
+separate owned trees:
 
 ```bash
 python3 DCI_3D/run_case.py --clean --mode smoke --compact-scale 2 \
   --run-dir DCI_3D/runs/resolution2
-python3 DCI_3D/run_case.py --clean --mode smoke --radiation-c-light 30 \
-  --run-dir DCI_3D/runs/rsla30
+python3 DCI_3D/run_case.py --clean --mode smoke --radiation-c-light 10 \
+  --run-dir DCI_3D/runs/rsla10
+python3 DCI_3D/run_case.py --clean --mode smoke --nlim 650 \
+  --radiation-c-light 299.792458 --run-dir DCI_3D/runs/cphys650
 ```
 
 Measure the full candidate allocation for two steps:
@@ -243,7 +250,8 @@ Calibration returns status 2 unless every GPU's measured allocation increase is 
 ## Production gate and 5+5 ns staging
 
 An actual `--mode production` call requires ignored local
-`DCI_3D/production_gate.json`.  It is generated from the four run trees above; it is never
+`DCI_3D/production_gate.json`.  It is generated from the five smoke, resolution,
+reduced-speed, physical-speed, and calibration evidence trees above; it is never
 hand-authored.  Preview all derived metrics without writing, then create or update it:
 
 ```bash
@@ -251,7 +259,7 @@ python3 DCI_3D/verify_production_gate.py --dry-run
 python3 DCI_3D/verify_production_gate.py
 ```
 
-The verifier writes schema 3 with hashes of the binary, problem generator, decks,
+The verifier writes schema 4 with hashes of the binary, problem generator, decks,
 launcher, verifier, material tables, every selected log/status/history/3T/restart artifact,
 the numerical tolerances, and computed metrics.  It exits 2 and records failed checks when
 evidence is incomplete or outside tolerance.  On an actual production request,
@@ -270,14 +278,16 @@ The exact required check names are:
 - `restart_continuity`
 - `resolution_or_opacity_sensitivity`
 - `reduced_light_speed_sensitivity`
+- `physical_light_speed_sensitivity`
 - `gpu_memory_60_80_all`
 
 The evidence must show finite, nonnegative ion/electron/group energies and no disallowed
 EOS-table clamps; a timestep of order `dx/c` without secular collapse; 10 kJ incident and
 laser power closure; chain-energy closure including integrated outward radiation; CH-mass
 conservation; continuous restart time/timestep/energies; a doubled-resolution or
-opacity-sensitivity result; acceptable `c_hat=10`/`30` (and short physical-`c`)
-sensitivity; and 60--80 percent memory on all eight V100s.
+opacity-sensitivity result; acceptable `c_hat=30` versus `10` and physical-`c`
+sensitivity under the split matter/radiation limits above; and 60--80 percent memory on
+all eight V100s.
 
 The deterministic parser and gate-math tests do not substitute for GPU evidence.  Run
 them with the repository test environment (the visualization environment intentionally

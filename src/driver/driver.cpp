@@ -88,7 +88,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   nmb_updated_(0),
   npart_updated_(0),
   lb_efficiency_(0),
-  physics_dt_(-1.0) {
+  physics_dt_(-1.0),
+  stop_reason_(StopReason::none) {
   // set time-evolution option (no default)
   {
     std::string evolution_t = pin->GetString("time","evolution");
@@ -496,11 +497,11 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     // TODO(@user): add work for time static problems here
   } else {
     Real elapsed_time = -1.;
-    if (wall_time > 0.) {
+    if (wall_time >= 0.) {
       elapsed_time = UpdateWallClock();
     }
     while ((pmesh->time < tlim) && (pmesh->ncycle < nlim || nlim < 0) &&
-           (elapsed_time < wall_time)) {
+           (wall_time < 0. || elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
       // Execute TaskLists
@@ -573,10 +574,18 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       LimitTimeStepToNextOutput(pmesh, pout);
 
       // Update wall clock time if needed.
-      if (wall_time > 0.) {
+      if (wall_time >= 0.) {
         elapsed_time = UpdateWallClock();
       }
     }  // end while
+
+    if (pmesh->ncycle == nlim) {
+      stop_reason_ = StopReason::cycle;
+    } else if (pmesh->time >= tlim) {
+      stop_reason_ = StopReason::time;
+    } else if (wall_time >= 0. && elapsed_time >= wall_time) {
+      stop_reason_ = StopReason::walltime;
+    }
   }    // end of (time_evolution != tstatic) clause
   return;
 }
@@ -587,11 +596,34 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 //!  and printing diagnostic messages
 
 void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
-  // cycle through output Types and load data / write files
-  //  This design allows for asynchronous outputs to implemented in the future.
+  const bool restart_only = (
+      stop_reason_ == StopReason::walltime &&
+      pin->GetOrAddBoolean("time", "walltime_restart_only", false));
+  bool wrote_walltime_checkpoint = false;
+
+  // Normal time/cycle completion retains the historical full terminal output.  A
+  // segmented wall-time stop can instead publish one rolling restart without consuming
+  // any regular output counters or cadences.
   for (auto &out : pout->pout_list) {
+    if (restart_only && out->out_params.file_type != "rst") continue;
     out->LoadOutputData(pmesh);
-    out->WriteOutputFile(pmesh, pin);
+    if (restart_only) {
+      auto *restart = dynamic_cast<RestartOutput *>(out);
+      if (restart == nullptr) {
+        std::cout << "### FATAL ERROR: restart output has the wrong dynamic type"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      restart->WriteCheckpointFile(pmesh, pin);
+      wrote_walltime_checkpoint = true;
+    } else {
+      out->WriteOutputFile(pmesh, pin);
+    }
+  }
+  if (restart_only && !wrote_walltime_checkpoint) {
+    std::cout << "### FATAL ERROR: walltime_restart_only requires an enabled restart "
+              << "output block" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 
   // call any problem specific functions to do work after main loop
@@ -612,9 +644,9 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     if (global_variable::my_rank == 0) {
       // Print diagnostic messages related to the end of the simulation
       OutputCycleDiagnostics(pmesh);
-      if (pmesh->ncycle == nlim) {
+      if (stop_reason_ == StopReason::cycle) {
         std::cout << std::endl << "Terminating on cycle limit" << std::endl;
-      } else if (pmesh->time >= tlim) {
+      } else if (stop_reason_ == StopReason::time) {
         std::cout << std::endl << "Terminating on time limit" << std::endl;
       } else {
         std::cout << std::endl << "Terminating on wall clock limit" << std::endl;

@@ -4,6 +4,7 @@ import glob
 import os
 import re
 import shutil
+import subprocess
 
 import numpy as np
 import pytest
@@ -12,6 +13,18 @@ import test_suite.testutils as testutils
 
 
 INPUT_FILE = "inputs/output_alignment.athinput"
+
+
+@pytest.mark.parametrize("walltime", ("bad", "1:60:00", "-1:00:00"))
+def test_invalid_walltime_is_rejected(walltime):
+    result = subprocess.run(
+        ["./athena", "-i", INPUT_FILE, "-t", walltime],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    message = result.stdout+result.stderr
+    assert "-t" in message
+    assert "requires" in message or "must be followed" in message
 
 
 @pytest.mark.parametrize(
@@ -99,6 +112,57 @@ def test_aligned_restart_recovers_physics_timestep():
             assert match is not None
             times.append(float(match.group(1)))
         assert times == pytest.approx(np.arange(6)*0.1)
+    finally:
+        testutils.cleanup()
+        for path in glob.glob(f"{basename}*.hst"):
+            os.remove(path)
+        shutil.rmtree("rst", ignore_errors=True)
+
+
+def test_walltime_checkpoint_is_atomic_and_preserves_restart_schedule():
+    """An immediate walltime stop writes only a resumable rolling checkpoint."""
+    basename = "output_alignment_walltime"
+    try:
+        log_offset = os.path.getsize(testutils.LOG_FILE_PATH)
+        command = [
+            "./athena", "-i", INPUT_FILE, "-t", "00:00:00",
+            f"job/basename={basename}",
+            "time/ndiag=1",
+        ]
+        assert testutils.run_command(command), "Immediate walltime checkpoint failed."
+        with open(testutils.LOG_FILE_PATH, encoding="utf-8") as stream:
+            stream.seek(log_offset)
+            walltime_log = stream.read()
+        assert "Terminating on wall clock limit" in walltime_log
+
+        checkpoint = f"rst/{basename}.walltime.rst"
+        assert os.path.isfile(checkpoint)
+        assert not glob.glob("rst/*.part")
+        # Initialize writes the ordinary t=0 outputs.  Walltime Finalize must not add a
+        # terminal table or consume the numbered restart schedule.
+        assert glob.glob(f"tab/{basename}.hydro_w.*.tab") == [
+            f"tab/{basename}.hydro_w.00000.tab"
+        ]
+        assert os.path.isfile(f"rst/{basename}.00000.rst")
+
+        parse_offset = os.path.getsize(testutils.LOG_FILE_PATH)
+        assert testutils.run_command(["./athena", "-r", checkpoint, "-n"])
+        with open(testutils.LOG_FILE_PATH, encoding="utf-8") as stream:
+            stream.seek(parse_offset)
+            parameter_dump = stream.read()
+        output3 = parameter_dump.split("<output3>", 1)[1].split("<par_end>", 1)[0]
+        file_number = re.search(r"(?m)^file_number\s*=\s*(\S+)", output3)
+        assert file_number is not None
+        assert int(file_number.group(1)) == 1
+        last_time = re.search(r"(?m)^last_time\s*=\s*(\S+)", output3)
+        assert last_time is not None
+        assert float(last_time.group(1)) == pytest.approx(0.0)
+
+        # A real one-cycle reload validates the payload, not only its text header.
+        assert testutils.run_command([
+            "./athena", "-r", checkpoint,
+            "time/nlim=1", "time/tlim=10.0", "time/ndiag=1",
+        ]), "Walltime checkpoint could not advance a complete cycle."
     finally:
         testutils.cleanup()
         for path in glob.glob(f"{basename}*.hst"):

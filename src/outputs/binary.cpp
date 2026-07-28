@@ -74,9 +74,10 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
           + "." + out_params.file_id + number + ".bin";
   }
 
+  const std::string write_name = out_params.atomic_write ? fname+".part" : fname;
   IOWrapper binfile;
   std::size_t header_offset=0;
-  binfile.Open(fname.c_str(), IOWrapper::FileMode::write, single_file_per_rank);
+  binfile.Open(write_name.c_str(), IOWrapper::FileMode::write, single_file_per_rank);
 
   // Basic parts of the format:
   // 1. Size of the header
@@ -313,6 +314,16 @@ void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
   // close the output file and clean up ptrs to data
   binfile.Close(single_file_per_rank);
+  if (out_params.atomic_write) {
+    const int publish_error = PublishFileAtomically(
+        write_name, fname, single_file_per_rank);
+    if (publish_error != 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Could not atomically publish binary output '" << fname
+                << "' (errno=" << publish_error << ")" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
   delete [] data;
   delete [] single_data;
   delete [] double_data;

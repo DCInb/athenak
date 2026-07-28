@@ -64,7 +64,9 @@ int main(int argc, char *argv[]) {
   bool marg_flag = false;  // set to true if -m        argument is on cmdline
   bool narg_flag = false;  // set to true if -n        argument is on cmdline
   bool  res_flag = false;  // set to true if -r <file> argument is on cmdline
-  Real wtlim = 0;
+  // A negative value means no wall-clock stop.  Zero is a useful, deterministic
+  // immediate-checkpoint request for restart/launcher tests.
+  Real wtlim = -1;
 
   //--- Step 1. --------------------------------------------------------------------------
   // Initialize environment (must initialize MPI first, then Kokkos)
@@ -141,12 +143,12 @@ int main(int argc, char *argv[]) {
               std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                         << std::endl << "-" << opt_letter
                         << " must be followed by a valid argument" << std::endl;
-              Kokkos::finalize();
-#if MPI_PARALLEL_ENABLED
-              MPI_Finalize();
-#endif
-              return(0);
             }
+            Kokkos::finalize();
+#if MPI_PARALLEL_ENABLED
+            MPI_Finalize();
+#endif
+            return(EXIT_FAILURE);
           }
       }
 
@@ -171,7 +173,19 @@ int main(int argc, char *argv[]) {
           break;
         case 't':                      // -t <hh:mm:ss>
           int wth, wtm, wts;
-          std::sscanf(argv[++i], "%d:%d:%d", &wth, &wtm, &wts);
+          char trailing;
+          if (std::sscanf(argv[++i], "%d:%d:%d%c", &wth, &wtm, &wts, &trailing) != 3 ||
+              wth < 0 || wtm < 0 || wtm >= 60 || wts < 0 || wts >= 60) {
+            if (global_variable::my_rank == 0) {
+              std::cerr << "### FATAL ERROR: -t requires H+:MM:SS with nonnegative "
+                        << "hours and two fields below 60" << std::endl;
+            }
+            Kokkos::finalize();
+#if MPI_PARALLEL_ENABLED
+            MPI_Finalize();
+#endif
+            return(EXIT_FAILURE);
+          }
           wtlim = static_cast<Real>(wth*3600 + wtm*60 + wts);
           break;
         case 'c':

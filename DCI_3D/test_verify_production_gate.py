@@ -1,6 +1,7 @@
 """Deterministic unit tests for the DCI production-gate verifier."""
 
 from pathlib import Path
+import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -8,10 +9,19 @@ import verify_production_gate as gate
 import run_case
 
 
+def test_schema_and_required_checks_match_launcher():
+    assert gate.SCHEMA == 4
+    assert run_case.PRODUCTION_GATE_SCHEMA == gate.SCHEMA
+    assert "physical_light_speed_sensitivity" in gate.CHECK_NAMES
+    assert tuple(run_case.REQUIRED_PRODUCTION_CHECKS) == gate.CHECK_NAMES
+
+
 def write_history(path: Path, scale: float = 1.0,
                   final_time: float = 1.0e-4,
                   eos_bad_cells: float = 0.0,
-                  eos_floor_cells: float = 0.0) -> None:
+                  eos_floor_cells: float = 0.0,
+                  radiation_scale: float = 1.0,
+                  centroid_scale: float = 1.0) -> None:
     names = ["time", "dt", "laser_Edep", "rad_Pesc", "CH_mass", "eion_E",
              "eele_E", "erad_E", "erad_soft", "erad_mid", "erad_hard",
              "chain_E", "laser_x", "eos_floor", "eos_bad"]
@@ -19,9 +29,11 @@ def write_history(path: Path, scale: float = 1.0,
     rows = (
         (0.0, 1e-4, 0.0, 0.0, 2.0, 1.0, 1.0, 1.0, .3, .4, .3,
          3.0, 0.0, 0.0, 0.0),
-        (final_time, 1e-4, 1e-3*scale, 2e-4*scale, 2.0, 1.0,
-         1.0+4e-4*scale, 1.0+4e-4*scale, .3, .4, .3004,
-         3.0+chain_delta, -5e-4*scale, eos_floor_cells, eos_bad_cells),
+        (final_time, 1e-4, 1e-3*scale, 2e-4*scale, 2.0,
+         1.0+2e-4*scale, 1.0+4e-4*scale,
+         1.0+1e-6*radiation_scale, .3, .4, .3+1e-6*radiation_scale,
+         3.0+chain_delta, -5e-4*scale*centroid_scale,
+         eos_floor_cells, eos_bad_cells),
     )
     header = "# " + " ".join(f"[{index}]={name}" for index, name in enumerate(names, 1))
     path.write_text(header+"\n"+"\n".join(
@@ -39,7 +51,34 @@ def test_history_parser_and_sensitivity(tmp_path):
     metrics = gate.history_sensitivity(reference, comparison)
     assert metrics["common_time"] == 1.0e-4
     assert 0.0 < metrics["laser_Edep"] < 0.1
+    assert 0.0 < metrics["eion_E"] < 0.1
+    assert 0.0 < metrics["eion_absolute_difference_over_deposited"] < 0.1
     assert metrics["laser_centroid"] <= 1.0e-12
+    assert metrics["erad_E"] == 0.0
+    assert metrics["erad_absolute_difference_over_deposited"] == 0.0
+
+
+def test_sensitivity_policy_gates_matter_and_absolute_radiation_only():
+    settings = {
+        "sensitivity_relative_tolerance": 0.05,
+        "radiation_deposited_relative_tolerance": 0.01,
+    }
+    metrics = {field: 0.01 for field in gate.SENSITIVITY_RELATIVE_FIELDS}
+    metrics.update(
+        common_time=1.0,
+        erad_E=0.99,
+        erad_absolute_difference_over_deposited=0.009,
+    )
+    assert gate.sensitivity_is_accepted(metrics, settings)
+
+    for field in gate.SENSITIVITY_RELATIVE_FIELDS:
+        failed = dict(metrics)
+        failed[field] = 0.051
+        assert not gate.sensitivity_is_accepted(failed, settings), field
+
+    failed = dict(metrics)
+    failed["erad_absolute_difference_over_deposited"] = 0.011
+    assert not gate.sensitivity_is_accepted(failed, settings)
 
 
 def test_cycle_parser(tmp_path):
@@ -107,6 +146,46 @@ def test_full_volume_glob_excludes_plane_slices(tmp_path):
     assert gate.latest_file(tmp_path, "*.three_t.*.bin") == volume
 
 
+def test_discover_sources_finds_root_level_histories(tmp_path):
+    smoke = tmp_path/"smoke"
+    resolution = tmp_path/"resolution2"
+    rsla = tmp_path/"rsla10"
+    physical = tmp_path/"cphys650"
+    calibration = tmp_path/"calibrate"
+    for directory in (smoke, resolution, rsla, physical, calibration):
+        directory.mkdir()
+
+    for directory in (smoke, resolution, rsla):
+        (directory/"run_status.json").touch()
+        (directory/"phase1.log").touch()
+        (directory/"phase2.log").touch()
+        (directory/f"{directory.name}.user.hst").touch()
+    (physical/"run_status.json").touch()
+    (physical/"phase1.log").touch()
+    (physical/"cphys.user.hst").touch()
+    (calibration/"run_status.json").touch()
+    (calibration/"phase1.log").touch()
+
+    (smoke/"bin").mkdir()
+    (smoke/"bin"/"case.fluid.00000.bin").touch()
+    (smoke/"bin"/"case.three_t.00000.bin").touch()
+    (smoke/"bin"/"case.laser.00000.bin").touch()
+    (smoke/"rst").mkdir()
+    (smoke/"rst"/"case.00000.rst").touch()
+    (smoke/"material_tables").mkdir()
+    (smoke/"material_tables"/"manifest.json").touch()
+
+    sources = gate.discover_sources(
+        smoke, resolution, rsla, physical, calibration
+    )
+    assert sources["smoke_history"].parent == smoke
+    assert sources["resolution_history"].parent == resolution
+    assert sources["rsla_history"].parent == rsla
+    assert sources["physical_history"].parent == physical
+    assert all(path.parent.name != "hst" for name, path in sources.items()
+               if name.endswith("_history"))
+
+
 def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     artifacts = {"athena_binary": "abc123"}
 
@@ -122,7 +201,9 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
 
     smoke_status = status("smoke")
     resolution_status = status("smoke", scale=2)
-    rsla_status = status("smoke", c_light=30.0)
+    rsla_status = status("smoke", c_light=10.0)
+    physical_status = status("smoke", c_light=299.792458)
+    physical_status["phase1_mpi_command"] = ["time/nlim=650"]
     calibration_status = status("calibrate")
     calibration_status["phase1_mpi_command"] = ["time/nlim=2"]
     calibration_status["phase1_memory"] = {
@@ -140,10 +221,10 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         ("smoke_status", smoke_status),
         ("resolution_status", resolution_status),
         ("rsla_status", rsla_status),
+        ("physical_status", physical_status),
         ("calibration_status", calibration_status),
     ):
         path = tmp_path/f"{name}.json"
-        import json
         path.write_text(json.dumps(value))
         sources[name] = path
 
@@ -152,8 +233,9 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         ("smoke_phase2_log", ((50, .008, 2e-4), (60, .01, 2e-4))),
         ("resolution_phase1_log", ((0, 0.0, 1e-4), (100, .008, 1e-4))),
         ("resolution_phase2_log", ((100, .008, 1e-4), (120, .01, 1e-4))),
-        ("rsla_phase1_log", ((0, 0.0, 7e-5), (150, .008, 7e-5))),
-        ("rsla_phase2_log", ((150, .008, 7e-5), (180, .01, 7e-5))),
+        ("rsla_phase1_log", ((0, 0.0, 2e-4), (50, .008, 2e-4))),
+        ("rsla_phase2_log", ((50, .008, 2e-4), (60, .01, 2e-4))),
+        ("physical_phase1_log", ((0, 0.0, 2e-5), (650, .012, 2e-5))),
         ("calibration_phase1_log", ((0, 0.0, 2e-4), (2, 4e-4, 2e-4))),
     ):
         path = tmp_path/f"{name}.log"
@@ -162,14 +244,16 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
             for cycle, time, dt in rows))
         sources[name] = path
 
-    for name in ("smoke_history", "resolution_history", "rsla_history"):
+    for name in (
+        "smoke_history", "resolution_history", "rsla_history", "physical_history"
+    ):
         path = tmp_path/f"{name}.hst"
         write_history(path, final_time=1.0e-2)
         sources[name] = path
 
     deck = tmp_path/"dci.athinput"
     deck.write_text(
-        "<thermal_radiation>\nc_light = 10\nn_groups = 20\n"
+        "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
         "<laser>\nbeam0_power = 2e19\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")
     sources["production_input"] = deck
@@ -194,19 +278,109 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "energy_relative_tolerance": 5e-4,
         "mass_relative_tolerance": 1e-8,
         "resolution_relative_tolerance": .35,
-        "rsla_relative_tolerance": .30,
+        "sensitivity_relative_tolerance": .05,
+        "radiation_deposited_relative_tolerance": .01,
         "minimum_causal_dt_fraction": 1e-4,
         "maximum_eos_energy_floor_fraction": .05,
     }
     checks = gate.evaluate_checks(sources, settings)
     assert set(checks) == set(gate.CHECK_NAMES)
     assert all(record["passed"] for record in checks.values()), checks
+    assert checks["reduced_light_speed_sensitivity"]["metrics"]["erad_E"] == 0.0
+    assert checks["physical_light_speed_sensitivity"]["metrics"]["final_cycle"] == 650
+
+    physical_status["phase1_mpi_command"] = ["time/nlim=649"]
+    sources["physical_status"].write_text(json.dumps(physical_status))
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
+    physical_status["phase1_mpi_command"] = ["time/nlim=650"]
+    sources["physical_status"].write_text(json.dumps(physical_status))
+
+    sources["physical_phase1_log"].write_text(
+        "cycle=0 time=0.00000000e+00 dt=2.00000000e-05\n"
+        "cycle=649 time=1.20000000e-02 dt=2.00000000e-05\n"
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
+    sources["physical_phase1_log"].write_text(
+        "cycle=0 time=0.00000000e+00 dt=2.00000000e-05\n"
+        "cycle=650 time=1.20000000e-02 dt=2.00000000e-05\n"
+    )
+
+    physical_status["radiation_c_light_override"] = 300.0
+    sources["physical_status"].write_text(json.dumps(physical_status))
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
+    physical_status["radiation_c_light_override"] = 299.792458
+    sources["physical_status"].write_text(json.dumps(physical_status))
+
+    rsla_status["radiation_c_light_override"] = 30.0
+    sources["rsla_status"].write_text(json.dumps(rsla_status))
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["reduced_light_speed_sensitivity"]["passed"]
+    rsla_status["radiation_c_light_override"] = 10.0
+    sources["rsla_status"].write_text(json.dumps(rsla_status))
+
+    write_history(
+        sources["physical_history"], final_time=1.0e-2, eos_bad_cells=1.0
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
+    write_history(
+        sources["physical_history"], final_time=1.0e-2,
+        eos_floor_cells=0.06*100*64*64
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
+    write_history(sources["physical_history"], final_time=1.0e-2)
+
+    deck.write_text(
+        "<thermal_radiation>\nc_light = 10\nn_groups = 20\n"
+        "<laser>\nbeam0_power = 2e19\n"
+        "beam0_start_time = 0\nbeam0_end_time = 5\n")
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["compact_20group_50step"]["passed"]
+    deck.write_text(
+        "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
+        "<laser>\nbeam0_power = 2e19\n"
+        "beam0_start_time = 0\nbeam0_end_time = 5\n")
 
     write_history(
         sources["smoke_history"], final_time=1.0e-2, eos_bad_cells=1.0
     )
     checks = gate.evaluate_checks(sources, settings)
     assert not checks["finite_nonnegative_3t"]["passed"]
+
+    write_history(sources["smoke_history"], final_time=1.0e-2)
+    write_history(sources["rsla_history"], scale=1.2, final_time=1.0e-2)
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["reduced_light_speed_sensitivity"]["passed"]
+
+    write_history(sources["rsla_history"], final_time=1.0e-2)
+    write_history(sources["physical_history"], scale=1.2, final_time=1.0e-2)
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
+
+    write_history(sources["physical_history"], final_time=1.0e-2)
+    write_history(
+        sources["rsla_history"], final_time=1.0e-2, radiation_scale=5.0
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    rsla_check = checks["reduced_light_speed_sensitivity"]
+    assert rsla_check["passed"]
+    assert rsla_check["metrics"]["erad_E"] > 0.5
+    assert rsla_check["metrics"]["erad_absolute_difference_over_deposited"] < .01
+
+    write_history(
+        sources["rsla_history"], final_time=1.0e-2, radiation_scale=20.0
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["reduced_light_speed_sensitivity"]["passed"]
+
+    write_history(sources["rsla_history"], final_time=1.0e-2)
+    write_history(sources["physical_history"], final_time=5.0e-3)
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["physical_light_speed_sensitivity"]["passed"]
 
     write_history(
         sources["smoke_history"], final_time=1.0e-2,

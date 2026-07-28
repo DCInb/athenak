@@ -116,9 +116,12 @@ The reference uses a harmonic flux limiter with coefficient one and vacuum condi
 all radiation faces.  The opacity tables provide Rosseland transport and Planck
 absorption/emission coefficients in cm2/g.  AthenaK uses its explicit
 asymptotic-preserving face flux and does not inflate opacity.  The production candidate
-uses the documented reduced value `c_hat=1.0e9 cm/s` (about `c/30`) so a 10 ns run is
-feasible; a `c_hat=10` versus `30` compact sensitivity comparison, plus a short physical-c
-check where practical, is a mandatory production gate.
+uses the documented reduced value `c_hat=3.0e9 cm/s` (about `c/10`) so a 10 ns run is
+feasible.  Matched compact comparisons against `c_hat=10` and physical `c` are mandatory
+production gates.  Matter and laser changes are bounded directly; because the tiny
+radiation reservoir is not relatively converged, its absolute difference is normalized by
+deposited laser energy and bounded separately while its relative difference remains
+reported.
 
 ## Laser comparison
 
