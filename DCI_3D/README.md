@@ -118,10 +118,11 @@ an already-reflected ray from retriggering against cell-local cutoff reconstruct
 noise; its state follows the ray across MPI ranks.  The evolved 100-cycle doubled-mesh
 sweep gives zero terminal power and at most 17--19 turns per ray across hysteresis,
 turning-offset, and cap variants.  Production keeps a hard cap of 64, 1,024 distributed
-transport waves, and a `1e-5`-cell normal offset.  Any terminal ray power above `1e-10`
-of launched power is fatal and is independently rejected by the production gate; it
-cannot be hidden inside the ordinary conservation residual.  The exact initial and
-evolved-state sweeps are recorded in
+transport waves, and a `1e-5`-cell normal offset.  Every solve reports its transport-wave
+count; the gate requires at least a factor-two margin to that cap (at most 512 observed
+waves).  Any terminal ray power above `1e-10` of launched power is fatal and is
+independently rejected by the production gate; it cannot be hidden inside the ordinary
+conservation residual.  The exact initial and evolved-state sweeps are recorded in
 `LASER_TRANSPORT_CONVERGENCE.md`.
 
 ```text
@@ -172,9 +173,9 @@ requested plane.
 The measured production candidate is `500 x 256 x 256` cells with `50 x 32 x 32`
 MeshBlocks: `10 x 8 x 8 = 640` blocks, exactly 80 blocks per rank on eight GPUs.  It
 resolves the shell thickness with approximately 26--29 cells.  The preceding
-`400 x 256 x 256` trial used 54.565 percent of each GPU.  The final hash-matched
-four-cycle calibration measured 11,058--11,066 MiB, or 67.493--67.541 percent, on every
-V100 with no pre-existing compute process or monitor error.
+`400 x 256 x 256` trial used 54.565 percent of each GPU.  The measured production
+allocation was 11,058--11,066 MiB, or 67.493--67.541 percent, on every V100 with no
+pre-existing compute process or monitor error.
 
 History is written every `0.025 ns`.  Its 20 reductions include laser deposited energy
 and power, outward radiation power, total/CH mass, material/kinetic/magnetic/ion/electron
@@ -247,7 +248,7 @@ python3 DCI_3D/run_case.py --clean --mode smoke --nlim 650 \
   --radiation-c-light 299.792458 --run-dir DCI_3D/runs/cphys650
 ```
 
-Measure the full candidate allocation and exercise eight full-layout RK2 laser solves:
+Measure the full candidate allocation and exercise 44 full-layout RK2 laser solves:
 
 ```bash
 python3 DCI_3D/run_case.py --clean --mode calibrate
@@ -268,7 +269,7 @@ python3 DCI_3D/verify_production_gate.py --dry-run
 python3 DCI_3D/verify_production_gate.py
 ```
 
-The verifier writes schema 7 with hashes of the binary, problem generator, decks,
+The verifier writes schema 8 with hashes of the binary, problem generator, decks,
 launcher, verifier, material tables, every selected log/status/history/3T/restart artifact,
 the numerical tolerances, and computed metrics.  It exits 2 and records failed checks when
 evidence is incomplete or outside tolerance.  On an actual production request,
@@ -293,13 +294,15 @@ The exact required check names are:
 The evidence must show finite, nonnegative ion/electron/group energies and no disallowed
 EOS-table clamps; a timestep of order `dx/c` without secular collapse; 10 kJ incident and
 laser power closure with no wave/reflection-cap remainder and at least a factor-two
-reflection-cap margin in every baseline, resolution, light-speed, and calibration solve;
-chain-energy closure including integrated outward radiation; CH-mass
+margin to both the reflection and distributed-transport-wave caps in every baseline,
+resolution, light-speed, and calibration solve; chain-energy closure including
+integrated outward radiation; CH-mass
 conservation; continuous restart time/timestep/energies; a doubled-resolution or
 opacity-sensitivity result; acceptable `c_hat=30` versus `10` and physical-`c`
 sensitivity under the split matter/radiation limits above; and 60--80 percent memory on
-all eight V100s.  The full-layout calibration must also reach four complete cycles,
-covering eight RK2 laser solves before production can be staged.
+all eight V100s.  Every laser record must contain an integral `waves` diagnostic.  The
+full-layout calibration must also reach exactly 22 complete cycles, covering exactly 44
+RK2 laser solves before production can be staged.
 
 The deterministic parser and gate-math tests do not substitute for GPU evidence.  Run
 them with the repository test environment (the visualization environment intentionally

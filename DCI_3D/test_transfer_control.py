@@ -75,7 +75,7 @@ def prepared(tmp_path, monkeypatch):
     case.mkdir()
     monkeypatch.setattr(tc, "CASE_DIR", case)
     run = case / "run"
-    run.mkdir()
+    run.mkdir(mode=0o700)
     gate = case / "production_gate.json"
     gate.write_text('{"schema": 4}\n', encoding="utf-8")
     gate_digest = tc.sha256_path(gate)
@@ -156,6 +156,23 @@ def test_prepare_writes_absolute_non_deleting_identity_bound_config(prepared):
     assert context.identity_path.is_file()
     assert not (context.config_path.stat().st_mode & 0o222)
     assert all(isinstance(args, list) for args, _ in runner.calls)
+
+
+def test_prepare_and_load_reject_nonprivate_run_root(prepared):
+    controller, context, runner = prepared
+    context.run_dir.chmod(0o755)
+    calls_before = len(runner.calls)
+
+    with pytest.raises(tc.TransferControlError, match="mode must be exactly 0700"):
+        controller.prepare(
+            context.run_dir,
+            Path(context.identity["production_gate"]),
+            tc.CASE_DIR / "tranfile_config.json",
+        )
+    with pytest.raises(tc.TransferControlError, match="mode must be exactly 0700"):
+        controller.load_context(context.run_dir)
+
+    assert len(runner.calls) == calls_before
 
 
 def test_resume_rejects_delete_policy_or_identity_change(prepared):

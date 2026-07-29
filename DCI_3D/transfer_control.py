@@ -119,6 +119,18 @@ def require_regular_file(path: Path, description: str) -> Path:
     return path.resolve()
 
 
+def require_private_run_directory(path: Path) -> Path:
+    if path.is_symlink() or not path.is_dir():
+        raise TransferControlError(f"Production run directory is unavailable: {path}")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != 0o700:
+        raise TransferControlError(
+            "Production run directory mode must be exactly 0700 before transfer "
+            f"provisioning, got {mode:04o}: {path}"
+        )
+    return path
+
+
 def require_absolute_path(raw: Any, field: str) -> Path:
     if not isinstance(raw, str) or not Path(raw).is_absolute():
         raise TransferControlError(f"{field} must be an absolute path")
@@ -473,8 +485,7 @@ class TransferController:
         base_config_path: Path = DEFAULT_BASE_CONFIG,
     ) -> TransferContext:
         run_dir = run_dir.expanduser().resolve()
-        if not run_dir.is_dir() or run_dir.is_symlink():
-            raise TransferControlError(f"Production run directory is unavailable: {run_dir}")
+        require_private_run_directory(run_dir)
         identity_path = run_dir / IDENTITY_NAME
         if identity_path.exists():
             context = self.load_context(run_dir)
@@ -543,6 +554,7 @@ class TransferController:
 
     def load_context(self, run_dir: Path) -> TransferContext:
         run_dir = run_dir.expanduser().resolve()
+        require_private_run_directory(run_dir)
         identity_path = require_regular_file(
             run_dir / IDENTITY_NAME, "transfer identity"
         )

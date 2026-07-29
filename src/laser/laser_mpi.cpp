@@ -158,6 +158,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
   // rays that hit the per-wave work cap stay active and are re-traced, so results
   // do not depend on how the work caps interact with the rank decomposition.
   for (int wave = 0; ; ++wave) {
+    mpi_wave_ = wave;
     if (propagation_model_ == PropagationModel::refractive) {
       TraceRefractiveRays(true);
     } else {
@@ -176,6 +177,7 @@ TaskStatus Laser::AdvanceDistributedTransport() {
   const int nranks = global_variable::nranks;
   if (nranks == 1) {
     for (int wave = 0; ; ++wave) {
+      mpi_wave_ = wave;
       if (propagation_model_ == PropagationModel::refractive) {
         TraceRefractiveRays(true);
       } else {
@@ -343,7 +345,8 @@ TaskStatus Laser::AdvanceDistributedTransport() {
     }
     if (!complete) return TaskStatus::incomplete;
 
-    if (mpi_global_active_ > 0 && ++mpi_wave_ < max_mpi_waves_) {
+    if (mpi_global_active_ > 0 && mpi_wave_+1 < max_mpi_waves_) {
+      ++mpi_wave_;
       transport_state_ = LaserTransportState::trace_local;
       return TaskStatus::incomplete;
     }

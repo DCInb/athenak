@@ -70,11 +70,12 @@ resolution uncertainty, while retaining zero terminal power.
 ## Production acceptance
 
 Each laser solve prints total and cause-specific remainder power/counts, maximum turns
-per ray, suppressed same-surface candidate segments, and rearm count.  Gate schema 7
-parses every laser record from baseline, doubled-resolution, reduced-light-speed,
-physical-light-speed, and calibration evidence.  It requires split accounting and
-residuals at or below `1e-10`, zero terminal power, and an observed maximum no greater
-than half the configured reflection cap (32 for production cap 64).
+per ray, suppressed same-surface candidate segments, rearm count, and the number of
+distributed transport waves.  Gate schema 8 parses every laser record from baseline,
+doubled-resolution, reduced-light-speed, physical-light-speed, and calibration evidence.
+It requires split accounting and residuals at or below `1e-10`, zero terminal power, and
+observed maxima no greater than half the configured reflection cap (32 for production
+cap 64) and transport-wave cap (512 for production cap 1,024).
 
 ## Full-layout ownership regression
 
@@ -89,6 +90,27 @@ failed one nearly absorbed ray.
 The replicated laser table now uses the exact MeshBlock endpoint rules and `LeftEdgeX`
 arithmetic on every active axis.  A two-rank asymmetric-domain regression crosses the
 same non-binary face in the negative direction and compares its fields with a one-rank
-reference.  The production-memory calibration now advances four full cycles (eight RK2
-laser solves), rather than two, and must record cycle 4.  Gate schema 7 enforces that
-coverage in addition to the eight-log remainder and reflection checks above.
+reference.  The schema-7 production-memory calibration advanced four full cycles (eight
+RK2 laser solves), rather than two, and recorded cycle 4.  That coverage exercised the
+formerly failing seventh solve in addition to the eight-log remainder and reflection
+checks above.
+
+## Sub-ulp face-probe regression
+
+The next schema-7 production start passed that ownership boundary but exposed a later,
+independent face-stagnation case in the second RK2 solve of cycle 21.  Ray 3415 on rank 1
+reached the `x=-0.6 mm` face with `n_x=-5.8814e-4`.  Multiplying the forward-probe
+distance by this nearly tangential component produced less than half an ulp, so ordinary
+addition left the classified x coordinate unchanged.  The departing MeshBlock was
+selected again, no further finite segment was traced, and the ray exhausted the 1,024
+distributed-wave production cap with `2.3382e-6` of launched power still active.
+
+All straight, refractive, reflected, and periodic face probes now guarantee movement by
+at least one representable value in each nonzero direction, using `nextafter` when the
+ordinary sum rounds back to the original coordinate.  A two-rank regression reproduces
+the sub-ulp component and matches a one-rank reference.  The fixed full-layout run reaches
+cycle 22 with all 44 RK2 laser solves complete, zero remainder, at most 10 transport
+waves, at most 15 reflections per ray, and a maximum conservation residual of
+`2.99e-13`.  Schema 8 therefore requires an integral `waves` field in every laser record,
+enforces factor-two headroom to both production caps, and accepts calibration evidence
+only when it records exactly cycle 22 and exactly 44 laser solves.

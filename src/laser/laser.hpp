@@ -105,6 +105,7 @@ struct LaserDiagnostics {
   int suppressed_turns = 0;
   int reflection_rearms = 0;
   int off_rank_transfers = 0;
+  int transport_waves = 0;
   int transport_iterations = 0;
   int traced_segments = 0;
   Real total_path_length = 0.0;

@@ -1,6 +1,8 @@
 build/
+forensics/
 material_tables/
-production_gate.json
+plots/
+production_gate*.json
 run/
 runs/
 tranfile/logs/

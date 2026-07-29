@@ -88,6 +88,9 @@ def test_run():
         assert_remaining_partition(diagnostics, 1.0, 0.0)
         assert diagnostics["remaining_fraction"] == 1.0
         assert diagnostics["wave_remaining_rays"] == 1.0
+        assert diagnostics["waves"] == 1
+        assert diagnostics["iterations"] == 1
+        assert log.count("laser_remaining_ray:") == 1
         assert "Laser transport failed" in log
     finally:
         testutils.cleanup()

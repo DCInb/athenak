@@ -320,9 +320,17 @@ def test_laser_transport_cli_overrides_reach_both_smoke_commands(monkeypatch):
     assert "problem/allow_laser_transport_variants=true" in initial
 
 
-def test_calibration_default_exercises_four_full_layout_cycles():
+def test_calibration_default_exercises_twenty_two_full_layout_cycles():
     overrides = run_case.nonproduction_overrides("calibrate", None, None, 1)
-    assert "time/nlim=4" in overrides
+    assert run_case.CALIBRATION_CYCLES == 22
+    assert "time/nlim=22" in overrides
+
+
+def test_prepare_run_directory_uses_transfer_sealable_mode(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o755)
+    run_case.prepare_run_dir(run_dir, "production")
+    assert run_dir.stat().st_mode & 0o777 == 0o700
 
 
 def test_production_rejects_laser_transport_cli_overrides(tmp_path, monkeypatch):

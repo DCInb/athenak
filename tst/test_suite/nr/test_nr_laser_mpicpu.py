@@ -92,6 +92,31 @@ def test_run():
             "laser_mpi_asymmetric_4", 4, asymmetric_flags))
         compare_fields(asymmetric_parallel, asymmetric_reference)
 
+        # A forward probe must move by at least one representable value in every
+        # nonzero direction.  This ray reaches the x=0.5 block face from one ulp
+        # above it; probe*direction is too small to change x in binary64.  A raw
+        # coordinate addition therefore reselects the departing block and exhausts
+        # the wave cap without another finite segment.
+        subulp_probe_flags = [
+            "mesh/nx1=16", "mesh/nx2=8", "mesh/nx3=1",
+            "meshblock/nx1=8", "meshblock/nx2=8", "meshblock/nx3=1",
+            "laser/beam0_nrays=1",
+            "laser/beam0_origin_x1=0.5000000000000001",
+            "laser/beam0_origin_x2=0.0",
+            "laser/beam0_direction_x1=-1.0e-8",
+            "laser/beam0_direction_x2=1.0",
+            "laser/absorption_coefficient=0.25",
+            "laser/max_segments_per_launch=8",
+            "laser/max_transport_iterations=1",
+            "laser/max_mpi_waves=2",
+            "laser/gpu_aware_mpi=false",
+        ]
+        subulp_reference = fields(run_mpi_case(
+            "laser_mpi_subulp_probe_1", 1, subulp_probe_flags))
+        subulp_parallel = fields(run_mpi_case(
+            "laser_mpi_subulp_probe_2", 2, subulp_probe_flags))
+        compare_fields(subulp_parallel, subulp_reference)
+
         # A nearly boundary-parallel beam crosses many rank regions in two dimensions.
         stress_flags = [
             "mesh/nx1=64", "mesh/nx2=64", "mesh/nx3=1",

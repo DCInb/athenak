@@ -76,8 +76,9 @@ GPU_LOCK_ROOT = Path(
 ) / "dci_3d-gpu-locks"
 OUTPUT_BLOCKS = range(1, 12)
 DEFAULT_PRODUCTION_GATE = CASE_DIR / "production_gate.json"
-PRODUCTION_GATE_SCHEMA = 7
+PRODUCTION_GATE_SCHEMA = 8
 PRODUCTION_RADIATION_C_LIGHT = 30.0
+CALIBRATION_CYCLES = 22
 PRODUCTION_STATUS_SCHEMA = 2
 PRODUCTION_PHASE1_TARGET = 5.0
 PRODUCTION_FINAL_TARGET = 10.0
@@ -131,7 +132,8 @@ def parse_args() -> argparse.Namespace:
         default="validate",
         help=(
             "validate=compact nlim=0, smoke=compact 50-step plus restart, "
-            "calibrate=production mesh nlim=4, production=5+5 ns"
+            f"calibrate=production mesh nlim={CALIBRATION_CYCLES}, "
+            "production=5+5 ns"
         ),
     )
     parser.add_argument("--build", action="store_true")
@@ -1082,6 +1084,11 @@ def prepare_run_dir(run_dir: Path, mode: str) -> None:
                     "--clean only if its sentinel confirms ownership"
                 )
     run_dir.mkdir(parents=True, exist_ok=True)
+    # TranFile provisions each isolated remote lineage with mode 0700.  Keep the
+    # source root identical so the final archive checksum has no permission-only
+    # delta, independent of the interactive shell's umask.
+    if mode == "production":
+        run_dir.chmod(0o700)
     (run_dir / RUN_SENTINEL).write_text(
         "Owned by DCI_3D/run_case.py; safe for this launcher's --clean.\n"
     )
@@ -1243,7 +1250,7 @@ def nonproduction_overrides(
     selected_nlim = {
         "validate": 0,
         "smoke": default_smoke_cycles(radiation_c_light, compact_scale),
-        "calibrate": 4,
+        "calibrate": CALIBRATION_CYCLES,
     }[mode]
     if nlim is not None:
         selected_nlim = nlim

@@ -11,6 +11,8 @@ import test_suite.testutils as testutils
 input_file = "../../../inputs/mhd/two_temperature_laser.athinput"
 reflection_input = "../../../inputs/mhd/two_temperature_laser_reflection.athinput"
 integer_diagnostic_fields = (
+    "waves",
+    "iterations",
     "max_reflections",
     "suppressed_turns",
     "reflection_rearms",
@@ -90,10 +92,12 @@ def test_run():
             "output3/dt=-1.0",
             "output4/dt=-1.0",
         ])
-        completed = laser_diagnostics(appended_log(log_offset))
+        completed_log = appended_log(log_offset)
+        completed = laser_diagnostics(completed_log)
         assert completed["remaining"] == 0.0
         assert completed["remaining_fraction"] == 0.0
         assert_remaining_partition(completed, 0.0, 0.0)
+        assert "laser_remaining_ray:" not in completed_log
 
         # A planar critical surface turns exactly once with hysteresis enabled,
         # then rearms only after returning to the underdense side.
@@ -165,6 +169,9 @@ def test_run():
         assert_remaining_partition(wave, 1.0, 0.0)
         assert wave["remaining_fraction"] == 1.0
         assert wave["wave_remaining_rays"] == 1.0
+        assert wave["waves"] == 1
+        assert wave["iterations"] == 1
+        assert wave_log.count("laser_remaining_ray:") == 1
         assert "Laser transport failed" in wave_log
 
         # A zero reflection allowance reaches the critical surface but may not turn;

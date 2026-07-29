@@ -14,6 +14,7 @@ def laser_diagnostic(
     wave_remaining: float | None = None,
     reflection_remaining: float | None = None,
     residual: float = 0.0,
+    waves: int = 9,
     max_reflections: int = 8,
     suppressed_turns: int = 3,
     reflection_rearms: int = 2,
@@ -38,7 +39,7 @@ def laser_diagnostic(
         f"max_reflections={max_reflections}",
         f"suppressed_turns={suppressed_turns}",
         f"reflection_rearms={reflection_rearms}",
-        "transfers=0", "segments=1",
+        "transfers=0", f"waves={waves}", "iterations=2304", "segments=1",
         "path=1.00000000000000000e+00",
         "dispersion=0.00000000000000000e+00",
     ))
@@ -46,8 +47,9 @@ def laser_diagnostic(
 
 
 def test_schema_and_required_checks_match_launcher():
-    assert gate.SCHEMA == 7
+    assert gate.SCHEMA == 8
     assert run_case.PRODUCTION_GATE_SCHEMA == gate.SCHEMA
+    assert run_case.CALIBRATION_CYCLES == gate.CALIBRATION_CYCLES == 22
     assert "physical_light_speed_sensitivity" in gate.CHECK_NAMES
     assert tuple(run_case.REQUIRED_PRODUCTION_CHECKS) == gate.CHECK_NAMES
 
@@ -127,7 +129,7 @@ def test_cycle_parser(tmp_path):
     assert rows[-1]["cycle"] == 50
 
 
-def test_laser_parser_reads_every_legacy_and_split_diagnostic(tmp_path):
+def test_laser_parser_reads_every_total_and_split_diagnostic(tmp_path):
     log = tmp_path/"phase.log"
     log.write_text(
         "unrelated output\n"
@@ -143,6 +145,8 @@ def test_laser_parser_reads_every_legacy_and_split_diagnostic(tmp_path):
     assert len(rows) == 2
     assert rows[0]["line_number"] == 2
     assert rows[0]["remaining"] == 1.0e-11
+    assert rows[0]["waves"] == 9
+    assert isinstance(rows[0]["waves"], int)
     assert "wave_remaining" not in rows[0]
     assert rows[1]["line_number"] == 4
     assert rows[1]["wave_remaining"] == 2.0e-11
@@ -166,6 +170,28 @@ def test_laser_parser_requires_reflection_behavior_counters(tmp_path):
     assert "max_reflections" in metrics["parse_errors"]["phase"]
 
 
+def test_laser_parser_requires_positive_integral_transport_waves(tmp_path):
+    log = tmp_path/"phase.log"
+    diagnostic = laser_diagnostic(
+        wave_remaining=0.0,
+        reflection_remaining=0.0,
+    )
+    log.write_text(diagnostic.replace(" waves=9", ""))
+    passed, metrics = gate.laser_remainder_metrics({"phase": log}, 1.0e-10)
+    assert not passed
+    assert "waves" in metrics["parse_errors"]["phase"]
+
+    log.write_text(diagnostic.replace("waves=9", "waves=9.5"))
+    passed, metrics = gate.laser_remainder_metrics({"phase": log}, 1.0e-10)
+    assert not passed
+    assert "Invalid laser count waves" in metrics["parse_errors"]["phase"]
+
+    log.write_text(diagnostic.replace("waves=9", "waves=0"))
+    passed, metrics = gate.laser_remainder_metrics({"phase": log}, 1.0e-10)
+    assert not passed
+    assert "Invalid laser count waves" in metrics["parse_errors"]["phase"]
+
+
 def test_laser_remainder_metrics_gate_every_record_and_require_each_log(tmp_path):
     phase1 = tmp_path/"phase1.log"
     phase2 = tmp_path/"phase2.log"
@@ -186,6 +212,7 @@ def test_laser_remainder_metrics_gate_every_record_and_require_each_log(tmp_path
     assert metrics["diagnostic_count"] == 2
     assert metrics["split_diagnostic_count"] == 2
     assert metrics["split_diagnostics_complete"]
+    assert metrics["maximum_observed_transport_waves"] == 9
     assert metrics["maximum_total_remainder_fraction"] == 1.0e-10
     assert 0.999e-10 <= metrics["maximum_split_remainder_fraction"] <= 1.0e-10
 
@@ -223,7 +250,8 @@ def test_laser_remainder_metrics_gate_every_record_and_require_each_log(tmp_path
         "remaining=8.01408963388458183e-04 "
         "residual=2.71917904859369308e-14 active=2067 reflected=3929 "
         "max_reflections=64 suppressed_turns=0 reflection_rearms=0 "
-        "transfers=10890 segments=1965976 path=1.19796497351896141e+04 "
+        "transfers=10890 waves=1024 iterations=262144 segments=1965976 "
+        "path=1.19796497351896141e+04 "
         "dispersion=0.00000000000000000e+00\n"
     )
     passed, metrics = gate.laser_remainder_metrics(
@@ -377,7 +405,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     physical_status = status("smoke", c_light=299.792458)
     physical_status["phase1_mpi_command"] = ["time/nlim=650"]
     calibration_status = status("calibrate")
-    calibration_status["phase1_mpi_command"] = ["time/nlim=4"]
+    calibration_status["phase1_mpi_command"] = ["time/nlim=22"]
     calibration_status["phase1_memory"] = {
         "errors": [],
         "devices": {
@@ -408,7 +436,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         ("rsla_phase1_log", ((0, 0.0, 2e-4), (50, .008, 2e-4))),
         ("rsla_phase2_log", ((50, .008, 2e-4), (60, .01, 2e-4))),
         ("physical_phase1_log", ((0, 0.0, 2e-5), (650, .012, 2e-5))),
-        ("calibration_phase1_log", ((0, 0.0, 2e-4), (4, 8e-4, 2e-4))),
+        ("calibration_phase1_log", ((0, 0.0, 2e-4), (22, 4.4e-3, 2e-4))),
     ):
         path = tmp_path/f"{name}.log"
         text = "".join(
@@ -419,9 +447,10 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
                 remaining=5.0e-11,
                 wave_remaining=2.0e-11,
                 reflection_remaining=3.0e-11,
+                waves=(10 if name == "calibration_phase1_log" else 9),
                 max_reflections=(32 if name == "calibration_phase1_log" else 8),
             )
-            text += diagnostic*(8 if name == "calibration_phase1_log" else 1)
+            text += diagnostic*(44 if name == "calibration_phase1_log" else 1)
         path.write_text(text)
         sources[name] = path
 
@@ -437,6 +466,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
         "<laser>\nbeam0_power = 2e19\n"
         "max_reflections_per_ray = 64\n"
+        "max_mpi_waves = 1024\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")
     sources["production_input"] = deck
     sources["calibration_input"] = deck
@@ -469,23 +499,23 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     assert set(checks) == set(gate.CHECK_NAMES)
     assert all(record["passed"] for record in checks.values()), checks
     memory_check = checks["gpu_memory_60_80_all"]
-    assert memory_check["metrics"]["requested_cycle_limit"] == 4
-    assert memory_check["metrics"]["final_cycle"] == 4
-    assert memory_check["metrics"]["laser_diagnostic_count"] == 8
+    assert memory_check["metrics"]["requested_cycle_limit"] == 22
+    assert memory_check["metrics"]["final_cycle"] == 22
+    assert memory_check["metrics"]["laser_diagnostic_count"] == 44
     assert checks["reduced_light_speed_sensitivity"]["metrics"]["erad_E"] == 0.0
 
-    calibration_status["phase1_mpi_command"] = ["time/nlim=3"]
+    calibration_status["phase1_mpi_command"] = ["time/nlim=21"]
     sources["calibration_status"].write_text(json.dumps(calibration_status))
     checks = gate.evaluate_checks(sources, settings)
     assert not checks["gpu_memory_60_80_all"]["passed"]
-    calibration_status["phase1_mpi_command"] = ["time/nlim=4"]
+    calibration_status["phase1_mpi_command"] = ["time/nlim=22"]
     sources["calibration_status"].write_text(json.dumps(calibration_status))
 
     calibration_log_text = sources["calibration_phase1_log"].read_text()
     sources["calibration_phase1_log"].write_text(
         calibration_log_text.replace(
-            "cycle=4 time=8.00000000e-04",
-            "cycle=3 time=6.00000000e-04",
+            "cycle=22 time=4.40000000e-03",
+            "cycle=21 time=4.20000000e-03",
         )
     )
     checks = gate.evaluate_checks(sources, settings)
@@ -494,8 +524,8 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
 
     sources["calibration_phase1_log"].write_text(
         calibration_log_text.replace(
-            "cycle=4 time=8.00000000e-04",
-            "cycle=5 time=1.00000000e-03",
+            "cycle=22 time=4.40000000e-03",
+            "cycle=23 time=4.60000000e-03",
         )
     )
     checks = gate.evaluate_checks(sources, settings)
@@ -508,6 +538,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
                 remaining=5.0e-11,
                 wave_remaining=2.0e-11,
                 reflection_remaining=3.0e-11,
+                waves=10,
                 max_reflections=32,
             ),
             "",
@@ -523,6 +554,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
             remaining=5.0e-11,
             wave_remaining=2.0e-11,
             reflection_remaining=3.0e-11,
+            waves=10,
             max_reflections=32,
         )
     )
@@ -532,12 +564,16 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     checks = gate.evaluate_checks(sources, settings)
     assert checks["physical_light_speed_sensitivity"]["metrics"]["final_cycle"] == 650
     closure = checks["laser_and_boundary_energy_closure"]
-    assert closure["metrics"]["diagnostic_count"] == 15
+    assert closure["metrics"]["diagnostic_count"] == 51
     assert closure["metrics"]["maximum_remainder_fraction"] == 5.0e-11
     assert closure["metrics"]["maximum_observed_reflections"] == 32
+    assert closure["metrics"]["maximum_observed_transport_waves"] == 10
     assert closure["metrics"]["configured_max_reflections_per_ray"] == 64
     assert closure["metrics"]["maximum_allowed_observed_reflections"] == 32.0
     assert closure["metrics"]["reflection_headroom_passed"]
+    assert closure["metrics"]["configured_max_mpi_waves"] == 1024
+    assert closure["metrics"]["maximum_allowed_observed_transport_waves"] == 512.0
+    assert closure["metrics"]["transport_wave_headroom_passed"]
     assert set(closure["source_ids"]) >= set(gate.LASER_DIAGNOSTIC_SOURCE_IDS)
 
     resolution_phase1_text = sources["resolution_phase1_log"].read_text()
@@ -556,6 +592,36 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     assert not closure["metrics"]["reflection_headroom_passed"]
     sources["resolution_phase1_log"].write_text(resolution_phase1_text)
 
+    sources["resolution_phase1_log"].write_text(
+        resolution_phase1_text
+        + laser_diagnostic(
+            wave_remaining=0.0,
+            reflection_remaining=0.0,
+            waves=512,
+        )
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    closure = checks["laser_and_boundary_energy_closure"]
+    assert closure["passed"]
+    assert closure["metrics"]["maximum_observed_transport_waves"] == 512
+    assert closure["metrics"]["transport_wave_headroom_passed"]
+    sources["resolution_phase1_log"].write_text(resolution_phase1_text)
+
+    sources["resolution_phase1_log"].write_text(
+        resolution_phase1_text
+        + laser_diagnostic(
+            wave_remaining=0.0,
+            reflection_remaining=0.0,
+            waves=513,
+        )
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    closure = checks["laser_and_boundary_energy_closure"]
+    assert not closure["passed"]
+    assert closure["metrics"]["maximum_observed_transport_waves"] == 513
+    assert not closure["metrics"]["transport_wave_headroom_passed"]
+    sources["resolution_phase1_log"].write_text(resolution_phase1_text)
+
     smoke_phase1_text = sources["smoke_phase1_log"].read_text()
     sources["smoke_phase1_log"].write_text(
         smoke_phase1_text
@@ -565,7 +631,8 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "remaining=8.01408963388458183e-04 "
         "residual=2.71917904859369308e-14 active=2067 reflected=3929 "
         "max_reflections=64 suppressed_turns=0 reflection_rearms=0 "
-        "transfers=10890 segments=1965976 path=1.19796497351896141e+04 "
+        "transfers=10890 waves=1024 iterations=262144 segments=1965976 "
+        "path=1.19796497351896141e+04 "
         "dispersion=0.00000000000000000e+00\n"
     )
     checks = gate.evaluate_checks(sources, settings)
@@ -635,6 +702,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "<thermal_radiation>\nc_light = 10\nn_groups = 20\n"
         "<laser>\nbeam0_power = 2e19\n"
         "max_reflections_per_ray = 64\n"
+        "max_mpi_waves = 1024\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")
     checks = gate.evaluate_checks(sources, settings)
     assert not checks["compact_20group_50step"]["passed"]
@@ -642,6 +710,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
         "<laser>\nbeam0_power = 2e19\n"
         "max_reflections_per_ray = 64\n"
+        "max_mpi_waves = 1024\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")
 
     write_history(

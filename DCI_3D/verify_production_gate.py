@@ -16,10 +16,12 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-SCHEMA = 7
+SCHEMA = 8
 PRODUCTION_C_LIGHT = 30.0
 RSLA_COMPARISON_C_LIGHT = 10.0
 PHYSICAL_C_LIGHT = 299.792458
+CALIBRATION_CYCLES = 22
+CALIBRATION_LASER_DIAGNOSTICS = 2*CALIBRATION_CYCLES
 DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE = 1.0e-10
 LASER_DIAGNOSTIC_SOURCE_IDS = (
     "smoke_phase1_log",
@@ -37,6 +39,7 @@ LASER_REQUIRED_FIELDS = (
     "escaped",
     "remaining",
     "residual",
+    "waves",
     "max_reflections",
     "suppressed_turns",
     "reflection_rearms",
@@ -167,7 +170,7 @@ def parse_laser_diagnostics(path: Path) -> list[dict[str, float | int]]:
     integer_fields = {
         "active", "remaining_rays", "reflected", "transfers", "segments",
         "wave_remaining_rays", "reflection_remaining_rays",
-        "max_reflections", "suppressed_turns", "reflection_rearms",
+        "waves", "max_reflections", "suppressed_turns", "reflection_rearms",
     }
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), 1
@@ -203,7 +206,11 @@ def parse_laser_diagnostics(path: Path) -> list[dict[str, float | int]]:
                     f"Nonfinite laser field {name} in {path}:{line_number}"
                 )
             if name in integer_fields:
-                if value < 0.0 or not value.is_integer():
+                if (
+                    value < 0.0
+                    or not value.is_integer()
+                    or (name == "waves" and value < 1.0)
+                ):
                     raise ValueError(
                         f"Invalid laser count {name}={text!r} in "
                         f"{path}:{line_number}"
@@ -266,6 +273,7 @@ def laser_remainder_metrics(
     violation_count = 0
     maximum_residual = 0.0
     maximum_split_mismatch = 0.0
+    maximum_observed_transport_waves = 0
     maximum_observed_reflections = 0
     maximum_suppressed_turns = 0
     maximum_reflection_rearms = 0
@@ -276,6 +284,9 @@ def laser_remainder_metrics(
 
     for source_id, row in samples:
         launched = float(row["launched"])
+        maximum_observed_transport_waves = max(
+            maximum_observed_transport_waves, int(row["waves"])
+        )
         maximum_observed_reflections = max(
             maximum_observed_reflections, int(row["max_reflections"])
         )
@@ -361,6 +372,7 @@ def laser_remainder_metrics(
         "maximum_remainder_fraction": max(maxima.values()),
         "maximum_laser_conservation_residual": maximum_residual,
         "maximum_split_accounting_mismatch": maximum_split_mismatch,
+        "maximum_observed_transport_waves": maximum_observed_transport_waves,
         "maximum_observed_reflections": maximum_observed_reflections,
         "maximum_suppressed_turns": maximum_suppressed_turns,
         "maximum_reflection_rearms": maximum_reflection_rearms,
@@ -734,6 +746,16 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         )
     configured_reflection_cap = int(configured_reflection_cap_value)
     maximum_allowed_observed_reflections = configured_reflection_cap/2.0
+    configured_transport_wave_cap_value = read_deck_value(
+        sources["production_input"], "max_mpi_waves"
+    )
+    if (
+        configured_transport_wave_cap_value <= 0.0
+        or not configured_transport_wave_cap_value.is_integer()
+    ):
+        raise ValueError("Production max_mpi_waves must be a positive integer")
+    configured_transport_wave_cap = int(configured_transport_wave_cap_value)
+    maximum_allowed_observed_transport_waves = configured_transport_wave_cap/2.0
     laser_remainder_tolerance = float(settings.get(
         "laser_remainder_relative_tolerance",
         DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE,
@@ -746,11 +768,16 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         laser_remainder["maximum_observed_reflections"]
         <= maximum_allowed_observed_reflections
     )
+    transport_wave_headroom_pass = (
+        laser_remainder["maximum_observed_transport_waves"]
+        <= maximum_allowed_observed_transport_waves
+    )
     energy_pass = (
         energy_relative <= settings["energy_relative_tolerance"]
         and abs(incident_joules-10000.0) <= 1.0e-9
         and laser_remainder_pass
         and reflection_headroom_pass
+        and transport_wave_headroom_pass
     )
     checks["laser_and_boundary_energy_closure"] = evidence_check(
         energy_pass,
@@ -762,6 +789,10 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         maximum_allowed_observed_reflections=
             maximum_allowed_observed_reflections,
         reflection_headroom_passed=reflection_headroom_pass,
+        configured_max_mpi_waves=configured_transport_wave_cap,
+        maximum_allowed_observed_transport_waves=
+            maximum_allowed_observed_transport_waves,
+        transport_wave_headroom_passed=transport_wave_headroom_pass,
         **laser_remainder)
 
     ch = history["CH_mass"]
@@ -903,9 +934,11 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     memory_pass = (
         same_artifacts and calibration_status.get("mode") == "calibrate"
         and calibration_status.get("phase1_exit_code") == 0
-        and command_override(calibration_status, 1, "time/nlim") == "4"
-        and max(int(row["cycle"]) for row in calibration1) == 4
-        and calibration_laser_count == 8
+        and command_override(calibration_status, 1, "time/nlim") == str(
+            CALIBRATION_CYCLES
+        )
+        and max(int(row["cycle"]) for row in calibration1) == CALIBRATION_CYCLES
+        and calibration_laser_count == CALIBRATION_LASER_DIAGNOSTICS
         and len(devices) == 8 and not memory.get("errors")
         and all(isinstance(record, dict)
                 and "V100" in str(record.get("name", ""))
@@ -916,10 +949,10 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     checks["gpu_memory_60_80_all"] = evidence_check(
         memory_pass, ["calibration_status", "calibration_phase1_log"],
         peak_fractions=fractions, device_count=len(devices),
-        requested_cycle_limit=4,
+        requested_cycle_limit=CALIBRATION_CYCLES,
         final_cycle=max(int(row["cycle"]) for row in calibration1),
         laser_diagnostic_count=calibration_laser_count,
-        required_laser_diagnostic_count=8)
+        required_laser_diagnostic_count=CALIBRATION_LASER_DIAGNOSTICS)
     return checks
 
 

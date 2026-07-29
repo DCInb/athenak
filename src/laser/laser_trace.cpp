@@ -84,7 +84,11 @@ Real ProbeForward(Real coordinate, Real direction, Real distance) {
   Real result = coordinate+distance*direction;
   if (result == coordinate) {
     Real limit = (direction > 0.0) ? kRealMaximum : -kRealMaximum;
+#if SINGLE_PRECISION_ENABLED
+    result = nextafterf(coordinate, limit);
+#else
     result = nextafter(coordinate, limit);
+#endif
   }
   return result;
 }
@@ -928,9 +932,9 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               // neighboring ranks exchange a face-resident ray forever without
               // tracing a finite segment.
               Real reflected_probe = offset;
-              Real reflected_x = x(r)+reflected_probe*nx(r);
-              Real reflected_y = y(r)+reflected_probe*ny(r);
-              Real reflected_z = z(r)+reflected_probe*nz(r);
+              Real reflected_x = ProbeForward(x(r), nx(r), reflected_probe);
+              Real reflected_y = ProbeForward(y(r), ny(r), reflected_probe);
+              Real reflected_z = ProbeForward(z(r), nz(r), reflected_probe);
               int reflected_m = FindLocalBlock(
                   sizes, nmb, reflected_x, reflected_y, reflected_z,
                   multi_d, three_d);
@@ -982,11 +986,14 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
             }
 
             // Probe infinitesimally into the destination so an exact block face is
-            // assigned to the block on the forward side of the ray.
+            // assigned to the block on the forward side of the ray.  A tangential
+            // component can make probe*direction smaller than half an ulp, so use
+            // ProbeForward rather than allowing the classified point to remain on
+            // the departing face.
             Real probe = 128.0*machine_eps*fmax(scale, 1.0);
-            Real px = x(r)+probe*nx(r);
-            Real py = y(r)+probe*ny(r);
-            Real pz = z(r)+probe*nz(r);
+            Real px = ProbeForward(x(r), nx(r), probe);
+            Real py = ProbeForward(y(r), ny(r), probe);
+            Real pz = ProbeForward(z(r), nz(r), probe);
             int new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
 
             if (new_m < 0 && periodic) {
@@ -1000,9 +1007,9 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 if (z(r) <= domain.x3min+tolerance && nz(r) < 0.0) z(r) = domain.x3max;
                 if (z(r) >= domain.x3max-tolerance && nz(r) > 0.0) z(r) = domain.x3min;
               }
-              px = x(r)+probe*nx(r);
-              py = y(r)+probe*ny(r);
-              pz = z(r)+probe*nz(r);
+              px = ProbeForward(x(r), nx(r), probe);
+              py = ProbeForward(y(r), ny(r), probe);
+              pz = ProbeForward(z(r), nz(r), probe);
               new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
             }
 
@@ -1422,9 +1429,9 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             }
 
             Real probe = 128.0*machine_eps*fmax(scale, 1.0);
-            Real px = x(r)+probe*nx(r);
-            Real py = y(r)+probe*ny(r);
-            Real pz = z(r)+probe*nz(r);
+            Real px = ProbeForward(x(r), nx(r), probe);
+            Real py = ProbeForward(y(r), ny(r), probe);
+            Real pz = ProbeForward(z(r), nz(r), probe);
             int new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
             if (new_m < 0 && periodic) {
               if (x(r) <= domain.x1min+tolerance && nx(r) < 0.0) x(r) = domain.x1max;
@@ -1437,9 +1444,9 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
                 if (z(r) <= domain.x3min+tolerance && nz(r) < 0.0) z(r) = domain.x3max;
                 if (z(r) >= domain.x3max-tolerance && nz(r) > 0.0) z(r) = domain.x3min;
               }
-              px = x(r)+probe*nx(r);
-              py = y(r)+probe*ny(r);
-              pz = z(r)+probe*nz(r);
+              px = ProbeForward(x(r), nx(r), probe);
+              py = ProbeForward(y(r), ny(r), probe);
+              pz = ProbeForward(z(r), nz(r), probe);
               new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
             }
 
@@ -1504,6 +1511,71 @@ void Laser::FinalizeDiagnostics() {
   Kokkos::deep_copy(host_reflections, ray_reflections_);
   Kokkos::deep_copy(host_path, ray_path_length_);
   Kokkos::deep_copy(host_dispersion, ray_dispersion_error_);
+
+  // A work-cap failure is otherwise reported only as an aggregate.  Preserve the
+  // owner-local terminal state so a face-stagnant or physically trapped ray can be
+  // distinguished without rebuilding a special diagnostic binary after the fact.
+  // These extra host copies occur only on a failing rank.
+  if (host_count(0) > 0) {
+    auto host_status = Kokkos::create_mirror_view(ray_status);
+    auto host_x = Kokkos::create_mirror_view(ray_x);
+    auto host_y = Kokkos::create_mirror_view(ray_y);
+    auto host_z = Kokkos::create_mirror_view(ray_z);
+    auto host_nx = Kokkos::create_mirror_view(ray_nx);
+    auto host_ny = Kokkos::create_mirror_view(ray_ny);
+    auto host_nz = Kokkos::create_mirror_view(ray_nz);
+    auto host_power = Kokkos::create_mirror_view(ray_power);
+    auto host_power0 = Kokkos::create_mirror_view(ray_power0_);
+    auto host_gid = Kokkos::create_mirror_view(ray_gid);
+    auto host_i = Kokkos::create_mirror_view(ray_i);
+    auto host_j = Kokkos::create_mirror_view(ray_j);
+    auto host_k = Kokkos::create_mirror_view(ray_k);
+    auto host_destination = Kokkos::create_mirror_view(ray_destination_rank_);
+    auto host_armed = Kokkos::create_mirror_view(ray_reflection_armed_);
+    auto host_turning_density =
+        Kokkos::create_mirror_view(ray_last_turning_density_);
+    Kokkos::deep_copy(host_status, ray_status);
+    Kokkos::deep_copy(host_x, ray_x);
+    Kokkos::deep_copy(host_y, ray_y);
+    Kokkos::deep_copy(host_z, ray_z);
+    Kokkos::deep_copy(host_nx, ray_nx);
+    Kokkos::deep_copy(host_ny, ray_ny);
+    Kokkos::deep_copy(host_nz, ray_nz);
+    Kokkos::deep_copy(host_power, ray_power);
+    Kokkos::deep_copy(host_power0, ray_power0_);
+    Kokkos::deep_copy(host_gid, ray_gid);
+    Kokkos::deep_copy(host_i, ray_i);
+    Kokkos::deep_copy(host_j, ray_j);
+    Kokkos::deep_copy(host_k, ray_k);
+    Kokkos::deep_copy(host_destination, ray_destination_rank_);
+    Kokkos::deep_copy(host_armed, ray_reflection_armed_);
+    Kokkos::deep_copy(host_turning_density, ray_last_turning_density_);
+    std::ios::fmtflags old_flags = std::cout.flags();
+    std::streamsize old_precision = std::cout.precision();
+    for (int r = 0; r < nrays_; ++r) {
+      if (host_status(r) != static_cast<int>(RayStatus::remaining)) continue;
+      std::cout << std::scientific << std::setprecision(17)
+                << "laser_remaining_ray: rank=" << global_variable::my_rank
+                << " wave=" << mpi_wave_
+                << " ray=" << r
+                << " status=" << host_status(r)
+                << " gid=" << host_gid(r)
+                << " cell=" << host_i(r) << "," << host_j(r) << "," << host_k(r)
+                << " destination_rank=" << host_destination(r)
+                << " x=" << host_x(r) << "," << host_y(r) << "," << host_z(r)
+                << " n=" << host_nx(r) << "," << host_ny(r) << "," << host_nz(r)
+                << " power=" << host_power(r)
+                << " initial_power=" << host_power0(r)
+                << " path=" << host_path(r)
+                << " segments=" << host_segments(r)
+                << " reflections=" << host_reflections(r)
+                << " reflection_armed=" << host_armed(r)
+                << " last_turning_density=" << host_turning_density(r)
+                << std::endl;
+    }
+    std::cout.flags(old_flags);
+    std::cout.precision(old_precision);
+  }
   Real global_diag[6] = {
       host_diag(0), host_diag(1), host_diag(2),
       host_diag(3), host_diag(4), host_diag(5)};
@@ -1582,7 +1654,9 @@ void Laser::FinalizeDiagnostics() {
   diagnostics_.suppressed_turns = global_count[6];
   diagnostics_.reflection_rearms = global_count[7];
   diagnostics_.off_rank_transfers = global_count[2];
-  diagnostics_.transport_iterations = max_transport_iterations_*(mpi_wave_+1);
+  diagnostics_.transport_waves = mpi_wave_+1;
+  diagnostics_.transport_iterations =
+      max_transport_iterations_*diagnostics_.transport_waves;
   diagnostics_.traced_segments = segment_count;
   diagnostics_.total_path_length = path_length;
   diagnostics_.max_dispersion_error = max_dispersion_error;
@@ -1628,6 +1702,8 @@ void Laser::FinalizeDiagnostics() {
               << " suppressed_turns=" << diagnostics_.suppressed_turns
               << " reflection_rearms=" << diagnostics_.reflection_rearms
               << " transfers=" << diagnostics_.off_rank_transfers
+              << " waves=" << diagnostics_.transport_waves
+              << " iterations=" << diagnostics_.transport_iterations
               << " segments=" << diagnostics_.traced_segments
               << " path=" << diagnostics_.total_path_length
               << " dispersion=" << diagnostics_.max_dispersion_error << std::endl;
