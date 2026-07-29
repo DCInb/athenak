@@ -147,6 +147,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     ray_beam_("laser-ray-beam", 1), beam_power_("laser-beam-power", 1),
     ray_segments_("laser-ray-segments", 1),
     ray_reflections_("laser-ray-reflections", 1),
+    ray_reflection_armed_("laser-ray-reflection-armed", 1),
+    ray_last_turning_density_("laser-ray-last-turning-density", 1),
     ray_path_length_("laser-ray-path", 1),
     ray_kx_("laser-ray-kx", 1), ray_ky_("laser-ray-ky", 1),
     ray_kz_("laser-ray-kz", 1),
@@ -162,7 +164,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     mpi_host_send_packets_("laser-mpi-host-send-packets", 1),
     mpi_host_recv_packets_("laser-mpi-host-recv-packets", 1),
     device_diagnostics_("laser-diagnostics", 6),
-    device_counters_("laser-counters", 6),
+    device_counters_("laser-counters", 8),
     cumulative_energy_start_("laser-energy-start", 1, 1, 1, 1, 1),
     pmy_pack_(ppack) {
   if (ppack->pmhd == nullptr || ppack->pmhd->ptwo_temp == nullptr) {
@@ -298,6 +300,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       "laser", "max_reflections_per_ray", 8);
   reflection_offset_fraction_ = pin->GetOrAddReal(
       "laser", "reflection_offset_fraction", 1.0e-10);
+  reflection_hysteresis_fraction_ = pin->GetOrAddReal(
+      "laser", "reflection_hysteresis_fraction", 0.0);
   refractive_cell_fraction_ = pin->GetOrAddReal(
       "laser", "refractive_cell_fraction", 0.25);
   refractive_curvature_fraction_ = pin->GetOrAddReal(
@@ -321,8 +325,12 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
       conservation_tolerance_,
       static_cast<Real>(128.0)*std::numeric_limits<Real>::epsilon());
   if (max_reflections_per_ray_ < 0 ||
-      !Finite(reflection_offset_fraction_) || reflection_offset_fraction_ <= 0.0) {
-    LaserInputError("reflection limit must be non-negative and offset must be positive");
+      !Finite(reflection_offset_fraction_) || reflection_offset_fraction_ <= 0.0 ||
+      !Finite(reflection_hysteresis_fraction_) ||
+      reflection_hysteresis_fraction_ < 0.0 ||
+      reflection_hysteresis_fraction_ >= 1.0) {
+    LaserInputError("reflection limit must be non-negative, offset must be positive, "
+                    "and hysteresis fraction must lie in [0,1)");
   }
   if (critical_reflection_ &&
       (!Finite(length_scale_cgs_) || !(length_scale_cgs_ > 0.0) ||
@@ -543,6 +551,8 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ray_beam_, nrays_); Kokkos::realloc(beam_power_, nbeams);
   Kokkos::realloc(ray_segments_, nrays_);
   Kokkos::realloc(ray_reflections_, nrays_);
+  Kokkos::realloc(ray_reflection_armed_, nrays_);
+  Kokkos::realloc(ray_last_turning_density_, nrays_);
   Kokkos::realloc(ray_path_length_, nrays_);
   Kokkos::realloc(ray_kx_, nrays_); Kokkos::realloc(ray_ky_, nrays_);
   Kokkos::realloc(ray_kz_, nrays_);

@@ -2,14 +2,14 @@
 
 The first production attempt exposed a hidden terminal-ray loss: with one allowed
 critical-surface reflection, roughly 44% of launched power was classified as
-`remaining`.  That quantity was included in the old accounting residual but was neither
-deposited nor escaped.  The run was stopped at `t=0.00152 ns`, the causes were split in
-the diagnostics, and non-negligible remainder was made fatal.
+`remaining`.  That power was included in the old accounting residual but was neither
+deposited nor escaped.  The run was stopped at `t=0.00152 ns`, cause-specific remainder
+diagnostics were added, and any remainder above `1e-10` of launched power became fatal.
 
-All sweeps below used eight V100 ranks, 4,096 Gaussian rays, the production CH/He tables,
-straight transport, and one complete RK2 cycle.  Every reported wave remainder was zero.
+## Initial-condition cap sweep
 
-## Reflection-cap sweep
+The first sweep used eight V100 ranks, 4,096 Gaussian rays, the production CH/He tables,
+straight transport, and one complete RK2 cycle.
 
 | Mesh | Reflection cap | Maximum reflection remainder / launched | Result |
 |---|---:|---:|---|
@@ -23,28 +23,55 @@ straight transport, and one complete RK2 cycle.  Every reported wave remainder w
 | 500 x 256 x 256 | 32 | 0 | passed |
 | 500 x 256 x 256 | 64 | 0 | identical to cap 32 |
 
-The production deck retains the doubled converged cap of 64.  This is a maximum, so it
-does not add iterations once all rays have deposited or escaped.  Although 64 MPI waves
-already produced zero wave remainder in every sweep, production retains the code default
-of 1,024 as a decomposition-safety margin.
+This established the initial hard-limit requirement but did not prove evolved-state
+convergence.  At `200 x 128 x 128`, a no-hysteresis 100-cycle smoke run later reached
+64 reflections on one ray at cycle 46, leaving `5.6401e-5` of launched power.  Its
+33,351 aggregate turns, versus about two turns per ray on the coarser mesh, and much
+shorter distance per turn identify cell-local critical-surface chatter rather than a
+physical 64-bounce trajectory.
 
-## Turning-offset sweep
+## Turning-surface rearm
 
-The production-layout cap-64 results around the selected offset were:
+After a specular turn, a ray is disarmed and moved a small distance toward the underdense
+side along the surface normal.  It rearms only after traversing one complete segment for
+which the reconstructed electron density stays below the saved turning density by the
+configured hysteresis fraction.  The armed state and saved cutoff migrate with the ray
+across MPI ranks.  A forward fractional-cell lookup probe assigns a reflected ray to the
+MeshBlock on its direction side, preventing zero-distance rank-boundary ping-pong.
 
-| Offset (cell widths) | Deposited power | Escaped power | Total path |
-|---:|---:|---:|---:|
-| 1e-6 | 1.818173737908249e-3 | 8.080273568309e-9 | 9.512684551505e3 |
-| 1e-5 | 1.818173736470490e-3 | 8.081711326555e-9 | 9.512684405597e3 |
-| 1e-4 | 1.818173722078494e-3 | 8.096103323855e-9 | 9.512702916225e3 |
+The selected hysteresis is `1e-2`; the selected normal offset is `1e-5` cell widths.
+Cap 64 remains a hard failure guard, not the mechanism used to terminate chatter.
 
-The 1e-5 and 1e-6 results differ by less than `1e-8` of launched power and less than
-`2e-8` in relative total path.  The selected `1e-5` offset is therefore in the converged
-small-offset regime without relying on a machine-epsilon displacement.
+## Evolved-state sweep
+
+The matched runs below used the same final CUDA binary, `200 x 128 x 128` uniform cells,
+eight V100s, and 100 RK2 cycles.  Every passing run contains 200 laser solves with zero
+total, wave, and reflection remainder and maximum conservation residual below `6.1e-14`.
+Values are compared at the common history time `t=0.002 ns`; incident laser energy by
+that time is `3.636363636e-6` code units.
+
+| Variant | Value | Result | Max turns/ray | Deposited energy at 0.002 ns | Difference / incident energy |
+|---|---:|---|---:|---:|---:|
+| no hysteresis | 0 | rejected at cycle 46 | 64 | n/a | n/a |
+| hysteresis | 0.005 | passed | 17 | 3.116962219964e-6 | 7.17e-4 vs selected |
+| hysteresis | **0.010** | **passed, selected** | 17 | 3.119567670020e-6 | 0 |
+| hysteresis | 0.020 | passed | 18 | 3.119734162583e-6 | 4.58e-5 vs selected |
+| reflection cap | 128 | passed | 17 | 3.119299138743e-6 | 7.38e-5 vs cap 64 |
+| normal offset | 1e-6 | passed | 17 | 3.112486356308e-6 | 1.95e-3 vs selected |
+| normal offset | **1e-5** | **passed, selected** | 17 | 3.119567670020e-6 | 0 |
+| normal offset | 1e-4 | passed | 19 | 3.126739791916e-6 | 1.97e-3 vs selected |
+
+The 0.5%, 1%, and 2% hysteresis band is converged below `1e-3` of incident energy.  Cap
+64 and 128 agree well below that level and the selected run uses at most 17 turns, giving
+more than a factor-three guard margin.  A decade offset change on either side perturbs
+cumulative deposition by less than `2e-3` of incident energy, much less than the spatial
+resolution uncertainty, while retaining zero terminal power.
 
 ## Production acceptance
 
-The binary prints total, MPI-wave, and reflection-cap remainder power and ray counts for
-every laser solve.  It exits nonzero when total remainder exceeds `1e-10` of launched
-power.  Gate schema 5 independently parses every smoke-phase laser record, requires the
-split diagnostics, and applies the same remainder, accounting, and conservation limit.
+Each laser solve prints total and cause-specific remainder power/counts, maximum turns
+per ray, suppressed same-surface candidate segments, and rearm count.  Gate schema 6
+parses every laser record from baseline, doubled-resolution, reduced-light-speed,
+physical-light-speed, and calibration evidence.  It requires split accounting and
+residuals at or below `1e-10`, zero terminal power, and an observed maximum no greater
+than half the configured reflection cap (32 for production cap 64).

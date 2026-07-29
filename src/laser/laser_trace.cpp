@@ -314,6 +314,8 @@ void Laser::InitializeRays() {
   auto beam_index = ray_beam_;
   auto beam_power = beam_power_;
   auto segments = ray_segments_; auto reflections = ray_reflections_;
+  auto reflection_armed = ray_reflection_armed_;
+  auto last_turning_density = ray_last_turning_density_;
   auto path = ray_path_length_;
   auto destination_rank = ray_destination_rank_;
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
@@ -342,6 +344,8 @@ void Laser::InitializeRays() {
         power(r) = power0(r);
         segments(r) = 0;
         reflections(r) = 0;
+        reflection_armed(r) = 1;
+        last_turning_density(r) = 0.0;
         path(r) = 0.0;
         destination_rank(r) = -1;
         gid(r) = -1; ci(r) = is; cj(r) = js; ck(r) = ks;
@@ -571,6 +575,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   auto status = ray_status; auto segments = ray_segments_;
   auto destination_rank = ray_destination_rank_;
   auto reflections = ray_reflections_;
+  auto reflection_armed = ray_reflection_armed_;
+  auto last_turning_density = ray_last_turning_density_;
   auto path = ray_path_length_; auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
   auto primitive = pmy_pack_->pmhd->w0;
@@ -599,6 +605,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   bool oblique_turning = oblique_turning_;
   int max_reflections = max_reflections_per_ray_;
   Real reflection_offset_fraction = reflection_offset_fraction_;
+  Real reflection_hysteresis_fraction = reflection_hysteresis_fraction_;
   int seg_per_launch = max_segments_per_launch_;
   bool use_materials = use_material_mixture_;
   auto material_mixture = material_mixture_;
@@ -663,7 +670,9 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
             }
             ds = fmax(ds, 0.0);
             bool turning_point = false;
+            bool rearm_after_segment = false;
             Real normal_x = 0.0, normal_y = 0.0, normal_z = 0.0;
+            Real current_turning_density = 0.0;
             if (reflect_at_critical) {
               Real number_scale = density_scale_cgs*electron_number_per_gram;
               Real ne_center;
@@ -719,33 +728,54 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                        primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
                 }
               }
+              Real center_x = size.x1min + (i-is+0.5)*size.dx1;
+              Real center_y = size.x2min + (j-js+0.5)*size.dx2;
+              Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
+              Real electron_density = ne_center+grad_x*(x(r)-center_x);
+              if (multi_d) electron_density += grad_y*(y(r)-center_y);
+              if (three_d) electron_density += grad_z*(z(r)-center_z);
+              Real approach = grad_x*nx(r) + grad_y*ny(r) + grad_z*nz(r);
+              if (reflection_armed(r) == 0) {
+                Real rearm_density = (1.0-reflection_hysteresis_fraction)*
+                                     last_turning_density(r);
+                Real density_at_face = electron_density+approach*ds;
+                // Rearm only after one complete, finite segment stays below the
+                // saved cutoff band.  Deferring the state change until the segment
+                // ends prevents an immediate zero-distance turn against a rotated
+                // cell-local normal, and also works in a uniform underdense cavity.
+                rearm_after_segment = ds > tolerance &&
+                    electron_density < rearm_density &&
+                    density_at_face < rearm_density;
+              }
+
               Real grad_norm = sqrt(SQR(grad_x)+SQR(grad_y)+SQR(grad_z));
               if (grad_norm > 0.0) {
                 normal_x = grad_x/grad_norm;
                 normal_y = grad_y/grad_norm;
                 normal_z = grad_z/grad_norm;
-                Real center_x = size.x1min + (i-is+0.5)*size.dx1;
-                Real center_y = size.x2min + (j-js+0.5)*size.dx2;
-                Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
-                Real electron_density = ne_center+grad_x*(x(r)-center_x);
-                if (multi_d) electron_density += grad_y*(y(r)-center_y);
-                if (three_d) electron_density += grad_z*(z(r)-center_z);
-                Real approach = grad_x*nx(r) + grad_y*ny(r) + grad_z*nz(r);
                 Real cosine = fabs(nx(r)*normal_x + ny(r)*normal_y +
                                    nz(r)*normal_z);
                 Real critical_density =
                     CriticalDensity(wavelength(r)*length_scale_cgs);
                 Real turning_density = critical_density*
                     (oblique_turning ? SQR(cosine) : 1.0);
+                current_turning_density = turning_density;
                 Real density_tolerance = 128.0*machine_eps*
                     fmax(turning_density, 1.0);
                 if (approach > 0.0 && turning_density > 0.0) {
                   Real density_at_face = electron_density + approach*ds;
-                  if (electron_density >= turning_density-density_tolerance) {
+                  bool starts_at_turn =
+                      electron_density >= turning_density-density_tolerance;
+                  bool crosses_turn =
+                      density_at_face >= turning_density-density_tolerance;
+                  if (reflection_armed(r) == 0) {
+                    if (starts_at_turn || crosses_turn) {
+                      Kokkos::atomic_inc(&counters(6));
+                    }
+                  } else if (starts_at_turn) {
                     ds = 0.0;
                     turning_point = true;
-                  } else if (density_at_face >=
-                             turning_density-density_tolerance) {
+                  } else if (crosses_turn) {
                     ds = fmin(fmax((turning_density-electron_density)/approach,
                                    0.0), ds);
                     turning_point = true;
@@ -847,6 +877,11 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               status(r) = static_cast<int>(RayStatus::absorbed);
               break;
             }
+            if (rearm_after_segment) {
+              reflection_armed(r) = 1;
+              last_turning_density(r) = 0.0;
+              Kokkos::atomic_inc(&counters(7));
+            }
             if (turning_point) {
               if (reflections(r) >= max_reflections) {
                 status(r) = static_cast<int>(RayStatus::remaining);
@@ -867,27 +902,53 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               nz(r) /= direction_norm;
               reflections(r) += 1;
               Kokkos::atomic_inc(&counters(1));
+              if (reflection_hysteresis_fraction > 0.0) {
+                reflection_armed(r) = 0;
+                last_turning_density(r) = current_turning_density;
+              }
 
               Real offset = fmax(reflection_offset_fraction*scale,
                                   128.0*machine_eps*fmax(scale, 1.0));
-              x(r) += offset*nx(r);
-              y(r) += offset*ny(r);
-              z(r) += offset*nz(r);
-              int reflected_m =
-                  FindLocalBlock(sizes, nmb, x(r), y(r), z(r), multi_d, three_d);
+              if (reflection_hysteresis_fraction > 0.0) {
+                // Move into the underdense side by a fixed normal distance.  An
+                // offset along a nearly tangent reflected direction has vanishing
+                // normal separation and can immediately retrigger against a
+                // cell-to-cell change in the reconstructed critical surface.
+                x(r) -= offset*normal_x;
+                y(r) -= offset*normal_y;
+                z(r) -= offset*normal_z;
+              } else {
+                // Preserve the legacy position update when rearm hysteresis is off.
+                x(r) += offset*nx(r);
+                y(r) += offset*ny(r);
+                z(r) += offset*nz(r);
+              }
+              // Resolve an exact cell/MeshBlock face on the forward side of the
+              // reflected direction.  Assigning the unprobed offset point can make
+              // neighboring ranks exchange a face-resident ray forever without
+              // tracing a finite segment.
+              Real reflected_probe = offset;
+              Real reflected_x = x(r)+reflected_probe*nx(r);
+              Real reflected_y = y(r)+reflected_probe*ny(r);
+              Real reflected_z = z(r)+reflected_probe*nz(r);
+              int reflected_m = FindLocalBlock(
+                  sizes, nmb, reflected_x, reflected_y, reflected_z,
+                  multi_d, three_d);
               if (reflected_m < 0) {
                 int reflected_gid = FindGlobalBlock(
-                    global_blocks, nmb_total, x(r), y(r), z(r), multi_d, three_d);
+                    global_blocks, nmb_total, reflected_x, reflected_y, reflected_z,
+                    multi_d, three_d);
                 if (reflected_gid >= 0 &&
                     global_blocks(reflected_gid).rank != my_rank) {
                   LaserBlockInfo block = global_blocks(reflected_gid);
                   gid(r) = block.gid;
                   destination_rank(r) = block.rank;
-                  ci(r) = ActiveCellIndex(x(r), block.x1min, block.dx1, is, ie);
+                  ci(r) = ActiveCellIndex(
+                      reflected_x, block.x1min, block.dx1, is, ie);
                   cj(r) = multi_d ? ActiveCellIndex(
-                      y(r), block.x2min, block.dx2, js, je) : js;
+                      reflected_y, block.x2min, block.dx2, js, je) : js;
                   ck(r) = three_d ? ActiveCellIndex(
-                      z(r), block.x3min, block.dx3, ks, ke) : ks;
+                      reflected_z, block.x3min, block.dx3, ks, ke) : ks;
                   status(r) = static_cast<int>(RayStatus::off_rank);
                   Kokkos::atomic_inc(&counters(2));
                 } else if (reflected_gid < 0) {
@@ -900,13 +961,13 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 break;
               }
               gid(r) = gids(reflected_m);
-              ci(r) = ActiveCellIndex(x(r), sizes(reflected_m).x1min,
+              ci(r) = ActiveCellIndex(reflected_x, sizes(reflected_m).x1min,
                                       sizes(reflected_m).dx1, is, ie);
               cj(r) = multi_d ? ActiveCellIndex(
-                  y(r), sizes(reflected_m).x2min,
+                  reflected_y, sizes(reflected_m).x2min,
                   sizes(reflected_m).dx2, js, je) : js;
               ck(r) = three_d ? ActiveCellIndex(
-                  z(r), sizes(reflected_m).x3min,
+                  reflected_z, sizes(reflected_m).x3min,
                   sizes(reflected_m).dx3, ks, ke) : ks;
               continue;
             }
@@ -1434,24 +1495,29 @@ void Laser::FinalizeDiagnostics() {
   auto host_diag = Kokkos::create_mirror_view(device_diagnostics_);
   auto host_count = Kokkos::create_mirror_view(device_counters_);
   auto host_segments = Kokkos::create_mirror_view(ray_segments_);
+  auto host_reflections = Kokkos::create_mirror_view(ray_reflections_);
   auto host_path = Kokkos::create_mirror_view(ray_path_length_);
   auto host_dispersion = Kokkos::create_mirror_view(ray_dispersion_error_);
   Kokkos::deep_copy(host_diag, device_diagnostics_);
   Kokkos::deep_copy(host_count, device_counters_);
   Kokkos::deep_copy(host_segments, ray_segments_);
+  Kokkos::deep_copy(host_reflections, ray_reflections_);
   Kokkos::deep_copy(host_path, ray_path_length_);
   Kokkos::deep_copy(host_dispersion, ray_dispersion_error_);
   Real global_diag[6] = {
       host_diag(0), host_diag(1), host_diag(2),
       host_diag(3), host_diag(4), host_diag(5)};
-  int global_count[6] = {
+  int global_count[8] = {
       host_count(0), host_count(1), host_count(2),
-      host_count(3), host_count(4), host_count(5)};
+      host_count(3), host_count(4), host_count(5),
+      host_count(6), host_count(7)};
   int segment_count = 0;
+  int max_reflections = 0;
   Real path_length = 0.0;
   Real max_dispersion_error = 0.0;
   for (int r = 0; r < nrays_; ++r) {
     segment_count += host_segments(r);
+    max_reflections = std::max(max_reflections, host_reflections(r));
     path_length += host_path(r);
     max_dispersion_error = fmax(max_dispersion_error, host_dispersion(r));
   }
@@ -1459,19 +1525,24 @@ void Laser::FinalizeDiagnostics() {
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {
     Real reduced_diag[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    int reduced_count[6] = {0, 0, 0, 0, 0, 0};
+    int reduced_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int reduced_segments = 0;
+    int reduced_max_reflections = 0;
     Real reduced_path = 0.0;
     Real reduced_dispersion_error = 0.0;
     int ierr = MPI_Allreduce(global_diag, reduced_diag, 6, MPI_ATHENA_REAL,
                              MPI_SUM, mpi_comm_);
     if (ierr == MPI_SUCCESS) {
-      ierr = MPI_Allreduce(global_count, reduced_count, 6, MPI_INT,
+      ierr = MPI_Allreduce(global_count, reduced_count, 8, MPI_INT,
                            MPI_SUM, mpi_comm_);
     }
     if (ierr == MPI_SUCCESS) {
       ierr = MPI_Allreduce(&segment_count, &reduced_segments, 1, MPI_INT,
                            MPI_SUM, mpi_comm_);
+    }
+    if (ierr == MPI_SUCCESS) {
+      ierr = MPI_Allreduce(&max_reflections, &reduced_max_reflections, 1,
+                           MPI_INT, MPI_MAX, mpi_comm_);
     }
     if (ierr == MPI_SUCCESS) {
       ierr = MPI_Allreduce(&path_length, &reduced_path, 1, MPI_ATHENA_REAL,
@@ -1488,11 +1559,10 @@ void Laser::FinalizeDiagnostics() {
       MPI_Abort(MPI_COMM_WORLD, 1);
       std::exit(EXIT_FAILURE);
     }
-    for (int n = 0; n < 6; ++n) {
-      global_diag[n] = reduced_diag[n];
-      global_count[n] = reduced_count[n];
-    }
+    for (int n = 0; n < 6; ++n) global_diag[n] = reduced_diag[n];
+    for (int n = 0; n < 8; ++n) global_count[n] = reduced_count[n];
     segment_count = reduced_segments;
+    max_reflections = reduced_max_reflections;
     path_length = reduced_path;
     max_dispersion_error = reduced_dispersion_error;
   }
@@ -1508,6 +1578,9 @@ void Laser::FinalizeDiagnostics() {
   diagnostics_.wave_remaining_rays = global_count[4];
   diagnostics_.reflection_remaining_rays = global_count[5];
   diagnostics_.reflected_rays = global_count[1];
+  diagnostics_.max_reflections = max_reflections;
+  diagnostics_.suppressed_turns = global_count[6];
+  diagnostics_.reflection_rearms = global_count[7];
   diagnostics_.off_rank_transfers = global_count[2];
   diagnostics_.transport_iterations = max_transport_iterations_*(mpi_wave_+1);
   diagnostics_.traced_segments = segment_count;
@@ -1551,6 +1624,9 @@ void Laser::FinalizeDiagnostics() {
               << " reflection_remaining_rays="
               << diagnostics_.reflection_remaining_rays
               << " reflected=" << diagnostics_.reflected_rays
+              << " max_reflections=" << diagnostics_.max_reflections
+              << " suppressed_turns=" << diagnostics_.suppressed_turns
+              << " reflection_rearms=" << diagnostics_.reflection_rearms
               << " transfers=" << diagnostics_.off_rank_transfers
               << " segments=" << diagnostics_.traced_segments
               << " path=" << diagnostics_.total_path_length
@@ -1571,6 +1647,7 @@ void Laser::FinalizeDiagnostics() {
                 << ", reflection_power="
                 << diagnostics_.reflection_remaining_power
                 << ") with tolerance=" << conservation_tolerance_
+                << "; max reflections=" << diagnostics_.max_reflections
                 << "; conservation residual=" << diagnostics_.conservation_residual
                 << " with tolerance=" << conservation_tolerance_
                 << "; dispersion error=" << diagnostics_.max_dispersion_error

@@ -76,7 +76,7 @@ GPU_LOCK_ROOT = Path(
 ) / "dci_3d-gpu-locks"
 OUTPUT_BLOCKS = range(1, 12)
 DEFAULT_PRODUCTION_GATE = CASE_DIR / "production_gate.json"
-PRODUCTION_GATE_SCHEMA = 5
+PRODUCTION_GATE_SCHEMA = 6
 PRODUCTION_RADIATION_C_LIGHT = 30.0
 PRODUCTION_STATUS_SCHEMA = 2
 PRODUCTION_PHASE1_TARGET = 5.0
@@ -206,6 +206,21 @@ def parse_args() -> argparse.Namespace:
         "--allow-busy-gpus",
         action="store_true",
         help="permit a non-idle baseline (never recommended for memory acceptance)",
+    )
+    parser.add_argument(
+        "--laser-max-reflections",
+        type=int,
+        help="non-production reflection-cap convergence override",
+    )
+    parser.add_argument(
+        "--laser-reflection-offset",
+        type=float,
+        help="non-production turning-offset convergence override in cell widths",
+    )
+    parser.add_argument(
+        "--laser-reflection-hysteresis",
+        type=float,
+        help="non-production fractional underdense rearm-band override",
     )
     return parser.parse_args()
 
@@ -1221,6 +1236,9 @@ def nonproduction_overrides(
     nlim: int | None,
     radiation_c_light: float | None,
     compact_scale: int,
+    laser_max_reflections: int | None = None,
+    laser_reflection_offset: float | None = None,
+    laser_reflection_hysteresis: float | None = None,
 ) -> list[str]:
     selected_nlim = {
         "validate": 0,
@@ -1229,7 +1247,24 @@ def nonproduction_overrides(
     }[mode]
     if nlim is not None:
         selected_nlim = nlim
-    overrides = [f"time/nlim={selected_nlim}", "time/tlim=1.0"]
+    overrides = [
+        f"time/nlim={selected_nlim}",
+        "time/tlim=1.0",
+        "problem/allow_laser_transport_variants=true",
+    ]
+    if laser_max_reflections is not None:
+        overrides.append(
+            f"laser/max_reflections_per_ray={laser_max_reflections}"
+        )
+    if laser_reflection_offset is not None:
+        overrides.append(
+            f"laser/reflection_offset_fraction={laser_reflection_offset:.17g}"
+        )
+    if laser_reflection_hysteresis is not None:
+        overrides.append(
+            "laser/reflection_hysteresis_fraction="
+            f"{laser_reflection_hysteresis:.17g}"
+        )
     if radiation_c_light is not None:
         overrides.append(f"thermal_radiation/c_light={radiation_c_light:.17g}")
     if mode in ("validate", "smoke"):
@@ -1261,7 +1296,11 @@ def nonproduction_overrides(
 
 
 def smoke_restart_overrides(
-    radiation_c_light: float | None, compact_scale: int
+    radiation_c_light: float | None,
+    compact_scale: int,
+    laser_max_reflections: int | None = None,
+    laser_reflection_offset: float | None = None,
+    laser_reflection_hysteresis: float | None = None,
 ) -> list[str]:
     first_cycles = default_smoke_cycles(radiation_c_light, compact_scale)
     value = (
@@ -1283,6 +1322,19 @@ def smoke_restart_overrides(
     if radiation_c_light is not None:
         overrides.append(
             f"thermal_radiation/c_light={radiation_c_light:.17g}"
+        )
+    if laser_max_reflections is not None:
+        overrides.append(
+            f"laser/max_reflections_per_ray={laser_max_reflections}"
+        )
+    if laser_reflection_offset is not None:
+        overrides.append(
+            f"laser/reflection_offset_fraction={laser_reflection_offset:.17g}"
+        )
+    if laser_reflection_hysteresis is not None:
+        overrides.append(
+            "laser/reflection_hysteresis_fraction="
+            f"{laser_reflection_hysteresis:.17g}"
         )
     return overrides
 
@@ -2061,10 +2113,39 @@ def main() -> int:
         raise RuntimeError("--nlim is only valid for non-production modes")
     if args.mode == "production" and args.radiation_c_light is not None:
         raise RuntimeError("--radiation-c-light is only valid for non-production modes")
+    laser_variant_values = (
+        args.laser_max_reflections,
+        args.laser_reflection_offset,
+        args.laser_reflection_hysteresis,
+    )
+    if args.mode == "production" and any(
+        value is not None for value in laser_variant_values
+    ):
+        raise RuntimeError("laser transport overrides are only valid for non-production modes")
     if args.mode in ("production", "calibrate") and args.compact_scale != 1:
         raise RuntimeError("--compact-scale applies only to validate and smoke modes")
     if args.nlim is not None and args.nlim < 0:
         raise RuntimeError("--nlim must be non-negative")
+    if args.laser_max_reflections is not None and args.laser_max_reflections <= 0:
+        raise RuntimeError("--laser-max-reflections must be positive")
+    if (
+        args.laser_reflection_offset is not None
+        and (
+            not math.isfinite(args.laser_reflection_offset)
+            or args.laser_reflection_offset <= 0.0
+        )
+    ):
+        raise RuntimeError("--laser-reflection-offset must be finite and positive")
+    if (
+        args.laser_reflection_hysteresis is not None
+        and (
+            not math.isfinite(args.laser_reflection_hysteresis)
+            or not 0.0 <= args.laser_reflection_hysteresis < 1.0
+        )
+    ):
+        raise RuntimeError(
+            "--laser-reflection-hysteresis must be finite and lie in [0,1)"
+        )
     if args.resume and args.mode != "production":
         raise RuntimeError("--resume is only valid in production mode")
     if args.prepare_only and args.mode != "production":
@@ -2177,6 +2258,9 @@ def main() -> int:
         args.nlim,
         args.radiation_c_light,
         args.compact_scale,
+        args.laser_max_reflections,
+        args.laser_reflection_offset,
+        args.laser_reflection_hysteresis,
     )
     first_mpi = mpi_command(input_path, first_overrides)
     if args.dry_run:
@@ -2201,6 +2285,11 @@ def main() -> int:
             "gpus": devices,
             "radiation_c_light_override": args.radiation_c_light,
             "compact_scale": args.compact_scale,
+            "laser_max_reflections_override": args.laser_max_reflections,
+            "laser_reflection_offset_override": args.laser_reflection_offset,
+            "laser_reflection_hysteresis_override": (
+                args.laser_reflection_hysteresis
+            ),
             "run_dir": str(run_dir),
             "case_artifacts": gate_artifact_hashes(),
             "material_manifest_sha256": sha256_path(MATERIAL_TABLE_MANIFEST),
@@ -2246,7 +2335,11 @@ def main() -> int:
             )
         restart = restarts[-1]
         second_overrides = smoke_restart_overrides(
-            args.radiation_c_light, args.compact_scale
+            args.radiation_c_light,
+            args.compact_scale,
+            args.laser_max_reflections,
+            args.laser_reflection_offset,
+            args.laser_reflection_hysteresis,
         )
         second_mpi = restart_command(restart.relative_to(run_dir), second_overrides)
         second_baseline, _ = gpu_preflight(devices, args.allow_busy_gpus)

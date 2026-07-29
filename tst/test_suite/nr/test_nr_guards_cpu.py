@@ -125,6 +125,14 @@ def test_guards():
                            {"laser": "periodic_transport = true"})
         run_expect_fatal(deck, [], "periodic")
 
+        # Laser reflection hysteresis is a fractional drop below the last
+        # turning density and must remain in the half-open interval [0, 1).
+        for label, value in (("negative", "-0.01"), ("unity", "1.0")):
+            deck = derive_deck(
+                LASER_DECK, f"guard_hysteresis_{label}.athinput",
+                {"laser": f"reflection_hysteresis_fraction = {value}"})
+            run_expect_fatal(deck, [], "hysteresis fraction")
+
         # Laser output variable without a <laser> block (Phase-1 null-guard fix;
         # segfaulted before the fix).
         deck = derive_deck(MHD_DECK, "guard_laser_out.athinput",

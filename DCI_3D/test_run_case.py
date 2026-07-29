@@ -275,6 +275,89 @@ def test_wall_time_validation_and_command_uses_staged_binary(tmp_path):
     assert str(run_case.BINARY) not in command
 
 
+def test_laser_transport_cli_overrides_reach_both_smoke_commands(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_case.py",
+            "--mode",
+            "smoke",
+            "--laser-max-reflections",
+            "32",
+            "--laser-reflection-offset",
+            "0.125",
+            "--laser-reflection-hysteresis",
+            "0.25",
+        ],
+    )
+    args = run_case.parse_args()
+    expected = {
+        "laser/max_reflections_per_ray=32",
+        "laser/reflection_offset_fraction=0.125",
+        "laser/reflection_hysteresis_fraction=0.25",
+    }
+
+    initial = run_case.nonproduction_overrides(
+        args.mode,
+        args.nlim,
+        args.radiation_c_light,
+        args.compact_scale,
+        args.laser_max_reflections,
+        args.laser_reflection_offset,
+        args.laser_reflection_hysteresis,
+    )
+    restart = run_case.smoke_restart_overrides(
+        args.radiation_c_light,
+        args.compact_scale,
+        args.laser_max_reflections,
+        args.laser_reflection_offset,
+        args.laser_reflection_hysteresis,
+    )
+
+    assert expected <= set(initial)
+    assert expected <= set(restart)
+    assert "problem/allow_laser_transport_variants=true" in initial
+
+
+def test_production_rejects_laser_transport_cli_overrides(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_case.py",
+            "--mode",
+            "production",
+            "--run-dir",
+            str(tmp_path),
+            "--laser-max-reflections",
+            "32",
+        ],
+    )
+    with pytest.raises(RuntimeError, match="only valid for non-production modes"):
+        run_case.main()
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    (
+        ("--laser-max-reflections", "0", "must be positive"),
+        ("--laser-reflection-offset", "nan", "finite and positive"),
+        ("--laser-reflection-hysteresis", "1", r"lie in \[0,1\)"),
+    ),
+)
+def test_invalid_laser_transport_cli_overrides_are_rejected(
+    tmp_path, monkeypatch, option, value, message
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_case.py", "--run-dir", str(tmp_path), option, value],
+    )
+    with pytest.raises(RuntimeError, match=message):
+        run_case.main()
+
+
 def test_run_lock_rejects_second_launcher(tmp_path):
     with run_case.RunLock(tmp_path):
         with pytest.raises(RuntimeError, match="Another launcher"):

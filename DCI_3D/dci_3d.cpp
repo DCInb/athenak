@@ -151,11 +151,23 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int max_mpi_waves = pin->GetInteger("laser", "max_mpi_waves");
   const Real reflection_offset =
       pin->GetReal("laser", "reflection_offset_fraction");
+  const Real reflection_hysteresis =
+      pin->GetReal("laser", "reflection_hysteresis_fraction");
+  const bool allow_laser_transport_variants = pin->GetOrAddBoolean(
+      "problem", "allow_laser_transport_variants", false);
   const Real pi = std::acos(-1.0);
   const Real projected_inner_radius =
       inner_radius*std::sin(opening_half_angle_deg*pi/180.0);
   const Real covered_area_fraction =
       SQR(target_radius/projected_inner_radius);
+  const bool production_transport =
+      max_reflections == 64 && max_mpi_waves >= 64 &&
+      NearlyEqual(reflection_offset, 1.0e-5) &&
+      NearlyEqual(reflection_hysteresis, 1.0e-2);
+  const bool diagnostic_transport =
+      max_reflections > 0 && max_mpi_waves >= 64 &&
+      reflection_offset >= 1.0e-7 && reflection_offset <= 1.0e-3 &&
+      reflection_hysteresis >= 0.0 && reflection_hysteresis < 0.1;
   if (geometry != "lens" || profile != "gaussian" ||
       !NearlyEqual(lens_x1, pmy_mesh_->mesh_size.x1max,
                    std::abs(pmy_mesh_->mesh_size.x1max)) ||
@@ -168,10 +180,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       !NearlyEqual(beam_power, 2.0e19, 2.0e19) ||
       !NearlyEqual(wavelength, 1.053e-4, 1.053e-4) ||
       !NearlyEqual(beam_start, 0.0) || !NearlyEqual(beam_end, 5.0, 5.0) ||
-      max_reflections < 64 || max_mpi_waves < 64 ||
-      !NearlyEqual(reflection_offset, 1.0e-5)) {
+      !(allow_laser_transport_variants ? diagnostic_transport
+                                      : production_transport)) {
     ProblemError("dci_3d requires the documented focused Gaussian 10 kJ beam "
-                 "and converged ray-transport limits");
+                 "and chatter-controlled ray-transport limits");
   }
 
   auto &indcs = pmy_mesh_->mb_indcs;

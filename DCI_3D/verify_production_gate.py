@@ -16,18 +16,30 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-SCHEMA = 5
+SCHEMA = 6
 PRODUCTION_C_LIGHT = 30.0
 RSLA_COMPARISON_C_LIGHT = 10.0
 PHYSICAL_C_LIGHT = 299.792458
 DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE = 1.0e-10
-LASER_DIAGNOSTIC_SOURCE_IDS = ("smoke_phase1_log", "smoke_phase2_log")
+LASER_DIAGNOSTIC_SOURCE_IDS = (
+    "smoke_phase1_log",
+    "smoke_phase2_log",
+    "resolution_phase1_log",
+    "resolution_phase2_log",
+    "rsla_phase1_log",
+    "rsla_phase2_log",
+    "physical_phase1_log",
+    "calibration_phase1_log",
+)
 LASER_REQUIRED_FIELDS = (
     "launched",
     "deposited",
     "escaped",
     "remaining",
     "residual",
+    "max_reflections",
+    "suppressed_turns",
+    "reflection_rearms",
 )
 LASER_SPLIT_REMAINDER_FIELDS = (
     "wave_remaining",
@@ -155,6 +167,7 @@ def parse_laser_diagnostics(path: Path) -> list[dict[str, float | int]]:
     integer_fields = {
         "active", "remaining_rays", "reflected", "transfers", "segments",
         "wave_remaining_rays", "reflection_remaining_rays",
+        "max_reflections", "suppressed_turns", "reflection_rearms",
     }
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), 1
@@ -253,6 +266,9 @@ def laser_remainder_metrics(
     violation_count = 0
     maximum_residual = 0.0
     maximum_split_mismatch = 0.0
+    maximum_observed_reflections = 0
+    maximum_suppressed_turns = 0
+    maximum_reflection_rearms = 0
     worst_source: str | None = None
     worst_line: int | None = None
     worst_field: str | None = None
@@ -260,6 +276,15 @@ def laser_remainder_metrics(
 
     for source_id, row in samples:
         launched = float(row["launched"])
+        maximum_observed_reflections = max(
+            maximum_observed_reflections, int(row["max_reflections"])
+        )
+        maximum_suppressed_turns = max(
+            maximum_suppressed_turns, int(row["suppressed_turns"])
+        )
+        maximum_reflection_rearms = max(
+            maximum_reflection_rearms, int(row["reflection_rearms"])
+        )
         if launched > 0.0:
             positive_launched_count += 1
 
@@ -336,6 +361,9 @@ def laser_remainder_metrics(
         "maximum_remainder_fraction": max(maxima.values()),
         "maximum_laser_conservation_residual": maximum_residual,
         "maximum_split_accounting_mismatch": maximum_split_mismatch,
+        "maximum_observed_reflections": maximum_observed_reflections,
+        "maximum_suppressed_turns": maximum_suppressed_turns,
+        "maximum_reflection_rearms": maximum_reflection_rearms,
         "remainder_relative_tolerance": tolerance,
         "worst_source_id": worst_source,
         "worst_line_number": worst_line,
@@ -693,6 +721,18 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     start = read_deck_value(sources["production_input"], "beam0_start_time")
     end = read_deck_value(sources["production_input"], "beam0_end_time")
     incident_joules = power*(end-start)*1.0e-9/1.0e7
+    configured_reflection_cap_value = read_deck_value(
+        sources["production_input"], "max_reflections_per_ray"
+    )
+    if (
+        configured_reflection_cap_value <= 0.0
+        or not configured_reflection_cap_value.is_integer()
+    ):
+        raise ValueError(
+            "Production max_reflections_per_ray must be a positive integer"
+        )
+    configured_reflection_cap = int(configured_reflection_cap_value)
+    maximum_allowed_observed_reflections = configured_reflection_cap/2.0
     laser_remainder_tolerance = float(settings.get(
         "laser_remainder_relative_tolerance",
         DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE,
@@ -701,10 +741,15 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         {name: sources[name] for name in LASER_DIAGNOSTIC_SOURCE_IDS},
         laser_remainder_tolerance,
     )
+    reflection_headroom_pass = (
+        laser_remainder["maximum_observed_reflections"]
+        <= maximum_allowed_observed_reflections
+    )
     energy_pass = (
         energy_relative <= settings["energy_relative_tolerance"]
         and abs(incident_joules-10000.0) <= 1.0e-9
         and laser_remainder_pass
+        and reflection_headroom_pass
     )
     checks["laser_and_boundary_energy_closure"] = evidence_check(
         energy_pass,
@@ -712,6 +757,10 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         deposited=deposited, chain_delta=chain_delta, integrated_radiation_escape=escaped,
         residual=residual, relative_residual=energy_relative,
         configured_incident_joules=incident_joules,
+        configured_max_reflections_per_ray=configured_reflection_cap,
+        maximum_allowed_observed_reflections=
+            maximum_allowed_observed_reflections,
+        reflection_headroom_passed=reflection_headroom_pass,
         **laser_remainder)
 
     ch = history["CH_mass"]

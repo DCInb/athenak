@@ -43,9 +43,12 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
     profile_mode = 0;
   } else if (profile == "exponential") {
     profile_mode = 1;
+  } else if (profile == "two_wall") {
+    profile_mode = 2;
   } else {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "Laser density_profile must be linear or exponential"
+              << std::endl
+              << "Laser density_profile must be linear, exponential, or two_wall"
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -55,6 +58,10 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
       pin->GetOrAddReal("problem", "density_gradient", 1.0);
   Real density_exponent =
       pin->GetOrAddReal("problem", "density_exponent", std::log(3.0));
+  Real density_wall_center =
+      pin->GetOrAddReal("problem", "density_wall_center", 0.5);
+  Real density_wall_half_gap =
+      pin->GetOrAddReal("problem", "density_wall_half_gap", 0.2);
   Real density_gradient_x2 =
       pin->GetOrAddReal("problem", "density_gradient_x2", 0.0);
   Real density_gradient_x3 =
@@ -69,10 +76,13 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
   Real temperature_reference_density =
       pin->GetOrAddReal("problem", "temperature_reference_density", rho0);
   if (!(rho0 > 0.0) || !(temperature > 0.0) ||
+      !std::isfinite(density_wall_center) ||
+      !std::isfinite(density_wall_half_gap) || density_wall_half_gap < 0.0 ||
       !(temperature_reference_density > 0.0)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
-              << "Laser profile density, temperature, and reference density must be positive"
+              << "Laser profile density, temperature, reference density, and wall "
+                 "geometry are invalid"
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -104,9 +114,16 @@ void ProblemGenerator::LaserProfile(ParameterInput *pin, const bool restart) {
     Real x3 = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                           size.d_view(m).x3max);
     Real distance = x1-x1min;
-    Real density = (profile_mode == 0)
-        ? rho0 + density_gradient*distance
-        : rho0*exp(density_exponent*distance);
+    Real density;
+    if (profile_mode == 0) {
+      density = rho0+density_gradient*distance;
+    } else if (profile_mode == 1) {
+      density = rho0*exp(density_exponent*distance);
+    } else {
+      Real wall_distance = fmax(fabs(x1-density_wall_center)-
+                                density_wall_half_gap, 0.0);
+      density = rho0+density_gradient*wall_distance;
+    }
     density += density_gradient_x2*x2 + density_gradient_x3*x3 +
                density_curvature_x2*x2*x2 + density_curvature_x3*x3*x3;
     density = fmax(density, 1.0e-20);

@@ -61,8 +61,9 @@ struct LaserRayPacket {
   Real kx, ky, kz;
   Real power, path_length;
   Real dispersion_error;
+  Real last_turning_density;
   int ray, gid, i, j, k;
-  int segments, reflections;
+  int segments, reflections, reflection_armed;
 };
 
 struct BeamConfig {
@@ -100,6 +101,9 @@ struct LaserDiagnostics {
   int wave_remaining_rays = 0;
   int reflection_remaining_rays = 0;
   int reflected_rays = 0;
+  int max_reflections = 0;
+  int suppressed_turns = 0;
+  int reflection_rearms = 0;
   int off_rank_transfers = 0;
   int transport_iterations = 0;
   int traced_segments = 0;
@@ -204,6 +208,7 @@ class Laser {
   bool gpu_aware_mpi_ = false;
   int max_reflections_per_ray_ = 8;
   Real reflection_offset_fraction_ = 1.0e-10;
+  Real reflection_hysteresis_fraction_ = 0.0;
   Real refractive_cell_fraction_ = 0.25;
   Real refractive_curvature_fraction_ = 0.25;
   Real refractive_tau_max_ = 0.25;
@@ -217,6 +222,8 @@ class Laser {
   DvceArray1D<Real> ray_zeff_, ray_constant_absorption_;
   DvceArray1D<Real> ray_start_time_, ray_end_time_;
   DvceArray1D<int> ray_beam_, ray_segments_, ray_reflections_;
+  DvceArray1D<int> ray_reflection_armed_;
+  DvceArray1D<Real> ray_last_turning_density_;
   DvceArray1D<Real> beam_power_;
   DvceArray1D<Real> ray_path_length_;
   DvceArray1D<Real> ray_kx_, ray_ky_, ray_kz_, ray_dispersion_error_;
@@ -231,7 +238,8 @@ class Laser {
   // wave-cap remaining, reflection-cap remaining.
   DvceArray1D<Real> device_diagnostics_;
   // Counters: total remaining, reflections, transfers, failures,
-  // wave-cap remaining, reflection-cap remaining.
+  // wave-cap remaining, reflection-cap remaining, suppressed same-surface
+  // turns, and reflection rearms.
   DvceArray1D<int> device_counters_;
   DvceArray5D<Real> cumulative_energy_start_;
 

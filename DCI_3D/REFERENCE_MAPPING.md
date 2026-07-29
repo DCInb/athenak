@@ -132,11 +132,13 @@ Those settings demonstrate the archive's ray and symmetry conventions but confli
 the requested 1ω Gaussian converging 10 kJ square drive.  The AthenaK laser therefore
 uses one axial 4,096-ray beam with a 0.72 mm Gaussian aperture focused to 0.58 mm at the
 inner cap.  The target spot covers 89.5 percent of the cap's projected area.  Incident,
-deposited, and escaped-radiation power are recorded for energy closure.  Compact and
-production-layout sweeps converge at 32 critical-surface reflections; the deck keeps the
-doubled cap of 64 and a converged `1e-5`-cell turning offset.  Wave-cap and reflection-cap
-remainders are reported separately, are fatal above `1e-10` of launched power, and are
-also checked from every smoke-log laser record by the production gate.
+deposited, and escaped-radiation power are recorded for energy closure.  Initial compact
+and production-layout sweeps establish a hard cap of 64.  An evolved 100-cycle
+doubled-mesh sweep additionally brackets the one-percent underdense rearm band, the
+`1e-5`-cell normal offset, and caps 64/128; it retains zero terminal power with at most
+19 observed turns per ray.  Wave-cap and reflection-cap remainders are reported
+separately, are fatal above `1e-10` of launched power, and are checked in every baseline,
+resolution, light-speed, and calibration laser record by the production gate.
 
 ## Exchange and numerical controls
 

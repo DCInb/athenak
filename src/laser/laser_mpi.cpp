@@ -60,6 +60,8 @@ void Laser::PrepareOutgoingRays() {
   auto power = ray_power; auto path = ray_path_length_;
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto segments = ray_segments_; auto reflections = ray_reflections_;
+  auto reflection_armed = ray_reflection_armed_;
+  auto last_turning_density = ray_last_turning_density_;
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
   auto counters = device_counters_;
   Kokkos::parallel_for(
@@ -79,15 +81,19 @@ void Laser::PrepareOutgoingRays() {
         packet.kx = wave_x(r); packet.ky = wave_y(r); packet.kz = wave_z(r);
         packet.power = power(r); packet.path_length = path(r);
         packet.dispersion_error = dispersion_error(r);
+        packet.last_turning_density = last_turning_density(r);
         packet.ray = r; packet.gid = gid(r);
         packet.i = ci(r); packet.j = cj(r); packet.k = ck(r);
         packet.segments = segments(r); packet.reflections = reflections(r);
+        packet.reflection_armed = reflection_armed(r);
         packets(slot) = packet;
 
         // Only the current owner contributes cumulative per-ray diagnostics.
         path(r) = 0.0;
         segments(r) = 0;
         reflections(r) = 0;
+        reflection_armed(r) = 0;
+        last_turning_density(r) = 0.0;
         destination(r) = -1;
         queue_a(r) = -1;
         queue_b(r) = -1;
@@ -110,6 +116,8 @@ void Laser::UnpackReceivedRays(int count) {
   auto gid = ray_gid; auto ci = ray_i; auto cj = ray_j; auto ck = ray_k;
   auto status = ray_status; auto destination = ray_destination_rank_;
   auto segments = ray_segments_; auto reflections = ray_reflections_;
+  auto reflection_armed = ray_reflection_armed_;
+  auto last_turning_density = ray_last_turning_density_;
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
   auto counters = device_counters_;
   Kokkos::parallel_for(
@@ -132,6 +140,8 @@ void Laser::UnpackReceivedRays(int count) {
         ci(r) = packet.i; cj(r) = packet.j; ck(r) = packet.k;
         segments(r) = packet.segments;
         reflections(r) = packet.reflections;
+        reflection_armed(r) = packet.reflection_armed;
+        last_turning_density(r) = packet.last_turning_density;
         destination(r) = -1;
         status(r) = static_cast<int>(RayStatus::active);
         queue_a(r) = r;

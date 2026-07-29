@@ -159,10 +159,11 @@ inverse_bremsstrahlung_coulomb_log = 5.0
 inverse_bremsstrahlung_temperature_floor = 1.1606e4
 critical_reflection = true
 oblique_turning = true
-# Compact and full-mesh sweeps give identical deposition for caps 32 and 64;
-# keep the doubled value.  Offsets 1e-5 and 1e-6 cell widths are converged.
+# Keep 64 only as a hard failure guard.  A one-percent underdense rearm band prevents
+# a reflected ray from retriggering on cell-to-cell cutoff reconstruction chatter.
 max_reflections_per_ray = 64
 reflection_offset_fraction = 1.0e-5
+reflection_hysteresis_fraction = 1.0e-2
 nbeams = 1
 max_segments_per_launch = 64
 max_transport_iterations = 256
@@ -202,6 +203,7 @@ outer_radius = 1.0
 opening_half_angle_deg = 50.0
 transition_width = 2.0e-2
 angular_transition = 1.0e-2
+allow_laser_transport_variants = false
 
 <output1>
 file_type = hst
