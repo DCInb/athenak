@@ -67,6 +67,31 @@ def test_run():
                 f"laser_mpi_slab_{ranks}", ranks, slab_flags))
             compare_fields(candidate, reference)
 
+        # Global ray ownership must use the exact same face coordinates as MeshBlock.
+        # On this asymmetric ten-block, four-rank domain, a nearly face-tangent ray
+        # crosses the rank-2/rank-1 face at x=-0.6. Its small negative x direction makes
+        # the forward ownership probe about two ulps long: enough to cross MeshBlock's
+        # canonical face but not an algebraically reconstructed, shifted global face.
+        asymmetric_flags = [
+            "mesh/nx1=80", "mesh/nx2=8", "mesh/nx3=1",
+            "mesh/x1min=-2.0", "mesh/x1max=1.5",
+            "meshblock/nx1=8", "meshblock/nx2=8", "meshblock/nx3=1",
+            "laser/beam0_nrays=1",
+            "laser/beam0_origin_x1=-0.599",
+            "laser/beam0_origin_x2=-0.25",
+            "laser/beam0_direction_x1=-0.007654894771870187",
+            "laser/beam0_direction_x2=1.0",
+            "laser/absorption_coefficient=0.25",
+            "laser/max_segments_per_launch=3",
+            "laser/max_transport_iterations=8",
+            "laser/gpu_aware_mpi=false",
+        ]
+        asymmetric_reference = fields(run_mpi_case(
+            "laser_mpi_asymmetric_1", 1, asymmetric_flags))
+        asymmetric_parallel = fields(run_mpi_case(
+            "laser_mpi_asymmetric_4", 4, asymmetric_flags))
+        compare_fields(asymmetric_parallel, asymmetric_reference)
+
         # A nearly boundary-parallel beam crosses many rank regions in two dimensions.
         stress_flags = [
             "mesh/nx1=64", "mesh/nx2=64", "mesh/nx3=1",

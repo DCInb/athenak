@@ -70,8 +70,25 @@ resolution uncertainty, while retaining zero terminal power.
 ## Production acceptance
 
 Each laser solve prints total and cause-specific remainder power/counts, maximum turns
-per ray, suppressed same-surface candidate segments, and rearm count.  Gate schema 6
+per ray, suppressed same-surface candidate segments, and rearm count.  Gate schema 7
 parses every laser record from baseline, doubled-resolution, reduced-light-speed,
 physical-light-speed, and calibration evidence.  It requires split accounting and
 residuals at or below `1e-10`, zero terminal power, and an observed maximum no greater
 than half the configured reflection cap (32 for production cap 64).
+
+## Full-layout ownership regression
+
+The first schema-6 production start exposed a separate floating-point ownership defect
+on its seventh laser solve.  A negative-going ray reached the `x=-0.6 mm` boundary
+between global blocks 448 and 393.  Rank-local MeshBlock bounds use AthenaK's symmetric
+`LeftEdgeX` arithmetic, while the laser's replicated global-block table had used an
+algebraically equivalent interpolation that differed by two ulps.  The local lookup
+correctly left block 448, but the mismatched global lookup returned block 448 again and
+failed one nearly absorbed ray.
+
+The replicated laser table now uses the exact MeshBlock endpoint rules and `LeftEdgeX`
+arithmetic on every active axis.  A two-rank asymmetric-domain regression crosses the
+same non-binary face in the negative direction and compares its fields with a one-rank
+reference.  The production-memory calibration now advances four full cycles (eight RK2
+laser solves), rather than two, and must record cycle 4.  Gate schema 7 enforces that
+coverage in addition to the eight-log remainder and reflection checks above.

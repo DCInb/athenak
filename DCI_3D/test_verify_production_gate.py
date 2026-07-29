@@ -46,7 +46,7 @@ def laser_diagnostic(
 
 
 def test_schema_and_required_checks_match_launcher():
-    assert gate.SCHEMA == 6
+    assert gate.SCHEMA == 7
     assert run_case.PRODUCTION_GATE_SCHEMA == gate.SCHEMA
     assert "physical_light_speed_sensitivity" in gate.CHECK_NAMES
     assert tuple(run_case.REQUIRED_PRODUCTION_CHECKS) == gate.CHECK_NAMES
@@ -377,7 +377,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     physical_status = status("smoke", c_light=299.792458)
     physical_status["phase1_mpi_command"] = ["time/nlim=650"]
     calibration_status = status("calibrate")
-    calibration_status["phase1_mpi_command"] = ["time/nlim=2"]
+    calibration_status["phase1_mpi_command"] = ["time/nlim=4"]
     calibration_status["phase1_memory"] = {
         "errors": [],
         "devices": {
@@ -408,19 +408,20 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
         ("rsla_phase1_log", ((0, 0.0, 2e-4), (50, .008, 2e-4))),
         ("rsla_phase2_log", ((50, .008, 2e-4), (60, .01, 2e-4))),
         ("physical_phase1_log", ((0, 0.0, 2e-5), (650, .012, 2e-5))),
-        ("calibration_phase1_log", ((0, 0.0, 2e-4), (2, 4e-4, 2e-4))),
+        ("calibration_phase1_log", ((0, 0.0, 2e-4), (4, 8e-4, 2e-4))),
     ):
         path = tmp_path/f"{name}.log"
         text = "".join(
             f"cycle={cycle} time={time:.8e} dt={dt:.8e}\n"
             for cycle, time, dt in rows)
         if name in gate.LASER_DIAGNOSTIC_SOURCE_IDS:
-            text += laser_diagnostic(
+            diagnostic = laser_diagnostic(
                 remaining=5.0e-11,
                 wave_remaining=2.0e-11,
                 reflection_remaining=3.0e-11,
                 max_reflections=(32 if name == "calibration_phase1_log" else 8),
             )
+            text += diagnostic*(8 if name == "calibration_phase1_log" else 1)
         path.write_text(text)
         sources[name] = path
 
@@ -467,10 +468,71 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     checks = gate.evaluate_checks(sources, settings)
     assert set(checks) == set(gate.CHECK_NAMES)
     assert all(record["passed"] for record in checks.values()), checks
+    memory_check = checks["gpu_memory_60_80_all"]
+    assert memory_check["metrics"]["requested_cycle_limit"] == 4
+    assert memory_check["metrics"]["final_cycle"] == 4
+    assert memory_check["metrics"]["laser_diagnostic_count"] == 8
     assert checks["reduced_light_speed_sensitivity"]["metrics"]["erad_E"] == 0.0
+
+    calibration_status["phase1_mpi_command"] = ["time/nlim=3"]
+    sources["calibration_status"].write_text(json.dumps(calibration_status))
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["gpu_memory_60_80_all"]["passed"]
+    calibration_status["phase1_mpi_command"] = ["time/nlim=4"]
+    sources["calibration_status"].write_text(json.dumps(calibration_status))
+
+    calibration_log_text = sources["calibration_phase1_log"].read_text()
+    sources["calibration_phase1_log"].write_text(
+        calibration_log_text.replace(
+            "cycle=4 time=8.00000000e-04",
+            "cycle=3 time=6.00000000e-04",
+        )
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["gpu_memory_60_80_all"]["passed"]
+    sources["calibration_phase1_log"].write_text(calibration_log_text)
+
+    sources["calibration_phase1_log"].write_text(
+        calibration_log_text.replace(
+            "cycle=4 time=8.00000000e-04",
+            "cycle=5 time=1.00000000e-03",
+        )
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["gpu_memory_60_80_all"]["passed"]
+    sources["calibration_phase1_log"].write_text(calibration_log_text)
+
+    sources["calibration_phase1_log"].write_text(
+        calibration_log_text.replace(
+            laser_diagnostic(
+                remaining=5.0e-11,
+                wave_remaining=2.0e-11,
+                reflection_remaining=3.0e-11,
+                max_reflections=32,
+            ),
+            "",
+            1,
+        )
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["gpu_memory_60_80_all"]["passed"]
+    sources["calibration_phase1_log"].write_text(calibration_log_text)
+
+    sources["calibration_phase1_log"].write_text(
+        calibration_log_text + laser_diagnostic(
+            remaining=5.0e-11,
+            wave_remaining=2.0e-11,
+            reflection_remaining=3.0e-11,
+            max_reflections=32,
+        )
+    )
+    checks = gate.evaluate_checks(sources, settings)
+    assert not checks["gpu_memory_60_80_all"]["passed"]
+    sources["calibration_phase1_log"].write_text(calibration_log_text)
+    checks = gate.evaluate_checks(sources, settings)
     assert checks["physical_light_speed_sensitivity"]["metrics"]["final_cycle"] == 650
     closure = checks["laser_and_boundary_energy_closure"]
-    assert closure["metrics"]["diagnostic_count"] == 8
+    assert closure["metrics"]["diagnostic_count"] == 15
     assert closure["metrics"]["maximum_remainder_fraction"] == 5.0e-11
     assert closure["metrics"]["maximum_observed_reflections"] == 32
     assert closure["metrics"]["configured_max_reflections_per_ray"] == 64

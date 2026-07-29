@@ -76,7 +76,7 @@ GPU_LOCK_ROOT = Path(
 ) / "dci_3d-gpu-locks"
 OUTPUT_BLOCKS = range(1, 12)
 DEFAULT_PRODUCTION_GATE = CASE_DIR / "production_gate.json"
-PRODUCTION_GATE_SCHEMA = 6
+PRODUCTION_GATE_SCHEMA = 7
 PRODUCTION_RADIATION_C_LIGHT = 30.0
 PRODUCTION_STATUS_SCHEMA = 2
 PRODUCTION_PHASE1_TARGET = 5.0
@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
         default="validate",
         help=(
             "validate=compact nlim=0, smoke=compact 50-step plus restart, "
-            "calibrate=production mesh nlim=2, production=5+5 ns"
+            "calibrate=production mesh nlim=4, production=5+5 ns"
         ),
     )
     parser.add_argument("--build", action="store_true")
@@ -1243,7 +1243,7 @@ def nonproduction_overrides(
     selected_nlim = {
         "validate": 0,
         "smoke": default_smoke_cycles(radiation_c_light, compact_scale),
-        "calibrate": 2,
+        "calibrate": 4,
     }[mode]
     if nlim is not None:
         selected_nlim = nlim

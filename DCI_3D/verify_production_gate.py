@@ -16,7 +16,7 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-SCHEMA = 6
+SCHEMA = 7
 PRODUCTION_C_LIGHT = 30.0
 RSLA_COMPARISON_C_LIGHT = 10.0
 PHYSICAL_C_LIGHT = 299.792458
@@ -596,6 +596,7 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     smoke1 = parse_cycle_log(sources["smoke_phase1_log"])
     smoke2 = parse_cycle_log(sources["smoke_phase2_log"])
     physical1 = parse_cycle_log(sources["physical_phase1_log"])
+    calibration1 = parse_cycle_log(sources["calibration_phase1_log"])
     history = read_history(sources["smoke_history"])
     resolution_history = read_history(sources["resolution_history"])
     rsla_history = read_history(sources["rsla_history"])
@@ -894,10 +895,17 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         name: record.get("peak_fraction") for name, record in devices.items()
         if isinstance(record, dict)
     }
+    calibration_laser_count = int(
+        laser_remainder["diagnostic_counts_by_source"].get(
+            "calibration_phase1_log", 0
+        )
+    )
     memory_pass = (
         same_artifacts and calibration_status.get("mode") == "calibrate"
         and calibration_status.get("phase1_exit_code") == 0
-        and command_override(calibration_status, 1, "time/nlim") == "2"
+        and command_override(calibration_status, 1, "time/nlim") == "4"
+        and max(int(row["cycle"]) for row in calibration1) == 4
+        and calibration_laser_count == 8
         and len(devices) == 8 and not memory.get("errors")
         and all(isinstance(record, dict)
                 and "V100" in str(record.get("name", ""))
@@ -907,7 +915,11 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     )
     checks["gpu_memory_60_80_all"] = evidence_check(
         memory_pass, ["calibration_status", "calibration_phase1_log"],
-        peak_fractions=fractions, device_count=len(devices))
+        peak_fractions=fractions, device_count=len(devices),
+        requested_cycle_limit=4,
+        final_cycle=max(int(row["cycle"]) for row in calibration1),
+        laser_diagnostic_count=calibration_laser_count,
+        required_laser_diagnostic_count=8)
     return checks
 
 

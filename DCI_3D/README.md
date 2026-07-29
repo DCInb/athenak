@@ -173,7 +173,7 @@ The measured production candidate is `500 x 256 x 256` cells with `50 x 32 x 32`
 MeshBlocks: `10 x 8 x 8 = 640` blocks, exactly 80 blocks per rank on eight GPUs.  It
 resolves the shell thickness with approximately 26--29 cells.  The preceding
 `400 x 256 x 256` trial used 54.565 percent of each GPU.  The final hash-matched
-two-cycle calibration measured 11,058--11,064 MiB, or 67.493--67.529 percent, on every
+four-cycle calibration measured 11,058--11,066 MiB, or 67.493--67.541 percent, on every
 V100 with no pre-existing compute process or monitor error.
 
 History is written every `0.025 ns`.  Its 20 reductions include laser deposited energy
@@ -247,7 +247,7 @@ python3 DCI_3D/run_case.py --clean --mode smoke --nlim 650 \
   --radiation-c-light 299.792458 --run-dir DCI_3D/runs/cphys650
 ```
 
-Measure the full candidate allocation for two steps:
+Measure the full candidate allocation and exercise eight full-layout RK2 laser solves:
 
 ```bash
 python3 DCI_3D/run_case.py --clean --mode calibrate
@@ -268,7 +268,7 @@ python3 DCI_3D/verify_production_gate.py --dry-run
 python3 DCI_3D/verify_production_gate.py
 ```
 
-The verifier writes schema 6 with hashes of the binary, problem generator, decks,
+The verifier writes schema 7 with hashes of the binary, problem generator, decks,
 launcher, verifier, material tables, every selected log/status/history/3T/restart artifact,
 the numerical tolerances, and computed metrics.  It exits 2 and records failed checks when
 evidence is incomplete or outside tolerance.  On an actual production request,
@@ -298,7 +298,8 @@ chain-energy closure including integrated outward radiation; CH-mass
 conservation; continuous restart time/timestep/energies; a doubled-resolution or
 opacity-sensitivity result; acceptable `c_hat=30` versus `10` and physical-`c`
 sensitivity under the split matter/radiation limits above; and 60--80 percent memory on
-all eight V100s.
+all eight V100s.  The full-layout calibration must also reach four complete cycles,
+covering eight RK2 laser solves before production can be staged.
 
 The deterministic parser and gate-math tests do not substitute for GPU evidence.  Run
 them with the repository test environment (the visualization environment intentionally

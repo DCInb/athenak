@@ -320,6 +320,11 @@ def test_laser_transport_cli_overrides_reach_both_smoke_commands(monkeypatch):
     assert "problem/allow_laser_transport_variants=true" in initial
 
 
+def test_calibration_default_exercises_four_full_layout_cycles():
+    overrides = run_case.nonproduction_overrides("calibrate", None, None, 1)
+    assert "time/nlim=4" in overrides
+
+
 def test_production_rejects_laser_transport_cli_overrides(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys,

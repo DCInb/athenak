@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "athena.hpp"
+#include "coordinates/cell_locations.hpp"
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
@@ -691,26 +692,31 @@ void Laser::RefreshGlobalBlockInfo() {
     int blocks_x2 = mesh->nmb_rootx2 << level_offset;
     int blocks_x3 = mesh->nmb_rootx3 << level_offset;
     LaserBlockInfo info;
-    info.x1min = domain.x1min + (domain.x1max-domain.x1min)*loc.lx1/blocks_x1;
-    info.x1max = domain.x1min +
-                 (domain.x1max-domain.x1min)*(loc.lx1+1)/blocks_x1;
+    // Keep these byte-identical to MeshBlock's canonical bounds. Algebraically
+    // equivalent interpolation can differ by a few ulps at a shared rank face.
+    info.x1min = (loc.lx1 == 0) ? domain.x1min :
+        LeftEdgeX(loc.lx1, blocks_x1, domain.x1min, domain.x1max);
+    info.x1max = (loc.lx1 == blocks_x1-1) ? domain.x1max :
+        LeftEdgeX(loc.lx1+1, blocks_x1, domain.x1min, domain.x1max);
     info.x2min = domain.x2min;
     info.x2max = domain.x2max;
     info.x3min = domain.x3min;
     info.x3max = domain.x3max;
     if (mesh->multi_d) {
-      info.x2min = domain.x2min + (domain.x2max-domain.x2min)*loc.lx2/blocks_x2;
-      info.x2max = domain.x2min +
-                   (domain.x2max-domain.x2min)*(loc.lx2+1)/blocks_x2;
+      info.x2min = (loc.lx2 == 0) ? domain.x2min :
+          LeftEdgeX(loc.lx2, blocks_x2, domain.x2min, domain.x2max);
+      info.x2max = (loc.lx2 == blocks_x2-1) ? domain.x2max :
+          LeftEdgeX(loc.lx2+1, blocks_x2, domain.x2min, domain.x2max);
     }
     if (mesh->three_d) {
-      info.x3min = domain.x3min + (domain.x3max-domain.x3min)*loc.lx3/blocks_x3;
-      info.x3max = domain.x3min +
-                   (domain.x3max-domain.x3min)*(loc.lx3+1)/blocks_x3;
+      info.x3min = (loc.lx3 == 0) ? domain.x3min :
+          LeftEdgeX(loc.lx3, blocks_x3, domain.x3min, domain.x3max);
+      info.x3max = (loc.lx3 == blocks_x3-1) ? domain.x3max :
+          LeftEdgeX(loc.lx3+1, blocks_x3, domain.x3min, domain.x3max);
     }
-    info.dx1 = (info.x1max-info.x1min)/indcs.nx1;
-    info.dx2 = (info.x2max-info.x2min)/indcs.nx2;
-    info.dx3 = (info.x3max-info.x3min)/indcs.nx3;
+    info.dx1 = (info.x1max-info.x1min)/static_cast<Real>(indcs.nx1);
+    info.dx2 = (info.x2max-info.x2min)/static_cast<Real>(indcs.nx2);
+    info.dx3 = (info.x3max-info.x3min)/static_cast<Real>(indcs.nx3);
     info.gid = gid;
     info.rank = mesh->rank_eachmb[gid];
     host_blocks(gid) = info;
