@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically render new DCI_3D laser-ray slices
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=dci-3d-ray-plots.service
+
+[Install]
+WantedBy=timers.target

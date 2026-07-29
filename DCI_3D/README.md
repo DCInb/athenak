@@ -349,14 +349,24 @@ install -Dm644 DCI_3D/systemd/dci-3d-production.service \
   ~/.config/systemd/user/dci-3d-production.service
 install -Dm644 DCI_3D/systemd/dci-3d-transfer.service \
   ~/.config/systemd/user/dci-3d-transfer.service
+install -Dm644 DCI_3D/systemd/dci-3d-ray-plots.service \
+  ~/.config/systemd/user/dci-3d-ray-plots.service
+install -Dm644 DCI_3D/systemd/dci-3d-ray-plots.timer \
+  ~/.config/systemd/user/dci-3d-ray-plots.timer
 systemctl --user daemon-reload
 loginctl enable-linger "$USER"
 systemctl --user enable --now dci-3d-transfer.service
 systemctl --user enable --now dci-3d-production.service
+systemctl --user enable --now dci-3d-ray-plots.timer
 ```
 
 Production resumes automatically from an atomic rolling checkpoint every 11.5 hours and
-still lands exactly on the numbered 5 and 10 ns boundaries.  After status reaches
+still lands exactly on the numbered 5 and 10 ns boundaries.  The low-priority plotting
+timer scans the inexpensive `laser_xy` and `laser_xz` plane outputs every 15 minutes,
+skips frames already rendered under `run/plots/laser_rays/{xy,xz}`, and leaves the PNGs
+for the same non-deleting TranFile watcher to copy.  The initial `t=0` frame truthfully
+contains no ray segments; active frames begin with the first `0.1 ns` laser slice, and
+post-pulse frames at `t>=5 ns` are expected to be blank.  After status reaches
 `state=complete` at 10 ns, let the backlog drain and publish the checksum-verified local
 and remote completion seal:
 

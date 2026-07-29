@@ -1,0 +1,16 @@
+[Unit]
+Description=Render available DCI_3D production laser-ray slices
+After=dci-3d-production.service
+ConditionPathExists=/home/mengqi/Research/athenak-2t/DCI_3D/run/bin/dci_3d.laser_xy.00000.bin
+ConditionPathExists=/home/mengqi/Research/athenak-2t/DCI_3D/run/bin/dci_3d.laser_xz.00000.bin
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/mengqi/Research/athenak-2t
+Environment=OMP_NUM_THREADS=1
+ExecStart=/home/mengqi/miniconda3/envs/athenak-vis/bin/python /home/mengqi/Research/athenak-2t/DCI_3D/plot_laser_rays.py /home/mengqi/Research/athenak-2t/DCI_3D/run --plane xy --quantity path --vectors quiver --shell-outline --output-dir /home/mengqi/Research/athenak-2t/DCI_3D/run/plots/laser_rays/xy
+ExecStart=/home/mengqi/miniconda3/envs/athenak-vis/bin/python /home/mengqi/Research/athenak-2t/DCI_3D/plot_laser_rays.py /home/mengqi/Research/athenak-2t/DCI_3D/run --plane xz --quantity path --vectors quiver --shell-outline --output-dir /home/mengqi/Research/athenak-2t/DCI_3D/run/plots/laser_rays/xz
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=10min
+UMask=0077
