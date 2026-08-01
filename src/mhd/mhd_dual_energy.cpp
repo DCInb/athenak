@@ -246,14 +246,29 @@ void MHD::SynchronizeDualEnergyFromTotal() {
         if (eint_cons < minimum_sum) {
           u0_(m, IEN, k, j, i) += minimum_sum-eint_cons;
         }
-        const materials::MaterialPressureEnergyState state =
-            material_mixture.PressureEnergyFromRhoSpecificEnergies(
-                dens, fmax(eion, eion_floor)/dens,
-                fmax(eele, eele_floor)/dens, y0);
-        const Real pressure_sum = state.ion_pressure+state.electron_pressure;
-        const Real ion_fraction = (pressure_sum > 0.0)
-            ? state.ion_pressure/pressure_sum
-            : ((component_sum > 0.0) ? eion/component_sum : 0.5);
+        Real ion_fraction;
+        const bool zero_residual_fast_path =
+            y0 > 0.0 && y0 < 1.0 && eion > 0.0 && eele > 0.0 &&
+            Kokkos::isfinite(eint_aux) && eint_aux == component_sum &&
+            material_mixture.TabularPressureSumsAreSafelyFinite();
+        if (zero_residual_fast_path) {
+          // Retain strict-bounds failures even though no diagnostic flags are stored by
+          // this dual-energy path.  With an exact zero residual, the finite pressure
+          // partition cannot affect any arithmetic below.
+          static_cast<void>(material_mixture.SpecificEnergiesQueryFlags(
+              dens, fmax(eion, eion_floor)/dens,
+              fmax(eele, eele_floor)/dens, y0));
+          ion_fraction = eion/component_sum;
+        } else {
+          const materials::MaterialPressureEnergyState state =
+              material_mixture.PressureEnergyFromRhoSpecificEnergies(
+                  dens, fmax(eion, eion_floor)/dens,
+                  fmax(eele, eele_floor)/dens, y0);
+          const Real pressure_sum = state.ion_pressure+state.electron_pressure;
+          ion_fraction = (pressure_sum > 0.0)
+              ? state.ion_pressure/pressure_sum
+              : ((component_sum > 0.0) ? eion/component_sum : 0.5);
+        }
         const Real residual = eint_aux-component_sum;
         Real ion_extra = fmax(eion+ion_fraction*residual-eion_floor, 0.0);
         Real electron_extra = fmax(

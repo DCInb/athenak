@@ -258,9 +258,31 @@ TaskStatus MHD::BiermannConToPrim(Driver *pdrive, int stage) {
   int n1m1 = indcs.nx1 + 2*indcs.ng - 1;
   int n2m1 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng - 1 : 0;
   int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
-  peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
+
+  // An intermediate subcycle stage is consumed only by the Biermann face/edge
+  // stencil.  Its widest access is one cell beyond the active domain, so closing
+  // the second ghost layer repeats the expensive mixed-material inverse without
+  // supplying a value that the next microstage can read.  The closing stage of
+  // every Strang half-step still refreshes the complete ghost domain: the regular
+  // MHD reconstruction that follows is allowed to consume both ghost layers.
+  int il = 0, iu = n1m1;
+  int jl = 0, ju = n2m1;
+  int kl = 0, ku = n3m1;
+  if (!biermann_stage_full_thermodynamics) {
+    il = indcs.is - 1;
+    iu = indcs.ie + 1;
+    if (indcs.nx2 > 1) {
+      jl = indcs.js - 1;
+      ju = indcs.je + 1;
+    }
+    if (indcs.nx3 > 1) {
+      kl = indcs.ks - 1;
+      ku = indcs.ke + 1;
+    }
+  }
+  peos->ConsToPrim(u0, b0, w0, bcc0, false, il, iu, jl, ju, kl, ku);
   ptwo_temp->CloseBiermannStage(
-      u0, w0, 0, n1m1, 0, n2m1, 0, n3m1,
+      u0, w0, il, iu, jl, ju, kl, ku,
       biermann_stage_full_thermodynamics);
   return TaskStatus::complete;
 }

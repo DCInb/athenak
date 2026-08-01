@@ -215,6 +215,62 @@ int MinimumTemperatureRoundTripsExactlyOnDevice(
   return exact_count;
 }
 
+struct CachedDeviceConstants {
+  Real log_density_to_cgs = 0.0;
+  Real log_temperature_to_kelvin = 0.0;
+  Real minimum_density_code = 0.0;
+  Real maximum_density_code = 0.0;
+  Real minimum_temperature_code = 0.0;
+  Real maximum_temperature_code = 0.0;
+};
+
+CachedDeviceConstants CacheDeviceConstants(
+    const DvceArray1D<Real> &log_density, const int ndensity,
+    const DvceArray1D<Real> &log_temperature, const int ntemperature,
+    const Real density_to_cgs, const Real temperature_to_kelvin) {
+  DualArray1D<Real> device_constants("ionmix-2t-device-constants", 6);
+  const DvceArray1D<Real> constants = device_constants.d_view;
+  Kokkos::parallel_for(
+      "ionmix-cache-device-constants", Kokkos::RangePolicy<>(0, 1),
+      KOKKOS_LAMBDA(const int) {
+        constants(0) = log(density_to_cgs);
+        constants(1) = log(temperature_to_kelvin);
+        constants(2) = exp(log_density(0))/density_to_cgs;
+        constants(3) = exp(log_density(ndensity-1))/density_to_cgs;
+        constants(4) = exp(log_temperature(0))/temperature_to_kelvin;
+        constants(5) = exp(log_temperature(ntemperature-1))/temperature_to_kelvin;
+      });
+  device_constants.modify_device();
+  device_constants.sync_host();
+
+  CachedDeviceConstants result;
+  result.log_density_to_cgs = device_constants.h_view(0);
+  result.log_temperature_to_kelvin = device_constants.h_view(1);
+  result.minimum_density_code = device_constants.h_view(2);
+  result.maximum_density_code = device_constants.h_view(3);
+  result.minimum_temperature_code = device_constants.h_view(4);
+  result.maximum_temperature_code = device_constants.h_view(5);
+  return result;
+}
+
+void CacheValueLogs(const DvceArray3D<Real> &values,
+                    const DvceArray3D<Real> &log_values,
+                    const int nfields, const int ndensity,
+                    const int ntemperature) {
+  const int count = nfields*ndensity*ntemperature;
+  Kokkos::parallel_for(
+      "ionmix-cache-value-logs", Kokkos::RangePolicy<>(0, count),
+      KOKKOS_LAMBDA(const int index) {
+        const int temperature = index%ntemperature;
+        const int field_density = index/ntemperature;
+        const int density = field_density%ndensity;
+        const int field = field_density/ndensity;
+        const Real value = values(field, density, temperature);
+        log_values(field, density, temperature) =
+            (value > 0.0) ? log(value) : 0.0;
+      });
+}
+
 } // namespace
 
 //----------------------------------------------------------------------------------------
@@ -225,7 +281,8 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
     options_(options),
     log_density_cgs_("ionmix-2t-log-density", 1),
     log_temperature_kelvin_("ionmix-2t-log-temperature", 1),
-    values_("ionmix-2t-values", 1, 1, 1) {
+    values_("ionmix-2t-values", 1, 1, 1),
+    log_values_("ionmix-2t-log-values", 1, 1, 1) {
   ValidateOptions(filename, options_);
 
   int format_version = 0;
@@ -234,6 +291,7 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   Real abar = 0.0;
   bool ion_energy_positive = false;
   bool electron_energy_positive = false;
+  bool pressure_interpolation_safely_finite = false;
   std::uint64_t fingerprint = 0;
   std::uint64_t file_size = 0;
   std::vector<Real> density;
@@ -304,6 +362,11 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
           "ion_pressure", "electron_pressure",
           "ion_specific_internal_energy", "electron_specific_internal_energy",
           "mean_ionization"};
+      pressure_interpolation_safely_finite = true;
+      // Keep headroom in both the native and code-unit domains for two nested
+      // non-negative interpolation stages followed by a four-term mixed pressure sum.
+      const Real safe_pressure_limit =
+          std::numeric_limits<Real>::max()/64.0;
       for (int field = 0; field < IonmixTwoTemperatureTableDevice::nfields; ++field) {
         tokens.Expect(labels[field]);
         for (int id = 0; id < ndensity; ++id) {
@@ -326,9 +389,16 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
                                       electron_specific_internal_energy)
                            ? options_.specific_energy_from_cgs
                            : 1.0);
-            if (!std::isfinite(value*output_scale)) {
+            const Real scaled_value = value*output_scale;
+            if (!std::isfinite(scaled_value)) {
               throw std::runtime_error(
                   std::string(labels[field]) + " overflows its code-unit scale");
+            }
+            if ((field == IonmixTwoTemperatureTableDevice::ion_pressure ||
+                 field == IonmixTwoTemperatureTableDevice::electron_pressure) &&
+                (!(value < safe_pressure_limit) ||
+                 !(scaled_value < safe_pressure_limit))) {
+              pressure_interpolation_safely_finite = false;
             }
             values[TableValueIndex(
                 field, id, it, ndensity, ntemperature)] = value;
@@ -372,11 +442,12 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   }
 
 #if MPI_PARALLEL_ENABLED
-  int header[5] = {
+  int header[6] = {
       format_version, ndensity, ntemperature,
       ion_energy_positive ? 1 : 0,
-      electron_energy_positive ? 1 : 0};
-  int ierr = MPI_Bcast(header, 5, MPI_INT, 0, MPI_COMM_WORLD);
+      electron_energy_positive ? 1 : 0,
+      pressure_interpolation_safely_finite ? 1 : 0};
+  int ierr = MPI_Bcast(header, 6, MPI_INT, 0, MPI_COMM_WORLD);
   if (ierr != MPI_SUCCESS) {
     IonmixTableError(filename, "could not broadcast table metadata");
   }
@@ -385,6 +456,7 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   ntemperature = header[2];
   ion_energy_positive = header[3] != 0;
   electron_energy_positive = header[4] != 0;
+  pressure_interpolation_safely_finite = header[5] != 0;
   if (format_version != 1 || ndensity < 2 || ntemperature < 2) {
     IonmixTableError(filename, "broadcast table metadata is invalid");
   }
@@ -440,6 +512,8 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   Kokkos::realloc(log_temperature_kelvin_, ntemperature);
   Kokkos::realloc(
       values_, IonmixTwoTemperatureTableDevice::nfields, ndensity, ntemperature);
+  Kokkos::realloc(
+      log_values_, IonmixTwoTemperatureTableDevice::nfields, ndensity, ntemperature);
   for (int id = 0; id < ndensity; ++id) {
     log_density_cgs_.h_view(id) = std::log(density[id]);
   }
@@ -460,6 +534,23 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   log_density_cgs_.sync_device();
   log_temperature_kelvin_.sync_device();
   values_.sync_device();
+  CacheValueLogs(
+      values_.d_view, log_values_.d_view,
+      IonmixTwoTemperatureTableDevice::nfields, ndensity, ntemperature);
+  log_values_.modify_device();
+
+  // These expressions used to run in every table query.  Evaluate them once on the
+  // active device backend so cached values retain the exact CUDA log/exp/div rounding
+  // of the original hot path rather than introducing host-libm values.
+  const CachedDeviceConstants device_constants = CacheDeviceConstants(
+      log_density_cgs_.d_view, ndensity, log_temperature_kelvin_.d_view,
+      ntemperature, options_.density_to_cgs, options_.temperature_to_kelvin);
+  log_density_to_cgs_ = device_constants.log_density_to_cgs;
+  log_temperature_to_kelvin_ = device_constants.log_temperature_to_kelvin;
+  minimum_density_code_ = device_constants.minimum_density_code;
+  maximum_density_code_ = device_constants.maximum_density_code;
+  minimum_temperature_code_ = device_constants.minimum_temperature_code;
+  maximum_temperature_code_ = device_constants.maximum_temperature_code;
 
   minimum_temperature_round_trips_exactly_ =
       MinimumTemperatureRoundTripsExactlyOnDevice(
@@ -479,6 +570,8 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   metadata_.maximum_temperature_kelvin = temperature.back();
   metadata_.ion_energy_is_strictly_positive = ion_energy_positive;
   metadata_.electron_energy_is_strictly_positive = electron_energy_positive;
+  metadata_.pressure_interpolation_is_safely_finite =
+      pressure_interpolation_safely_finite;
 
   if (rank == 0) {
     std::cout << "Loaded separate ion/electron IONMIX table " << filename
@@ -499,6 +592,7 @@ IonmixTwoTemperatureTableDevice IonmixTwoTemperatureTable::DeviceData() const {
   result.log_density_cgs = log_density_cgs_.d_view;
   result.log_temperature_kelvin = log_temperature_kelvin_.d_view;
   result.values = values_.d_view;
+  result.log_values = log_values_.d_view;
   result.ndensity = metadata_.ndensity;
   result.ntemperature = metadata_.ntemperature;
   result.bounds_error =
@@ -508,6 +602,8 @@ IonmixTwoTemperatureTableDevice IonmixTwoTemperatureTable::DeviceData() const {
       metadata_.ion_energy_is_strictly_positive;
   result.electron_energy_is_strictly_positive =
       metadata_.electron_energy_is_strictly_positive;
+  result.pressure_interpolation_is_safely_finite =
+      metadata_.pressure_interpolation_is_safely_finite;
   result.minimum_temperature_round_trips_exactly =
       minimum_temperature_round_trips_exactly_;
   result.abar = metadata_.abar;
@@ -515,6 +611,12 @@ IonmixTwoTemperatureTableDevice IonmixTwoTemperatureTable::DeviceData() const {
   result.temperature_to_kelvin = options_.temperature_to_kelvin;
   result.pressure_from_cgs = options_.pressure_from_cgs;
   result.specific_energy_from_cgs = options_.specific_energy_from_cgs;
+  result.log_density_to_cgs = log_density_to_cgs_;
+  result.log_temperature_to_kelvin = log_temperature_to_kelvin_;
+  result.minimum_density_code = minimum_density_code_;
+  result.maximum_density_code = maximum_density_code_;
+  result.minimum_temperature_code = minimum_temperature_code_;
+  result.maximum_temperature_code = maximum_temperature_code_;
   return result;
 }
 

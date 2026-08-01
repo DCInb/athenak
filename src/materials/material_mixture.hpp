@@ -267,11 +267,13 @@ struct MaterialMixtureDevice {
   Real SpeciesComponentEnergyFromCachedDensity(
       const IonmixTwoTemperatureTableDevice &table,
       const IonmixComponent component, const Real temperature,
+      const Real log_temperature,
       const SpeciesDensityCache &density_cache,
       IonmixEnergyIntervalCache &energy_cache) const {
     if (density_cache.status == 1) return 0.0;
     return table.ComponentEnergyFromPreparedDensityTemperature(
-        component, density_cache.location, temperature, energy_cache);
+        component, density_cache.location, temperature, log_temperature,
+        energy_cache);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -281,12 +283,15 @@ struct MaterialMixtureDevice {
       MixedEnergyIntervalCache &energy_cache) const {
     const Real y0 = ClampMassFraction(y0_in);
     const Real y1 = 1.0-y0;
+    // Both material tables receive the same rounded exp(log_trial).  Evaluate its
+    // logarithm once while preserving the legacy exp-then-log inverse trajectory.
+    const Real log_temperature = log(temperature);
     const Real energy0 = SpeciesComponentEnergyFromCachedDensity(
-        material0_table, component, temperature, density_cache.material0,
-        energy_cache.material0);
+        material0_table, component, temperature, log_temperature,
+        density_cache.material0, energy_cache.material0);
     const Real energy1 = SpeciesComponentEnergyFromCachedDensity(
-        material1_table, component, temperature, density_cache.material1,
-        energy_cache.material1);
+        material1_table, component, temperature, log_temperature,
+        density_cache.material1, energy_cache.material1);
     return y0*energy0+y1*energy1;
   }
 
@@ -611,9 +616,9 @@ struct MaterialMixtureDevice {
   // temperature.  Pure-material table inverses are already logarithmic and inexpensive;
   // a mixed state needs only its two endpoint energies instead of 48 bisection probes.
   KOKKOS_INLINE_FUNCTION
-  int MixtureComponentSpecificEnergyQueryFlags(
+  int MixtureComponentSpecificEnergyQueryFlagsCached(
       const IonmixComponent component, const Real density,
-      const Real target_energy, const Real y0) const {
+      const Real target_energy, const Real y0, MixedDensityCache &cache) const {
     if (!Kokkos::isfinite(target_energy)) {
       Kokkos::abort("Mixed IONMIX inverse energy must be finite.");
     }
@@ -634,7 +639,6 @@ struct MaterialMixtureDevice {
           component, density, inverse.temperature, y0);
       return inverse.query_flags | forward.query_flags;
     }
-    MixedDensityCache cache;
     const ComponentAtTemperature minimum = MixtureComponentFromCachedDensity(
         component, density, MinimumTemperatureForComposition(y0), y0, cache);
     const ComponentAtTemperature maximum = MixtureComponentFromCachedDensity(
@@ -646,32 +650,41 @@ struct MaterialMixtureDevice {
       if (error_bounds) {
         Kokkos::abort("Mixed IONMIX inverse energy is below the table range.");
       }
-      const ComponentAtTemperature forward = MixtureComponentFromRhoTemperature(
-          component, density, minimum.temperature, y0);
-      return minimum.query_flags | forward.query_flags |
+      const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
+          density, minimum.temperature, y0).query_flags;
+      return minimum.query_flags | forward_query_flags |
              ionmix_energy_below_table;
     } else if (target_energy > maximum.specific_internal_energy) {
       if (error_bounds) {
         Kokkos::abort("Mixed IONMIX inverse energy is above the table range.");
       }
-      const ComponentAtTemperature forward = MixtureComponentFromRhoTemperature(
-          component, density, maximum.temperature, y0);
-      return maximum.query_flags | forward.query_flags |
+      const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
+          density, maximum.temperature, y0).query_flags;
+      return maximum.query_flags | forward_query_flags |
              ionmix_energy_above_table;
     }
     if (target_energy == minimum.specific_internal_energy) {
-      const ComponentAtTemperature forward = MixtureComponentFromRhoTemperature(
-          component, density, minimum.temperature, y0);
-      return minimum.query_flags | forward.query_flags;
+      const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
+          density, minimum.temperature, y0).query_flags;
+      return minimum.query_flags | forward_query_flags;
     }
     if (target_energy == maximum.specific_internal_energy) {
-      const ComponentAtTemperature forward = MixtureComponentFromRhoTemperature(
-          component, density, maximum.temperature, y0);
-      return maximum.query_flags | forward.query_flags;
+      const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
+          density, maximum.temperature, y0).query_flags;
+      return maximum.query_flags | forward_query_flags;
     }
     constexpr int density_query_flags =
         ionmix_density_below_table | ionmix_density_above_table;
     return query_flags & density_query_flags;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  int MixtureComponentSpecificEnergyQueryFlags(
+      const IonmixComponent component, const Real density,
+      const Real target_energy, const Real y0) const {
+    MixedDensityCache cache;
+    return MixtureComponentSpecificEnergyQueryFlagsCached(
+        component, density, target_energy, y0, cache);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -855,6 +868,17 @@ struct MaterialMixtureDevice {
  public:
   KOKKOS_INLINE_FUNCTION
   bool UsesTabularEOS() const { return use_tabular_eos; }
+
+  // Each table loader reserves enough exponent headroom for four interpolated
+  // non-negative pressure contributions (two materials times ion/electron).  This
+  // capability permits exact zero-residual shortcuts that would otherwise have to
+  // preserve a legacy inf/inf pressure ratio.
+  KOKKOS_INLINE_FUNCTION
+  bool TabularPressureSumsAreSafelyFinite() const {
+    return use_tabular_eos &&
+           material0_table.pressure_interpolation_is_safely_finite &&
+           material1_table.pressure_interpolation_is_safely_finite;
+  }
 
   KOKKOS_INLINE_FUNCTION
   Real ClampMassFraction(const Real y0) const {
@@ -1392,6 +1416,30 @@ struct MaterialMixtureDevice {
     if (!use_tabular_eos) return ionmix_query_in_bounds;
     return MixtureComponentSpecificEnergyQueryFlags(
         IonmixComponent::ion, density, ion_specific_energy, y0);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  int ElectronSpecificEnergyQueryFlags(
+      const Real density, const Real electron_specific_energy,
+      const Real y0) const {
+    if (!use_tabular_eos) return ionmix_query_in_bounds;
+    return MixtureComponentSpecificEnergyQueryFlags(
+        IonmixComponent::electron, density, electron_specific_energy, y0);
+  }
+
+  // Paired form reuses the two prepared partial-density locations, matching the
+  // ion-then-electron evaluation order of the full pressure/energy closure.
+  KOKKOS_INLINE_FUNCTION
+  int SpecificEnergiesQueryFlags(
+      const Real density, const Real ion_specific_energy,
+      const Real electron_specific_energy, const Real y0) const {
+    if (!use_tabular_eos) return ionmix_query_in_bounds;
+    MixedDensityCache cache;
+    int query_flags = MixtureComponentSpecificEnergyQueryFlagsCached(
+        IonmixComponent::ion, density, ion_specific_energy, y0, cache);
+    query_flags |= MixtureComponentSpecificEnergyQueryFlagsCached(
+        IonmixComponent::electron, density, electron_specific_energy, y0, cache);
+    return query_flags;
   }
 
   // Reduced state for pressure/floor-only paths.  The tabular branch intentionally

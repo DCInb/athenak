@@ -71,6 +71,7 @@ struct IonmixTwoTemperatureTableMetadata {
   Real maximum_temperature_kelvin = 0.0;
   bool ion_energy_is_strictly_positive = false;
   bool electron_energy_is_strictly_positive = false;
+  bool pressure_interpolation_is_safely_finite = false;
 };
 
 struct IonmixComponentState {
@@ -110,6 +111,8 @@ struct IonmixDensityLocation {
 struct IonmixEnergyIntervalCache {
   Real lower_energy = 0.0;
   Real upper_energy = 0.0;
+  Real log_lower_energy = 0.0;
+  Real log_upper_energy = 0.0;
   int temperature_lower = -1;
 };
 
@@ -137,18 +140,26 @@ struct IonmixTwoTemperatureTableDevice {
   DvceArray1D<Real> log_density_cgs;
   DvceArray1D<Real> log_temperature_kelvin;
   DvceArray3D<Real> values;
+  DvceArray3D<Real> log_values;
   int ndensity = 0;
   int ntemperature = 0;
   int bounds_error = 0;
   bool geometric_interpolation = true;
   bool ion_energy_is_strictly_positive = false;
   bool electron_energy_is_strictly_positive = false;
+  bool pressure_interpolation_is_safely_finite = false;
   int minimum_temperature_round_trips_exactly = 0;
   Real abar = 0.0;
   Real density_to_cgs = 1.0;
   Real temperature_to_kelvin = 1.0;
   Real pressure_from_cgs = 1.0;
   Real specific_energy_from_cgs = 1.0;
+  Real log_density_to_cgs = 0.0;
+  Real log_temperature_to_kelvin = 0.0;
+  Real minimum_density_code = 0.0;
+  Real maximum_density_code = 0.0;
+  Real minimum_temperature_code = 0.0;
+  Real maximum_temperature_code = 0.0;
 
  private:
   struct AxisLocation {
@@ -158,14 +169,19 @@ struct IonmixTwoTemperatureTableDevice {
     int query_flags = ionmix_query_in_bounds;
   };
 
+  template <bool log_coordinate_is_precomputed = false>
   KOKKOS_INLINE_FUNCTION
   AxisLocation Locate(const DvceArray1D<Real> &axis, const int size,
-                      const Real code_coordinate, const Real unit_scale,
-                      const int low_flag, const int high_flag) const {
+                      const Real code_coordinate, const Real log_unit_scale,
+                      const int low_flag, const int high_flag,
+                      const int lower_hint = -1,
+                      const Real precomputed_log_coordinate = 0.0) const {
     if (!Kokkos::isfinite(code_coordinate) || !(code_coordinate > 0.0)) {
       Kokkos::abort("IONMIX table coordinates must be finite and positive.");
     }
-    const Real coordinate = log(code_coordinate)+log(unit_scale);
+    const Real log_coordinate = log_coordinate_is_precomputed
+        ? precomputed_log_coordinate : log(code_coordinate);
+    const Real coordinate = log_coordinate+log_unit_scale;
     if (!Kokkos::isfinite(coordinate)) {
       Kokkos::abort("IONMIX table coordinate conversion is not finite.");
     }
@@ -204,6 +220,18 @@ struct IonmixTwoTemperatureTableDevice {
       return result;
     }
 
+    // Repeated inverse probes normally remain in one native temperature interval.
+    // Intervals own [axis[lower], axis[lower+1]); exact internal nodes therefore fall
+    // through to the ordinary search unless the hint already names the upper interval.
+    if (lower_hint >= 0 && lower_hint < size-1 &&
+        coordinate >= axis(lower_hint) && coordinate < axis(lower_hint+1)) {
+      result.lower = lower_hint;
+      result.fraction =
+          (coordinate-axis(lower_hint))/(axis(lower_hint+1)-axis(lower_hint));
+      result.bounded_log_coordinate = coordinate;
+      return result;
+    }
+
     int lower = 0;
     int upper = size-1;
     while (upper-lower > 1) {
@@ -235,6 +263,36 @@ struct IonmixTwoTemperatureTableDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  Real InterpolatePairWithLogs(const Real lower, const Real upper,
+                               const Real log_lower, const Real log_upper,
+                               const Real fraction,
+                               const bool allow_geometric) const {
+    if (fraction <= 0.0) return lower;
+    if (fraction >= 1.0) return upper;
+    if (allow_geometric && lower > 0.0 && upper > 0.0) {
+      return exp(Kokkos::fma(
+          fraction, log_upper, (1.0-fraction)*log_lower));
+    }
+    return Kokkos::fma(fraction, upper, (1.0-fraction)*lower);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real InterpolateTablePair(const int field, const int lower_density,
+                            const int upper_density, const int temperature,
+                            const Real fraction, const bool allow_geometric) const {
+    const Real lower = values(field, lower_density, temperature);
+    const Real upper = values(field, upper_density, temperature);
+    if (fraction <= 0.0) return lower;
+    if (fraction >= 1.0) return upper;
+    if (allow_geometric && lower > 0.0 && upper > 0.0) {
+      return exp(Kokkos::fma(
+          fraction, log_values(field, upper_density, temperature),
+          (1.0-fraction)*log_values(field, lower_density, temperature)));
+    }
+    return Kokkos::fma(fraction, upper, (1.0-fraction)*lower);
+  }
+
+  KOKKOS_INLINE_FUNCTION
   bool FieldAllowsGeometricInterpolation(const int field) const {
     if (!geometric_interpolation) return false;
     if (field == ion_specific_internal_energy) {
@@ -257,12 +315,10 @@ struct IonmixTwoTemperatureTableDevice {
 
     // Interpolating density first makes the exact values on every temperature plane
     // independent of which adjacent temperature cell owns a boundary query.
-    const Real at_lower_temperature = InterpolatePair(
-        values(field, id0, it0), values(field, id1, it0),
-        density.fraction, geometric);
-    const Real at_upper_temperature = InterpolatePair(
-        values(field, id0, it1), values(field, id1, it1),
-        density.fraction, geometric);
+    const Real at_lower_temperature = InterpolateTablePair(
+        field, id0, id1, it0, density.fraction, geometric);
+    const Real at_upper_temperature = InterpolateTablePair(
+        field, id0, id1, it1, density.fraction, geometric);
     return InterpolatePair(at_lower_temperature, at_upper_temperature,
                            temperature.fraction, geometric);
   }
@@ -270,9 +326,8 @@ struct IonmixTwoTemperatureTableDevice {
   KOKKOS_INLINE_FUNCTION
   Real ValueAtTemperatureIndex(const int field, const AxisLocation &density,
                                const int temperature_index) const {
-    return InterpolatePair(
-        values(field, density.lower, temperature_index),
-        values(field, density.lower+1, temperature_index),
+    return InterpolateTablePair(
+        field, density.lower, density.lower+1, temperature_index,
         density.fraction, FieldAllowsGeometricInterpolation(field));
   }
 
@@ -305,22 +360,22 @@ struct IonmixTwoTemperatureTableDevice {
  public:
   KOKKOS_INLINE_FUNCTION
   Real MinimumDensityCode() const {
-    return exp(log_density_cgs(0))/density_to_cgs;
+    return minimum_density_code;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real MaximumDensityCode() const {
-    return exp(log_density_cgs(ndensity-1))/density_to_cgs;
+    return maximum_density_code;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real MinimumTemperatureCode() const {
-    return exp(log_temperature_kelvin(0))/temperature_to_kelvin;
+    return minimum_temperature_code;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real MaximumTemperatureCode() const {
-    return exp(log_temperature_kelvin(ntemperature-1))/temperature_to_kelvin;
+    return maximum_temperature_code;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -331,7 +386,7 @@ struct IonmixTwoTemperatureTableDevice {
   KOKKOS_INLINE_FUNCTION
   IonmixDensityLocation PrepareDensityLocation(const Real code_density) const {
     const AxisLocation density = Locate(
-        log_density_cgs, ndensity, code_density, density_to_cgs,
+        log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
     IonmixDensityLocation result;
     result.lower = density.lower;
@@ -350,7 +405,7 @@ struct IonmixTwoTemperatureTableDevice {
     density.query_flags = prepared_density.query_flags;
     const AxisLocation temperature = Locate(
         log_temperature_kelvin, ntemperature, code_temperature,
-        temperature_to_kelvin, ionmix_temperature_below_table,
+        log_temperature_to_kelvin, ionmix_temperature_below_table,
         ionmix_temperature_above_table);
     return StateAtLocations(component, density, temperature);
   }
@@ -358,33 +413,41 @@ struct IonmixTwoTemperatureTableDevice {
   KOKKOS_INLINE_FUNCTION
   Real ComponentEnergyFromPreparedDensityTemperature(
       const IonmixComponent component, const IonmixDensityLocation &prepared_density,
-      const Real code_temperature, IonmixEnergyIntervalCache &cache) const {
+      const Real code_temperature, const Real log_code_temperature,
+      IonmixEnergyIntervalCache &cache) const {
     AxisLocation density;
     density.lower = prepared_density.lower;
     density.fraction = prepared_density.fraction;
     density.query_flags = prepared_density.query_flags;
-    const AxisLocation temperature = Locate(
+    const AxisLocation temperature = Locate<true>(
         log_temperature_kelvin, ntemperature, code_temperature,
-        temperature_to_kelvin, ionmix_temperature_below_table,
-        ionmix_temperature_above_table);
+        log_temperature_to_kelvin, ionmix_temperature_below_table,
+        ionmix_temperature_above_table, cache.temperature_lower,
+        log_code_temperature);
     const int energy_field = EnergyField(component);
     if (cache.temperature_lower != temperature.lower) {
       cache.lower_energy =
           ValueAtTemperatureIndex(energy_field, density, temperature.lower);
       cache.upper_energy =
           ValueAtTemperatureIndex(energy_field, density, temperature.lower+1);
+      if (FieldAllowsGeometricInterpolation(energy_field) &&
+          cache.lower_energy > 0.0 && cache.upper_energy > 0.0) {
+        cache.log_lower_energy = log(cache.lower_energy);
+        cache.log_upper_energy = log(cache.upper_energy);
+      }
       cache.temperature_lower = temperature.lower;
     }
-    return specific_energy_from_cgs*InterpolatePair(
-        cache.lower_energy, cache.upper_energy, temperature.fraction,
-        FieldAllowsGeometricInterpolation(energy_field));
+    return specific_energy_from_cgs*InterpolatePairWithLogs(
+        cache.lower_energy, cache.upper_energy,
+        cache.log_lower_energy, cache.log_upper_energy,
+        temperature.fraction, FieldAllowsGeometricInterpolation(energy_field));
   }
 
   KOKKOS_INLINE_FUNCTION
   IonmixPressureEnergyState PressureEnergyFromRhoMinimumTemperature(
       const Real code_density) const {
     const AxisLocation density = Locate(
-        log_density_cgs, ndensity, code_density, density_to_cgs,
+        log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
     if (minimum_temperature_round_trips_exactly == 0) {
       return PressureEnergyFromRhoTemperature(
@@ -412,11 +475,11 @@ struct IonmixTwoTemperatureTableDevice {
   IonmixPressureEnergyState PressureEnergyFromRhoTemperature(
       const Real code_density, const Real code_temperature) const {
     const AxisLocation density = Locate(
-        log_density_cgs, ndensity, code_density, density_to_cgs,
+        log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
     const AxisLocation temperature = Locate(
         log_temperature_kelvin, ntemperature, code_temperature,
-        temperature_to_kelvin, ionmix_temperature_below_table,
+        log_temperature_to_kelvin, ionmix_temperature_below_table,
         ionmix_temperature_above_table);
     IonmixPressureEnergyState result;
     result.ion_pressure = pressure_from_cgs*
@@ -438,11 +501,11 @@ struct IonmixTwoTemperatureTableDevice {
     // exp/log round trip as ComponentFromRhoTemperature, while omitting only the
     // pressure and energy field evaluations.
     const AxisLocation density = Locate(
-        log_density_cgs, ndensity, code_density, density_to_cgs,
+        log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
     const AxisLocation temperature = Locate(
         log_temperature_kelvin, ntemperature, code_temperature,
-        temperature_to_kelvin, ionmix_temperature_below_table,
+        log_temperature_to_kelvin, ionmix_temperature_below_table,
         ionmix_temperature_above_table);
     IonmixTemperatureState result;
     result.temperature =
@@ -482,7 +545,7 @@ struct IonmixTwoTemperatureTableDevice {
       Kokkos::abort("IONMIX inverse energy must be finite.");
     }
     const AxisLocation density = Locate(
-        log_density_cgs, ndensity, code_density, density_to_cgs,
+        log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
     const int energy_field = EnergyField(component);
     const Real target = code_specific_energy/specific_energy_from_cgs;
@@ -591,11 +654,11 @@ struct IonmixTwoTemperatureTableDevice {
   Real MeanIonizationFromRhoTemperature(const Real code_density,
                                         const Real code_temperature) const {
     const AxisLocation density = Locate(
-        log_density_cgs, ndensity, code_density, density_to_cgs,
+        log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
     const AxisLocation temperature = Locate(
         log_temperature_kelvin, ntemperature, code_temperature,
-        temperature_to_kelvin, ionmix_temperature_below_table,
+        log_temperature_to_kelvin, ionmix_temperature_below_table,
         ionmix_temperature_above_table);
     return EvaluateWithLocations(mean_ionization, density, temperature);
   }
@@ -652,7 +715,14 @@ class IonmixTwoTemperatureTable {
   DualArray1D<Real> log_density_cgs_;
   DualArray1D<Real> log_temperature_kelvin_;
   DualArray3D<Real> values_;
+  DualArray3D<Real> log_values_;
   int minimum_temperature_round_trips_exactly_ = 0;
+  Real log_density_to_cgs_ = 0.0;
+  Real log_temperature_to_kelvin_ = 0.0;
+  Real minimum_density_code_ = 0.0;
+  Real maximum_density_code_ = 0.0;
+  Real minimum_temperature_code_ = 0.0;
+  Real maximum_temperature_code_ = 0.0;
 };
 
 } // namespace materials
