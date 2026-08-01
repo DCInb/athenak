@@ -66,6 +66,7 @@ class Driver {
   Real physics_dt_;             // timestep before output/terminal event alignment
   StopReason stop_reason_;
   void OutputCycleDiagnostics(Mesh *pm);
+  void ExecuteBiermannHalfStep(Mesh *pm, Real interval);
   void LimitTimeStepToNextOutput(Mesh *pm, Outputs *pout);
   Real UpdateWallClock();
 };

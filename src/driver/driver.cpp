@@ -338,6 +338,94 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn Driver::ExecuteBiermannHalfStep()
+//! \brief Tile one Strang half-interval with globally synchronized SSPRK2 microsteps.
+
+void Driver::ExecuteBiermannHalfStep(Mesh *pm, Real interval) {
+  mhd::MHD *pmhd = pm->pmb_pack->pmhd;
+  if (pmhd == nullptr || !pmhd->BiermannSubcycleActive() || interval <= 0.0) return;
+
+  Real remaining = interval;
+  int nsteps = 0;
+  while (remaining > 0.0) {
+    Real limit = pmhd->BiermannSubcycleTimeStepLimit();
+#if MPI_PARALLEL_ENABLED
+    // Every rank must reach the same collective even when one local state produces an
+    // invalid limit.  Exiting before the reduction can strand the healthy ranks inside
+    // MPI_Allreduce.  Positive infinity is deliberate: it is the no-local-restriction
+    // sentinel returned for a vanishing local Biermann characteristic speed.
+    int invalid_limit = (!(limit > 0.0) || std::isnan(limit)) ? 1 : 0;
+    int any_invalid_limit = 0;
+    MPI_Allreduce(&invalid_limit, &any_invalid_limit, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_invalid_limit != 0) {
+      if (invalid_limit != 0) {
+        std::cerr << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Invalid local Biermann subcycle timestep limit on "
+                  << "rank " << global_variable::my_rank << ": " << limit
+                  << std::endl;
+      }
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+      std::exit(EXIT_FAILURE);
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &limit, 1, MPI_ATHENA_REAL, MPI_MIN,
+                  MPI_COMM_WORLD);
+#else
+    if (!(limit > 0.0) || std::isnan(limit)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Invalid local Biermann subcycle timestep limit: "
+                << limit << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+#endif
+    if (!(limit > 0.0) || std::isnan(limit)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Invalid global Biermann subcycle timestep limit: "
+                << limit << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+
+    if (++nsteps > pmhd->biermann_subcycle_max_steps) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Biermann half-step requires more than "
+                << pmhd->biermann_subcycle_max_steps << " microsteps; remaining="
+                << remaining << " stability_limit=" << limit << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+
+    Real h = std::min(remaining, limit);
+    if (!(h > 0.0) || remaining - h == remaining) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Biermann microstep cannot advance the half-interval: "
+                << "h=" << h << " remaining=" << remaining << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+
+    pmhd->biermann_substep_dt = h;
+    ExecuteTaskList(pm, "biermann_stage", 1);
+    ExecuteTaskList(pm, "biermann_stage", 2);
+
+    pmhd->biermann_substeps_last_cycle++;
+    pmhd->biermann_substeps_total++;
+    pmhd->biermann_interval_last_cycle += h;
+    pmhd->biermann_dt_min_last_cycle =
+        std::min(pmhd->biermann_dt_min_last_cycle, limit);
+    pmhd->biermann_dt_max_last_cycle =
+        std::max(pmhd->biermann_dt_max_last_cycle, limit);
+    pmhd->biermann_max_stability_ratio_last_cycle = std::max(
+        pmhd->biermann_max_stability_ratio_last_cycle, h / limit);
+
+    // Assign zero explicitly on the closing step.  This avoids an extra tiny step from
+    // subtraction roundoff and makes the two half-interval sums equal the macro dt.
+    if (h >= remaining) {
+      remaining = 0.0;
+    } else {
+      remaining -= h;
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! Shorten the next step so time-based outputs land within Real roundoff of schedule.
 //! This is opt-in because exact output alignment can add timesteps to existing problems.
 
@@ -508,6 +596,19 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Work before time integrator indicated by "0" in stage
       ExecuteTaskList(pmesh, "before_timeintegrator", 0);
 
+      mhd::MHD *pmhd = pmesh->pmb_pack->pmhd;
+      if (pmhd != nullptr && pmhd->biermann_subcycle) {
+        pmhd->biermann_substeps_last_cycle = 0;
+        pmhd->biermann_dt_min_last_cycle = std::numeric_limits<Real>::max();
+        pmhd->biermann_dt_max_last_cycle = 0.0;
+        pmhd->biermann_interval_last_cycle = 0.0;
+        pmhd->biermann_max_stability_ratio_last_cycle = 0.0;
+      }
+
+      // Symmetric multirate split: the complete existing macro operator is enclosed by
+      // two independently stable Biermann half-steps.
+      ExecuteBiermannHalfStep(pmesh, 0.5*pmesh->dt);
+
       // time-integrator tasks for each stage of integrator
       for (int stage=1; stage<=(nexp_stages); ++stage) {
         ExecuteTaskList(pmesh, "before_stagen", stage);
@@ -517,6 +618,29 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // Work after time integrator indicated by "1" in stage
       ExecuteTaskList(pmesh, "after_timeintegrator", 1);
+
+      const bool biermann_active =
+          pmhd != nullptr && pmhd->BiermannSubcycleActive();
+      const Real macro_start_time = pmesh->time;
+      if (biermann_active) {
+        // For a non-autonomous user boundary, Strang's leading and trailing B maps
+        // use the macro endpoints.  The leading half already saw macro_start_time;
+        // expose the endpoint to both this refresh and every trailing microstage.
+        pmesh->time = macro_start_time + pmesh->dt;
+        // Two-temperature exchange and matter-radiation coupling are local nonlinear
+        // sources applied after the final macro-stage boundary exchange.  Rebuild the
+        // restricted/coarse and ghost state before the trailing Biermann RHS; applying
+        // those sources independently to an interpolated AMR ghost is not equivalent to
+        // interpolating the source-updated fine state.
+        InitBoundaryValuesAndPrimitives(pmesh);
+      }
+      ExecuteBiermannHalfStep(pmesh, 0.5*pmesh->dt);
+      if (biermann_active) {
+        // TwoTempExchange normally produces the final MHD timestep cache, but the
+        // trailing Biermann half-step changes B and thermodynamics after that task.
+        (void)pmhd->NewTimeStep(this, nexp_stages);
+        pmesh->time = macro_start_time;
+      }
 
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
@@ -535,8 +659,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
             static_cast<float>(pmesh->nmb_total);
       }
 
-      // Test for/make outputs
-      for (auto &out : pout->pout_list) {
+      auto output_due = [&](BaseTypeOutput *out) {
         const auto &params = out->out_params;
         bool time_output_due = false;
         if (params.dt > 0.0) {
@@ -554,10 +677,22 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
             time_output_due = ((time_32 >= next_32) && (time_32 < tlim_32));
           }
         }
-        int &dcycle_ = out->out_params.dcycle;
+        return time_output_due ||
+               ((params.dcycle > 0) && (pmesh->ncycle % params.dcycle == 0));
+      };
 
-        if (time_output_due ||
-            ((dcycle_ > 0) && ((pmesh->ncycle)%(dcycle_) == 0)) ) {
+      // A scheduled adaptive restart must contain the topology selected at this cycle
+      // boundary.  Otherwise the uninterrupted run refines immediately after writing
+      // the file while the resumed run advances once on the stale topology.  Keep all
+      // other output ordering unchanged, including the legacy path.
+      const bool defer_adaptive_biermann_restart =
+          pmesh->adaptive && pmhd != nullptr && pmhd->BiermannSubcycleActive();
+
+      // Test for/make outputs
+      for (auto &out : pout->pout_list) {
+        if (defer_adaptive_biermann_restart &&
+            out->out_params.file_type == "rst") continue;
+        if (output_due(out)) {
           out->LoadOutputData(pmesh);
           out->WriteOutputFile(pmesh, pin);
         }
@@ -565,6 +700,14 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // AMR
       if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
+      if (defer_adaptive_biermann_restart) {
+        for (auto &out : pout->pout_list) {
+          if (out->out_params.file_type == "rst" && output_due(out)) {
+            out->LoadOutputData(pmesh);
+            out->WriteOutputFile(pmesh, pin);
+          }
+        }
+      }
       // compute new timestep AFTER all Meshblocks refined/derefined
       // Use the previous unconstrained physics timestep for the 2x growth limiter.
       // The completed pmesh->dt may be a much smaller output-alignment remainder.
@@ -692,7 +835,17 @@ void Driver::OutputCycleDiagnostics(Mesh *pm) {
     Real elapsed = pwall_clock_->seconds();
     std::cout << "elapsed=" << std::scientific << std::setprecision(dtprcsn) << elapsed
               << " cycle=" << pm->ncycle
-              << " time=" << pm->time << " dt=" << pm->dt << std::endl;
+              << " time=" << pm->time << " dt=" << pm->dt;
+    mhd::MHD *pmhd = pm->pmb_pack->pmhd;
+    if (pmhd != nullptr && pmhd->biermann_subcycle) {
+      std::cout << " biermann_substeps=" << pmhd->biermann_substeps_last_cycle
+                << " biermann_dt_min=" << pmhd->biermann_dt_min_last_cycle
+                << " biermann_dt_max=" << pmhd->biermann_dt_max_last_cycle
+                << " biermann_interval=" << pmhd->biermann_interval_last_cycle
+                << " biermann_max_ratio="
+                << pmhd->biermann_max_stability_ratio_last_cycle;
+    }
+    std::cout << std::endl;
   }
   return;
 }

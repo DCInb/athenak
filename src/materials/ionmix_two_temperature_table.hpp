@@ -80,6 +80,30 @@ struct IonmixComponentState {
   int query_flags = ionmix_query_in_bounds;
 };
 
+// Both component pressure/energy pairs at one density and temperature. This reduced
+// state omits the canonical temperature when the caller does not consume it.
+struct IonmixPressureEnergyState {
+  Real ion_pressure = 0.0;
+  Real electron_pressure = 0.0;
+  Real ion_specific_internal_energy = 0.0;
+  Real electron_specific_internal_energy = 0.0;
+  int query_flags = ionmix_query_in_bounds;
+};
+
+// Canonical temperature and bounds diagnostics without field interpolation.
+struct IonmixTemperatureState {
+  Real temperature = 0.0;
+  int query_flags = ionmix_query_in_bounds;
+};
+
+// Density interpolation state that can be reused across temperature probes. The token
+// is valid only for the table device and unit conversion that prepared it.
+struct IonmixDensityLocation {
+  Real fraction = 0.0;
+  int lower = 0;
+  int query_flags = ionmix_query_in_bounds;
+};
+
 struct IonmixTwoTemperatureState {
   IonmixComponentState ion;
   IonmixComponentState electron;
@@ -110,6 +134,7 @@ struct IonmixTwoTemperatureTableDevice {
   bool geometric_interpolation = true;
   bool ion_energy_is_strictly_positive = false;
   bool electron_energy_is_strictly_positive = false;
+  int minimum_temperature_round_trips_exactly = 0;
   Real abar = 0.0;
   Real density_to_cgs = 1.0;
   Real temperature_to_kelvin = 1.0;
@@ -292,9 +317,63 @@ struct IonmixTwoTemperatureTableDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
-  IonmixComponentState ComponentFromRhoTemperature(
-      const IonmixComponent component, const Real code_density,
+  IonmixDensityLocation PrepareDensityLocation(const Real code_density) const {
+    const AxisLocation density = Locate(
+        log_density_cgs, ndensity, code_density, density_to_cgs,
+        ionmix_density_below_table, ionmix_density_above_table);
+    IonmixDensityLocation result;
+    result.lower = density.lower;
+    result.fraction = density.fraction;
+    result.query_flags = density.query_flags;
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  IonmixComponentState ComponentFromPreparedDensityTemperature(
+      const IonmixComponent component, const IonmixDensityLocation &prepared_density,
       const Real code_temperature) const {
+    AxisLocation density;
+    density.lower = prepared_density.lower;
+    density.fraction = prepared_density.fraction;
+    density.query_flags = prepared_density.query_flags;
+    const AxisLocation temperature = Locate(
+        log_temperature_kelvin, ntemperature, code_temperature,
+        temperature_to_kelvin, ionmix_temperature_below_table,
+        ionmix_temperature_above_table);
+    return StateAtLocations(component, density, temperature);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  IonmixPressureEnergyState PressureEnergyFromRhoMinimumTemperature(
+      const Real code_density) const {
+    const AxisLocation density = Locate(
+        log_density_cgs, ndensity, code_density, density_to_cgs,
+        ionmix_density_below_table, ionmix_density_above_table);
+    if (minimum_temperature_round_trips_exactly == 0) {
+      return PressureEnergyFromRhoTemperature(
+          code_density, MinimumTemperatureCode());
+    }
+    AxisLocation temperature;
+    temperature.lower = 0;
+    temperature.fraction = 0.0;
+    temperature.bounded_log_coordinate = log_temperature_kelvin(0);
+    temperature.query_flags = ionmix_query_in_bounds;
+    IonmixPressureEnergyState result;
+    result.ion_pressure = pressure_from_cgs*
+        EvaluateWithLocations(ion_pressure, density, temperature);
+    result.ion_specific_internal_energy = specific_energy_from_cgs*
+        EvaluateWithLocations(ion_specific_internal_energy, density, temperature);
+    result.electron_pressure = pressure_from_cgs*
+        EvaluateWithLocations(electron_pressure, density, temperature);
+    result.electron_specific_internal_energy = specific_energy_from_cgs*
+        EvaluateWithLocations(electron_specific_internal_energy, density, temperature);
+    result.query_flags = density.query_flags | temperature.query_flags;
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  IonmixPressureEnergyState PressureEnergyFromRhoTemperature(
+      const Real code_density, const Real code_temperature) const {
     const AxisLocation density = Locate(
         log_density_cgs, ndensity, code_density, density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
@@ -302,7 +381,46 @@ struct IonmixTwoTemperatureTableDevice {
         log_temperature_kelvin, ntemperature, code_temperature,
         temperature_to_kelvin, ionmix_temperature_below_table,
         ionmix_temperature_above_table);
-    return StateAtLocations(component, density, temperature);
+    IonmixPressureEnergyState result;
+    result.ion_pressure = pressure_from_cgs*
+        EvaluateWithLocations(ion_pressure, density, temperature);
+    result.ion_specific_internal_energy = specific_energy_from_cgs*
+        EvaluateWithLocations(ion_specific_internal_energy, density, temperature);
+    result.electron_pressure = pressure_from_cgs*
+        EvaluateWithLocations(electron_pressure, density, temperature);
+    result.electron_specific_internal_energy = specific_energy_from_cgs*
+        EvaluateWithLocations(electron_specific_internal_energy, density, temperature);
+    result.query_flags = density.query_flags | temperature.query_flags;
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  IonmixTemperatureState TemperatureFromRhoTemperature(
+      const Real code_density, const Real code_temperature) const {
+    // Preserve the same density-then-temperature location order and canonical
+    // exp/log round trip as ComponentFromRhoTemperature, while omitting only the
+    // pressure and energy field evaluations.
+    const AxisLocation density = Locate(
+        log_density_cgs, ndensity, code_density, density_to_cgs,
+        ionmix_density_below_table, ionmix_density_above_table);
+    const AxisLocation temperature = Locate(
+        log_temperature_kelvin, ntemperature, code_temperature,
+        temperature_to_kelvin, ionmix_temperature_below_table,
+        ionmix_temperature_above_table);
+    IonmixTemperatureState result;
+    result.temperature =
+        exp(temperature.bounded_log_coordinate)/temperature_to_kelvin;
+    result.query_flags = density.query_flags | temperature.query_flags;
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  IonmixComponentState ComponentFromRhoTemperature(
+      const IonmixComponent component, const Real code_density,
+      const Real code_temperature) const {
+    const IonmixDensityLocation density = PrepareDensityLocation(code_density);
+    return ComponentFromPreparedDensityTemperature(
+        component, density, code_temperature);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -497,6 +615,7 @@ class IonmixTwoTemperatureTable {
   DualArray1D<Real> log_density_cgs_;
   DualArray1D<Real> log_temperature_kelvin_;
   DualArray3D<Real> values_;
+  int minimum_temperature_round_trips_exactly_ = 0;
 };
 
 } // namespace materials

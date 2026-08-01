@@ -192,6 +192,29 @@ void ValidateOptions(const std::string &filename,
   }
 }
 
+int MinimumTemperatureRoundTripsExactlyOnDevice(
+    const DvceArray1D<Real> &log_temperature_kelvin,
+    const Real temperature_to_kelvin) {
+  const DvceArray1D<Real> temperature_axis = log_temperature_kelvin;
+  int exact_count = 0;
+  Kokkos::parallel_reduce(
+      "ionmix-minimum-temperature-round-trip", Kokkos::RangePolicy<>(0, 1),
+      KOKKOS_LAMBDA(const int, int &local_exact_count) {
+        const Real code_temperature =
+            exp(temperature_axis(0))/temperature_to_kelvin;
+        if (!Kokkos::isfinite(code_temperature) || !(code_temperature > 0.0)) {
+          return;
+        }
+        const Real reconstructed =
+            log(code_temperature)+log(temperature_to_kelvin);
+        if (Kokkos::isfinite(reconstructed) &&
+            reconstructed == temperature_axis(0)) {
+          ++local_exact_count;
+        }
+      }, Kokkos::Sum<int>(exact_count));
+  return exact_count;
+}
+
 } // namespace
 
 //----------------------------------------------------------------------------------------
@@ -438,6 +461,10 @@ IonmixTwoTemperatureTable::IonmixTwoTemperatureTable(
   log_temperature_kelvin_.sync_device();
   values_.sync_device();
 
+  minimum_temperature_round_trips_exactly_ =
+      MinimumTemperatureRoundTripsExactlyOnDevice(
+          log_temperature_kelvin_.d_view, options_.temperature_to_kelvin);
+
   metadata_.source_file = filename;
   metadata_.file_fingerprint_value = fingerprint;
   metadata_.file_fingerprint = FingerprintString(fingerprint);
@@ -481,6 +508,8 @@ IonmixTwoTemperatureTableDevice IonmixTwoTemperatureTable::DeviceData() const {
       metadata_.ion_energy_is_strictly_positive;
   result.electron_energy_is_strictly_positive =
       metadata_.electron_energy_is_strictly_positive;
+  result.minimum_temperature_round_trips_exactly =
+      minimum_temperature_round_trips_exactly_;
   result.abar = metadata_.abar;
   result.density_to_cgs = options_.density_to_cgs;
   result.temperature_to_kelvin = options_.temperature_to_kelvin;

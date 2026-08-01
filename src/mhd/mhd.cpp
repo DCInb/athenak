@@ -6,6 +6,7 @@
 //! \file mhd.cpp
 //! \brief implementation of MHD class constructor and assorted functions
 
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <algorithm>
@@ -172,6 +173,48 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
         pmaterials);
   }
 
+  biermann_subcycle = pin->GetOrAddBoolean("mhd", "biermann_subcycle", false);
+  if (biermann_subcycle) {
+    if (pbiermann == nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/biermann_subcycle=true requires "
+                << "<mhd>/biermann_battery=true" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    // The raw FLASH characteristic bound needs a conservative method factor for
+    // the complete SSPRK2 operator.  Resolution sweeps of the strongly coupled
+    // thermal-magnetic mode lose temporal agreement above 0.15.
+    constexpr Real biermann_subcycle_cfl_max = 0.15;
+    biermann_subcycle_cfl = pin->GetOrAddReal(
+        "mhd", "biermann_subcycle_cfl",
+        std::min(pin->GetReal("time", "cfl_number"),
+                 biermann_subcycle_cfl_max));
+    biermann_subcycle_max_steps = pin->GetOrAddInteger(
+        "mhd", "biermann_subcycle_max_steps", 100000);
+    if (!std::isfinite(biermann_subcycle_cfl) ||
+        biermann_subcycle_cfl <= 0.0 ||
+        biermann_subcycle_cfl > biermann_subcycle_cfl_max) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/biermann_subcycle_cfl must be finite and in "
+                << "(0," << biermann_subcycle_cfl_max << "]" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (biermann_subcycle_max_steps <= 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd>/biermann_subcycle_max_steps must be positive"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const std::string evolution = pin->GetString("time", "evolution");
+    const std::string integrator = pin->GetOrAddString("time", "integrator", "rk2");
+    if (evolution != "dynamic" || integrator == "rk1") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Biermann subcycling requires dynamic evolution and "
+                << "a second- or higher-order macro integrator" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
   // In 2T MHD the ion+electron energy sum is the auxiliary internal energy.  Enable
   // dual energy by default so magnetic-energy subtraction cannot erase the gas pressure.
   use_dual_energy = pin->GetOrAddBoolean("mhd", "dual_energy", use_two_temperature);
@@ -303,8 +346,14 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // allocate boundary buffers for conserved (cell-centered) and face-centered variables
   pbval_u = new MeshBoundaryValuesCC(ppack, pin, false);
+  // The ordinary dual-energy correction and the multilevel Biermann drift each need
+  // one extra refluxed face field.  Their task lists never pack them simultaneously,
+  // so a single shared extra slot is sufficient when either path is active.
+  const bool needs_biermann_drift_flux =
+      biermann_subcycle && ppack->pmesh->multilevel;
   pbval_u->InitializeBuffers((nmhd+nscalars),
-      (nmhd+nscalars) + (use_dual_energy ? 1 : 0));
+      (nmhd+nscalars) +
+          ((use_dual_energy || needs_biermann_drift_flux) ? 1 : 0));
   pbval_b = new MeshBoundaryValuesFC(ppack, pin);
   pbval_b->InitializeBuffers(3);
 

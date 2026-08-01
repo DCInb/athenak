@@ -47,6 +47,9 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
   tl_map.insert(std::make_pair("before_stagen",std::make_shared<TaskList>()));
   tl_map.insert(std::make_pair("stagen",std::make_shared<TaskList>()));
   tl_map.insert(std::make_pair("after_stagen",std::make_shared<TaskList>()));
+  // Reused for both SSPRK2 stages of every optional Biermann microstep.  The list is
+  // empty unless MHD constructs a subcycled Biermann operator.
+  tl_map.insert(std::make_pair("biermann_stage",std::make_shared<TaskList>()));
 }
 
 //----------------------------------------------------------------------------------------

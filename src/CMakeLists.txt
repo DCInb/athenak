@@ -92,6 +92,8 @@ add_executable(
 
         mhd/mhd.cpp
         mhd/biermann_battery.cpp
+        mhd/biermann_battery_amr.cpp
+        mhd/mhd_biermann_subcycle.cpp
         mhd/mhd_corner_e.cpp
         mhd/mhd_ct.cpp
         mhd/mhd_dual_energy.cpp

@@ -8,6 +8,7 @@
 //! \file mhd.hpp
 //  \brief definitions for MHD class
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -135,6 +136,20 @@ class MHD {
   materials::MaterialMixture *pmaterials = nullptr;
   BiermannBattery *pbiermann = nullptr;
 
+  // Optional second-order multirate integration of the complete Biermann operator.
+  // The driver owns the outer Strang composition; these values coordinate each local
+  // SSPRK2 microstep and expose lightweight production diagnostics.
+  bool biermann_subcycle = false;
+  Real biermann_subcycle_cfl = 0.0;
+  int biermann_subcycle_max_steps = 0;
+  Real biermann_substep_dt = 0.0;
+  int biermann_substeps_last_cycle = 0;
+  Real biermann_dt_min_last_cycle = 0.0;
+  Real biermann_dt_max_last_cycle = 0.0;
+  Real biermann_interval_last_cycle = 0.0;
+  Real biermann_max_stability_ratio_last_cycle = 0.0;
+  std::uint64_t biermann_substeps_total = 0;
+
   // following only used for time-evolving flow
   DvceArray5D<Real> u1;       // conserved variables, second register
   DvceFaceFld4D<Real> b1;     // face-centered magnetic fields, second register
@@ -164,6 +179,8 @@ class MHD {
   // functions...
   void SetSaveWBcc();
   void AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);
+  bool BiermannSubcycleActive() const;
+  Real BiermannSubcycleTimeStepLimit();
   // ...in "before_timeintegrator" task list
   TaskStatus SaveMHDState(Driver *d, int stage);
   // ...in "before_stagen_tl" task list
@@ -203,6 +220,21 @@ class MHD {
   // ...in "after_stagen_tl" task list
   TaskStatus ClearSend(Driver *d, int stage);
   TaskStatus ClearRecv(Driver *d, int stage);  // also in Driver::Initialize
+
+  // ...in the dedicated Biermann SSPRK2 stage task list
+  TaskStatus BiermannInitRecv(Driver *d, int stage);
+  TaskStatus BiermannCopyCons(Driver *d, int stage);
+  TaskStatus BiermannFluxes(Driver *d, int stage);
+  TaskStatus BiermannSendFlux(Driver *d, int stage);
+  TaskStatus BiermannRecvFlux(Driver *d, int stage);
+  TaskStatus BiermannRKUpdate(Driver *d, int stage);
+  TaskStatus BiermannEField(Driver *d, int stage);
+  TaskStatus BiermannCompositeEnergyFlux(Driver *d, int stage);
+  TaskStatus BiermannCT(Driver *d, int stage);
+  TaskStatus BiermannCloseInterior(Driver *d, int stage);
+  TaskStatus BiermannConToPrim(Driver *d, int stage);
+  TaskStatus BiermannClearSend(Driver *d, int stage);
+  TaskStatus BiermannClearRecv(Driver *d, int stage);
 
   // CalculateFluxes function templated over Riemann Solvers
   template <MHD_RSolver T>

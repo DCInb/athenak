@@ -27,10 +27,38 @@ nx1 = 32
 nx2 = 32
 nx3 = 1
 
+# Disabled for the uniform reference problem.  Subcycle SMR regressions enable this
+# block at run time so they exercise the same physical setup and output definitions.
+<mesh_refinement>
+refinement = none
+num_levels = 2
+refinement_interval = 1
+max_nmb_per_rank = 256
+
+<refined_region1>
+level = 1
+x1min = -0.25
+x1max = 0.25
+x2min = -0.5
+x2max = 0.5
+x3min = -0.5
+x3max = 0.5
+
+# Ignored unless refinement=adaptive.  The dynamic-AMR regression moves the
+# static seed region outside the mesh, then uses this compact central region to
+# create coarse/fine interfaces after time integration has begun.
+<amr_criterion0>
+method = location
+location_x1 = 0.0
+location_x2 = 0.0
+location_x3 = 0.0
+location_rad = 0.2
+
 <time>
 evolution = dynamic
 integrator = rk2
 cfl_number = 0.3
+align_outputs = false
 nlim = -1
 tlim = 1.0e-4
 ndiag = 1
@@ -40,15 +68,24 @@ eos = ideal
 reconstruct = plm
 rsolver = hlle
 gamma = 1.6666666666666667
+sigma_max = 3.402823466e38
 two_temperature = true
 dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
 electron_heat_capacity_fraction = 0.5
 initial_electron_temperature_ratio = 1.0
 t_ei = -1.0
 biermann_battery = true
 biermann_coefficient = 0.1
+biermann_subcycle = false
+biermann_subcycle_cfl = 0.15
+biermann_subcycle_max_steps = 100000
 biermann_shock_suppression = true
 biermann_shock_threshold = 0.25
+# Directional compression Mach number where shock suppression begins; it is
+# fully active at twice this value when the pressure-jump sensor is also active.
+biermann_shock_compression_threshold = 0.02
 
 <problem>
 pgen_name = biermann_battery
@@ -56,6 +93,14 @@ rho0 = 1.0
 p0 = 1.0
 density_amplitude = 0.2
 pressure_amplitude = 0.2
+pressure_x2_amplitude = 0.0
+pressure_x3_amplitude = 0.0
+density_x3_amplitude = 0.0
+checkerboard_b3_amplitude = 0.0
+compression_rate = 0.0
+compression_rate_x1 = 0.0
+compression_rate_x2 = 0.0
+compression_rate_x3 = 0.0
 
 <output1>
 file_type = hst
@@ -79,3 +124,43 @@ data_format = %20.12e
 dt = 1.0e-4
 slice_x2 = 0.0078125
 slice_x3 = 0.0
+
+# Disabled by default; true-3D CT tests enable this block at run time.
+<output4>
+file_type = bin
+variable = mhd_divb
+id = divb
+double_precision_binary = true
+dt = -1.0
+dcycle = -1
+
+# Default-off full-state/restart outputs used by subcycle qualification.
+<output5>
+file_type = bin
+variable = mhd_w_bcc
+id = biermann_full
+double_precision_binary = true
+dt = -1.0
+dcycle = -1
+
+<output6>
+file_type = bin
+variable = mhd_2t
+id = two_temperature_full
+double_precision_binary = true
+dt = -1.0
+dcycle = -1
+
+<output7>
+file_type = rst
+dt = -1.0
+dcycle = -1
+
+# Default-off conserved-state output used by dual-energy branch qualification.
+<output8>
+file_type = bin
+variable = mhd_u_bcc
+id = biermann_conserved
+double_precision_binary = true
+dt = -1.0
+dcycle = -1

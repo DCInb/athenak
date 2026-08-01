@@ -22,6 +22,10 @@ ELECTRON_PRESSURE_FRACTION = 0.8
 CH_IONIZATION = 0.25
 CH_ABAR = 6.5
 MINIMUM_ELECTRON_FRACTION = 1.0e-12
+DEFAULT_CFL = 0.3
+SUBCYCLE_COEFFICIENT = 5.0
+SUBCYCLE_CFL = 0.15
+FINE_LEGACY_CFL = 0.0375
 
 
 def write_table(path, abar, ionization):
@@ -131,13 +135,22 @@ def expected_biermann_dt(coefficient):
     density = np.exp(DENSITY_AMPLITUDE*np.sin(2.0*np.pi*x2))
     pressure = np.exp(PRESSURE_AMPLITUDE*np.sin(2.0*np.pi*x1))
     electron_density = density*CH_IONIZATION/CH_ABAR
-    # This is exactly the centered periodic stencil used by NewTimeStep.
+    # NewTimeStep uses the larger adjacent one-sided slope so that a Nyquist
+    # checkerboard cannot disappear from the explicit stability bound.
     log_ne = np.log(electron_density)
-    dln2 = (np.roll(log_ne, -1, axis=0)-np.roll(log_ne, 1, axis=0))/(2.0*dx)
+    dln2 = np.maximum(
+        np.abs(np.roll(log_ne, -1, axis=0)-log_ne),
+        np.abs(log_ne-np.roll(log_ne, 1, axis=0)))/dx
     pe = ELECTRON_PRESSURE_FRACTION*pressure
     gm1 = 2.0/3.0
     vtm = (coefficient*np.sqrt(gm1*pe)/electron_density*np.abs(dln2))
-    return 0.3*dx/np.max(vtm)
+    return DEFAULT_CFL*dx/np.max(vtm)
+
+
+def relative_l2_norm(left, right):
+    denominator = np.linalg.norm(right)
+    assert denominator > 0.0
+    return np.linalg.norm(left-right)/denominator
 
 
 def test_run():
@@ -173,6 +186,83 @@ def test_run():
                           expected_biermann_dt(cfl_coefficient),
                           rtol=3.0e-10, atol=0.0)
 
+        # Exercise the multirate path with a battery limit well below the macro
+        # interval, then compare it with a finely stepped legacy calculation.  The
+        # exact gamma-law table makes the component/total closure and cache relations
+        # independently testable after every Biermann stage has completed.
+        common_subcycle_flags = [
+            "mhd/biermann_shock_suppression=false",
+        ]
+        run_case("tabular_biermann_subcycle", SUBCYCLE_COEFFICIENT, [
+            *common_subcycle_flags,
+            "mhd/biermann_subcycle=true",
+            f"mhd/biermann_subcycle_cfl={SUBCYCLE_CFL}",
+        ])
+        run_case("tabular_biermann_fine_legacy", SUBCYCLE_COEFFICIENT, [
+            *common_subcycle_flags,
+            "mhd/biermann_subcycle=false",
+            f"time/cfl_number={FINE_LEGACY_CFL}",
+        ])
+
+        subcycle_field = athena_read.tab(
+            "tab/tabular_biermann_subcycle.biermann.00001.tab")
+        subcycle_two_temp = athena_read.tab(
+            "tab/tabular_biermann_subcycle.two_temperature.00001.tab")
+        legacy_field = athena_read.tab(
+            "tab/tabular_biermann_fine_legacy.biermann.00001.tab")
+        legacy_two_temp = athena_read.tab(
+            "tab/tabular_biermann_fine_legacy.two_temperature.00001.tab")
+        subcycle_history = athena_read.hst(
+            "tabular_biermann_subcycle.mhd.hst")
+        legacy_history = athena_read.hst(
+            "tabular_biermann_fine_legacy.mhd.hst")
+
+        ordinary_battery_dt = expected_biermann_dt(SUBCYCLE_COEFFICIENT)
+        assert ordinary_battery_dt < 0.5*T_FINAL
+        assert np.isclose(subcycle_history["dt"][0], T_FINAL,
+                          rtol=2.0e-13, atol=0.0)
+        assert len(subcycle_history["time"])-1 == 1
+        assert np.isclose(legacy_history["dt"][0],
+                          ordinary_battery_dt*FINE_LEGACY_CFL/DEFAULT_CFL,
+                          rtol=3.0e-10, atol=0.0)
+        assert np.linalg.norm(subcycle_field["bcc3"]) > 1.0e-2
+
+        for field in (subcycle_field, legacy_field):
+            for key in ("dens", "eint"):
+                assert np.all(np.isfinite(field[key]))
+                assert np.all(field[key] > 0.0)
+            assert np.all(field["s_00"] == 1.0)
+        for two_temp in (subcycle_two_temp, legacy_two_temp):
+            for key in ("eion", "eele", "tion", "tele"):
+                assert np.all(np.isfinite(two_temp[key]))
+                assert np.all(two_temp[key] > 0.0)
+            assert np.count_nonzero(two_temp["eos_flags"]) == 0
+
+        # eint is an energy density; the tabular component energies are specific.
+        for field, two_temp in (
+                (subcycle_field, subcycle_two_temp),
+                (legacy_field, legacy_two_temp)):
+            component_energy_density = field["dens"]*(
+                two_temp["eion"]+two_temp["eele"])
+            assert np.allclose(field["eint"], component_energy_density,
+                               rtol=3.0e-11, atol=3.0e-12)
+            assert np.allclose(two_temp["tion"], two_temp["eion"]/0.3,
+                               rtol=3.0e-12, atol=3.0e-12)
+            assert np.allclose(two_temp["tele"], two_temp["eele"]/1.2,
+                               rtol=3.0e-12, atol=3.0e-12)
+
+        for history in (subcycle_history, legacy_history):
+            assert np.all(np.isfinite(history["tot-E"]))
+            assert np.allclose(history["tot-E"], history["tot-E"][0],
+                               rtol=2.0e-12, atol=2.0e-12)
+        assert relative_l2_norm(subcycle_field["bcc3"],
+                                legacy_field["bcc3"]) < 5.0e-4
+        assert relative_l2_norm(subcycle_field["eint"],
+                                legacy_field["eint"]) < 1.0e-5
+        for key in ("eion", "eele", "tion", "tele"):
+            assert relative_l2_norm(subcycle_two_temp[key],
+                                    legacy_two_temp[key]) < 3.0e-5
+
         # A table can retain a numerical electron-pressure floor while its physical
         # ionization is effectively zero.  q_e=1e-200 would underflow q_e**2 and make
         # the old vTM expression pathological; the regularized plasma activation must
@@ -188,12 +278,49 @@ def test_run():
         one_step = ["time/nlim=1", "time/tlim=1.0"]
         run_case("tabular_biermann_neutral_cfl", cfl_coefficient, one_step)
         run_case("tabular_biermann_neutral_control", 0.0, one_step)
+        run_case("tabular_biermann_neutral_subcycle", cfl_coefficient, [
+            *one_step,
+            "mhd/biermann_subcycle=true",
+        ])
         neutral_history = athena_read.hst(
             "tabular_biermann_neutral_cfl.mhd.hst")
         control_history = athena_read.hst(
             "tabular_biermann_neutral_control.mhd.hst")
+        neutral_subcycle_history = athena_read.hst(
+            "tabular_biermann_neutral_subcycle.mhd.hst")
+        neutral_subcycle_field = athena_read.tab(
+            "tab/tabular_biermann_neutral_subcycle.biermann.00001.tab")
         assert np.isfinite(neutral_history["dt"][0])
         assert neutral_history["dt"][0] == control_history["dt"][0]
+        assert neutral_subcycle_history["dt"][0] == control_history["dt"][0]
+        for key in ("bcc1", "bcc2", "bcc3"):
+            assert np.count_nonzero(neutral_subcycle_field[key]) == 0
+
+        # Resolve the complete neutral-activation transition.  With a spatially
+        # constant q_e, the generated field scales exactly as S(q_e)/q_e.  At
+        # q_e=1.25*q_min the cubic smoothstep is S(0.25)=0.15625, while at
+        # q_e=3*q_min it is fully active, giving a field-norm ratio of 0.375.
+        activation_coefficient = COEFFICIENT*MINIMUM_ELECTRON_FRACTION
+        activation_fields = {}
+        for label, electron_fraction in (
+                ("below", 0.75*MINIMUM_ELECTRON_FRACTION),
+                ("ramp", 1.25*MINIMUM_ELECTRON_FRACTION),
+                ("full", 3.0*MINIMUM_ELECTRON_FRACTION)):
+            prepare_case(ch_ionization=CH_ABAR*electron_fraction)
+            basename = f"tabular_biermann_activation_{label}"
+            run_case(basename, activation_coefficient, [
+                "mhd/biermann_subcycle=true",
+                "mhd/biermann_shock_suppression=false",
+            ])
+            activation_fields[label] = athena_read.tab(
+                f"tab/{basename}.biermann.00001.tab")["bcc3"]
+
+        assert np.count_nonzero(activation_fields["below"]) == 0
+        ramp_norm = np.linalg.norm(activation_fields["ramp"])
+        full_norm = np.linalg.norm(activation_fields["full"])
+        assert ramp_norm > 0.0 and full_norm > 0.0
+        assert np.isclose(ramp_norm/full_norm, 0.375,
+                          rtol=2.0e-10, atol=0.0)
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

@@ -20,12 +20,15 @@
 #include "pgen/pgen.hpp"
 
 //----------------------------------------------------------------------------------------
-//! \brief Initialize p=p0 exp[a_p sin(k x)] and rho=rho0 exp[a_rho sin(k y)].
+//! \brief Initialize smooth periodic pressure and density gradients.
 //!
 //! The electron pressure varies along x while electron number density varies
 //! along y, giving an analytic early-time B3 source proportional to
-//! cos(kx)cos(ky).  The problem remains smooth and periodic, so it also checks
-//! flux synchronization across blocks.
+//! cos(kx)cos(ky).  Optional, default-zero pressure-y/pressure-z and density-z
+//! amplitudes extend the same problem to three dimensions.  They also permit a
+//! mixed pressure field at exactly uniform electron density, for which the
+//! Biermann curl must vanish.  The problem remains smooth and periodic, so it
+//! also checks flux synchronization across blocks.
 
 void ProblemGenerator::BiermannBattery(ParameterInput *pin,
                                        const bool restart) {
@@ -57,18 +60,65 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
       pin->GetOrAddReal("problem", "density_amplitude", 0.2);
   Real pressure_amplitude =
       pin->GetOrAddReal("problem", "pressure_amplitude", 0.2);
+  Real pressure_x2_amplitude =
+      pin->GetOrAddReal("problem", "pressure_x2_amplitude", 0.0);
+  Real pressure_x3_amplitude =
+      pin->GetOrAddReal("problem", "pressure_x3_amplitude", 0.0);
+  Real density_x3_amplitude =
+      pin->GetOrAddReal("problem", "density_x3_amplitude", 0.0);
+  Real checkerboard_b3_amplitude =
+      pin->GetOrAddReal("problem", "checkerboard_b3_amplitude", 0.0);
+  Real compression_rate =
+      pin->GetOrAddReal("problem", "compression_rate", 0.0);
+  Real compression_rate_x1 = pin->GetOrAddReal(
+      "problem", "compression_rate_x1", compression_rate);
+  Real compression_rate_x2 = pin->GetOrAddReal(
+      "problem", "compression_rate_x2", compression_rate);
+  Real compression_rate_x3 = pin->GetOrAddReal(
+      "problem", "compression_rate_x3", compression_rate);
+  if (!std::isfinite(checkerboard_b3_amplitude)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "problem/checkerboard_b3_amplitude must be finite" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (!std::isfinite(compression_rate) ||
+      !std::isfinite(compression_rate_x1) ||
+      !std::isfinite(compression_rate_x2) ||
+      !std::isfinite(compression_rate_x3)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "problem compression rates must be finite" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   Real wave_number = 2.0 * std::acos(-1.0);
   int material_scalar = -1;
   Real material0_fraction = 1.0;
+  Real material0_fraction_x1_amplitude = 0.0;
+  Real material0_fraction_x2_amplitude = 0.0;
+  Real material0_fraction_x3_amplitude = 0.0;
   if (pmbp->pmhd->pmaterials != nullptr) {
     material_scalar = pmbp->pmhd->pmaterials->DeviceData().scalar_index;
     material0_fraction = pin->GetOrAddReal(
         "problem", "material0_fraction", 1.0);
-    if (!std::isfinite(material0_fraction) || material0_fraction < 0.0 ||
-        material0_fraction > 1.0) {
+    material0_fraction_x1_amplitude = pin->GetOrAddReal(
+        "problem", "material0_fraction_x1_amplitude", 0.0);
+    material0_fraction_x2_amplitude = pin->GetOrAddReal(
+        "problem", "material0_fraction_x2_amplitude", 0.0);
+    material0_fraction_x3_amplitude = pin->GetOrAddReal(
+        "problem", "material0_fraction_x3_amplitude", 0.0);
+    const Real total_material_amplitude =
+        std::abs(material0_fraction_x1_amplitude) +
+        std::abs(material0_fraction_x2_amplitude) +
+        std::abs(material0_fraction_x3_amplitude);
+    if (!std::isfinite(material0_fraction) ||
+        !std::isfinite(total_material_amplitude) ||
+        material0_fraction-total_material_amplitude < 0.0 ||
+        material0_fraction+total_material_amplitude > 1.0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl
-                << "problem/material0_fraction must be finite and in [0,1]"
+                << "problem/material0_fraction and its sinusoidal amplitudes must "
+                << "remain finite and in [0,1]"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -79,6 +129,9 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
   Kokkos::deep_copy(pmbp->pmhd->b0.x1f, 0.0);
   Kokkos::deep_copy(pmbp->pmhd->b0.x2f, 0.0);
   Kokkos::deep_copy(pmbp->pmhd->b0.x3f, 0.0);
+  auto b3f = pmbp->pmhd->b0.x3f;
+  const Real mesh_x1min = pmy_mesh_->mesh_size.x1min;
+  const Real mesh_x2min = pmy_mesh_->mesh_size.x2min;
 
   par_for(
       "pgen_biermann", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
@@ -87,15 +140,38 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
                               size.d_view(m).x1max);
         Real x2 = CellCenterX(j - js, indcs.nx2, size.d_view(m).x2min,
                               size.d_view(m).x2max);
-        Real density = rho0 * exp(density_amplitude * sin(wave_number * x2));
-        Real pressure = p0 * exp(pressure_amplitude * sin(wave_number * x1));
+        Real x3 = CellCenterX(k - ks, indcs.nx3, size.d_view(m).x3min,
+                              size.d_view(m).x3max);
+        Real density = rho0 * exp(
+            density_amplitude * sin(wave_number * x2) +
+            density_x3_amplitude * sin(wave_number * x3));
+        Real pressure = p0 * exp(
+            pressure_amplitude * sin(wave_number * x1) +
+            pressure_x2_amplitude * sin(wave_number * x2) +
+            pressure_x3_amplitude * sin(wave_number * x3));
+        // Optional Nyquist mode for the stability-limiter regression.  B3 may vary
+        // arbitrarily in x1/x2 without contributing to div(B), and is held constant
+        // in x3.  Deriving the parity from physical location keeps the pattern
+        // continuous across MeshBlock boundaries instead of resetting it per block.
+        const int gi = static_cast<int>(floor(
+            (x1-mesh_x1min)/size.d_view(m).dx1));
+        const int gj = static_cast<int>(floor(
+            (x2-mesh_x2min)/size.d_view(m).dx2));
+        const Real b3 = ((gi+gj) & 1) == 0
+            ? checkerboard_b3_amplitude : -checkerboard_b3_amplitude;
         w(m, IDN, k, j, i) = density;
-        w(m, IVX, k, j, i) = 0.0;
-        w(m, IVY, k, j, i) = 0.0;
-        w(m, IVZ, k, j, i) = 0.0;
+        w(m, IVX, k, j, i) = -compression_rate_x1*x1;
+        w(m, IVY, k, j, i) = -compression_rate_x2*x2;
+        w(m, IVZ, k, j, i) = -compression_rate_x3*x3;
         w(m, IEN, k, j, i) = pressure / gm1;
+        bcc(m, IBZ, k, j, i) = b3;
+        b3f(m, k, j, i) = b3;
+        if (k == ke) b3f(m, k+1, j, i) = b3;
         if (material_scalar >= 0) {
-          w(m, material_scalar, k, j, i) = material0_fraction;
+          w(m, material_scalar, k, j, i) = material0_fraction +
+              material0_fraction_x1_amplitude*sin(wave_number*x1) +
+              material0_fraction_x2_amplitude*sin(wave_number*x2) +
+              material0_fraction_x3_amplitude*sin(wave_number*x3);
         }
       });
 

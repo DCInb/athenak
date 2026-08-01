@@ -206,7 +206,11 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   }
   if (pbiermann != nullptr) {
     pbiermann->NewTimeStep(w0, bcc0);
-    dtnew = std::min(dtnew, pbiermann->dtnew);
+    // In multirate mode this remains the raw diagnostic/microstep limit; the
+    // complete Biermann operator no longer clamps the macro MHD timestep.
+    if (!biermann_subcycle) {
+      dtnew = std::min(dtnew, pbiermann->dtnew);
+    }
   }
 
   return TaskStatus::complete;

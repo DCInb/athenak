@@ -95,6 +95,62 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
   // task list anyways to catch potential bugs in MPI communication logic
   id.crecv = tl["after_stagen"]->AddTask(&MHD::ClearRecv, this, id.csend);
 
+  // A Biermann microstep is a self-contained SSPRK2 stage: it owns the conservative
+  // energy flux correction, CT edge correction, state communication, and primitive/
+  // material-cache refresh.  Reusing this list for both stages prevents orbital and
+  // shearing operations from being repeated at the microstep cadence.
+  if (biermann_subcycle) {
+    TaskID b_irecv = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannInitRecv, this, none);
+    TaskID b_copy = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannCopyCons, this, b_irecv);
+    TaskID b_flux = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannFluxes, this, b_copy);
+    TaskID b_efld = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannEField, this, b_flux);
+    TaskID b_sende = tl["biermann_stage"]->AddTask(
+        &MHD::SendE, this, b_efld);
+    TaskID b_recve = tl["biermann_stage"]->AddTask(
+        &MHD::RecvE, this, b_sende);
+    TaskID b_cflux = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannCompositeEnergyFlux, this, b_recve);
+    TaskID b_sendf = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannSendFlux, this, b_cflux);
+    TaskID b_recvf = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannRecvFlux, this, b_sendf);
+    TaskID b_update = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannRKUpdate, this, b_recvf);
+    TaskID b_ct = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannCT, this, b_update);
+    TaskID b_closed = b_ct;
+    if (pmy_pack->pmesh->multilevel) {
+      b_closed = tl["biermann_stage"]->AddTask(
+          &MHD::BiermannCloseInterior, this, b_ct);
+    }
+    TaskID b_restu = tl["biermann_stage"]->AddTask(
+        &MHD::RestrictU, this, b_closed);
+    TaskID b_sendu = tl["biermann_stage"]->AddTask(
+        &MHD::SendU, this, b_restu);
+    TaskID b_recvu = tl["biermann_stage"]->AddTask(
+        &MHD::RecvU, this, b_sendu);
+    TaskID b_restb = tl["biermann_stage"]->AddTask(
+        &MHD::RestrictB, this, b_recvu);
+    TaskID b_sendb = tl["biermann_stage"]->AddTask(
+        &MHD::SendB, this, b_restb);
+    TaskID b_recvb = tl["biermann_stage"]->AddTask(
+        &MHD::RecvB, this, b_sendb);
+    TaskID b_bcs = tl["biermann_stage"]->AddTask(
+        &MHD::ApplyPhysicalBCs, this, b_recvb);
+    TaskID b_prol = tl["biermann_stage"]->AddTask(
+        &MHD::Prolongate, this, b_bcs);
+    TaskID b_c2p = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannConToPrim, this, b_prol);
+    TaskID b_csend = tl["biermann_stage"]->AddTask(
+        &MHD::BiermannClearSend, this, b_c2p);
+    (void)tl["biermann_stage"]->AddTask(
+        &MHD::BiermannClearRecv, this, b_csend);
+  }
+
   return;
 }
 
@@ -233,7 +289,7 @@ TaskStatus MHD::Fluxes(Driver *pdrive, int stage) {
   }
 
   // Add the non-ideal face fluxes after FOFC has finished replacing ideal fluxes.
-  if (pbiermann != nullptr) {
+  if (pbiermann != nullptr && !biermann_subcycle) {
     pbiermann->AddFluxes(w0, bcc0, uflx);
   }
 
@@ -406,7 +462,7 @@ TaskStatus MHD::EField(Driver *pdrive, int stage) {
   if (presist != nullptr) {
     presist->AddResistiveEMFs(b0, efld);
   }
-  if (pbiermann != nullptr) {
+  if (pbiermann != nullptr && !biermann_subcycle) {
     pbiermann->AddEMFs(efld);
   }
   // TODO(@user): Add more resistive effects here
@@ -577,10 +633,20 @@ TaskStatus MHD::ConToPrim(Driver *pdrive, int stage) {
   int n1m1 = indcs.nx1 + 2*ng - 1;
   int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
   int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
-  SynchronizeDualEnergyFromTotal();
+  // Initialization and AMR redistribution call this wrapper with stage zero.  A
+  // subcycled state must then be restored with the same electron-energy closure used
+  // by every accepted Biermann stage; the ordinary pressure-partition projection moves
+  // both components by roundoff and makes a restart follow a different microstep path.
+  const bool biermann_stage_zero = (stage == 0 && BiermannSubcycleActive());
+  if (!biermann_stage_zero) SynchronizeDualEnergyFromTotal();
   peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
   if (ptwo_temp != nullptr) {
-    ptwo_temp->Sync(u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);
+    if (biermann_stage_zero) {
+      ptwo_temp->CloseBiermannStage(
+          u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);
+    } else {
+      ptwo_temp->Sync(u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);
+    }
   }
   return TaskStatus::complete;
 }

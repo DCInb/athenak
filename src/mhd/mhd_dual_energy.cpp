@@ -53,9 +53,13 @@ namespace mhd {
 TaskStatus MHD::DualEnergyStep(Driver *pdrive, int stage) {
   const Real beta_dt = pdrive->beta[stage-1]*pmy_pack->pmesh->dt;
   if (use_dual_energy) {
+    // Biermann subcycling must not change the macro operator A.  In particular, an
+    // arbitrarily small nonzero battery coefficient must approach the coefficient-zero
+    // solution continuously.  Keep the established MHD component-work update here;
+    // Biermann electron work belongs exclusively to the dedicated B operator below.
     ApplyDualEnergyFormalism(beta_dt);
   }
-  if (pbiermann != nullptr) {
+  if (pbiermann != nullptr && !biermann_subcycle) {
     pbiermann->ApplyElectronWork(beta_dt, u0, w0);
   }
   return TaskStatus::complete;
@@ -114,11 +118,12 @@ void MHD::ApplyDualEnergyFormalism(const Real dt) {
       const Real y0 = material_mixture.Material0MassFractionFromConserved(
           u0_, m, k, j, i, eos.dfloor);
       if (material_mixture.UsesTabularEOS()) {
-        const materials::MaterialThermodynamicState state =
-            material_mixture.StateFromRhoSpecificEnergies(
+        const materials::MaterialPressureEnergyState state =
+            material_mixture.PressureEnergyFromRhoSpecificEnergies(
                 dens, eion/dens, eele/dens, y0);
-        const materials::MaterialThermodynamicState floor =
-            material_mixture.MinimumState(dens, y0, eos.pfloor, eos.tfloor);
+        const materials::MaterialPressureEnergyState floor =
+            material_mixture.MinimumPressureEnergyState(
+                dens, y0, eos.pfloor, eos.tfloor);
         if (eion > 0.0) {
           eion *= exp(-(state.ion_pressure/eion)*divv*dt);
         }
@@ -227,8 +232,9 @@ void MHD::SynchronizeDualEnergyFromTotal() {
       const Real y0 = material_mixture.Material0MassFractionFromConserved(
           u0_, m, k, j, i, eos.dfloor);
       if (material_mixture.UsesTabularEOS()) {
-        const materials::MaterialThermodynamicState floor =
-            material_mixture.MinimumState(dens, y0, eos.pfloor, eos.tfloor);
+        const materials::MaterialPressureEnergyState floor =
+            material_mixture.MinimumPressureEnergyState(
+                dens, y0, eos.pfloor, eos.tfloor);
         const Real eion_floor = dens*floor.ion_specific_internal_energy;
         const Real eele_floor = dens*floor.electron_specific_internal_energy;
         const Real minimum_sum = eion_floor+eele_floor;
@@ -240,8 +246,8 @@ void MHD::SynchronizeDualEnergyFromTotal() {
         if (eint_cons < minimum_sum) {
           u0_(m, IEN, k, j, i) += minimum_sum-eint_cons;
         }
-        const materials::MaterialThermodynamicState state =
-            material_mixture.StateFromRhoSpecificEnergies(
+        const materials::MaterialPressureEnergyState state =
+            material_mixture.PressureEnergyFromRhoSpecificEnergies(
                 dens, fmax(eion, eion_floor)/dens,
                 fmax(eele, eele_floor)/dens, y0);
         const Real pressure_sum = state.ion_pressure+state.electron_pressure;

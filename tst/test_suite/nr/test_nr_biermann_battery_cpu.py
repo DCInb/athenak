@@ -1,5 +1,7 @@
 """Regression tests for the FLASH-style flux-form Biermann battery."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -16,6 +18,7 @@ Y_SLICE = 0.0078125
 
 
 def run_case(basename, temperature_ratio, extra_flags=None):
+    Path(f"{basename}.mhd.hst").unlink(missing_ok=True)
     flags = [
         f"job/basename={basename}",
         f"mhd/initial_electron_temperature_ratio={temperature_ratio}",
@@ -80,6 +83,21 @@ def test_run():
                            / np.linalg.norm(rates[1.0]))
         assert np.isclose(amplitude_ratio, 0.4, rtol=7.0e-3, atol=0.0)
 
+        # The dedicated Strang/SSPRK2 path must retain the same early-time analytic
+        # magnetic response, even when this weak case needs only one step per half.
+        run_case("biermann_equal_subcycle", 1.0, [
+            "mhd/biermann_subcycle=true",
+        ])
+        subcycle_field, subcycle_two_temp = load_profile(
+            "biermann_equal_subcycle")
+        subcycle_rate = subcycle_field["bcc3"]/T_FINAL
+        exact_rate = analytic_b3_rate(subcycle_field["x1v"], 1.0)
+        assert (np.linalg.norm(subcycle_rate-exact_rate)
+                / np.linalg.norm(exact_rate)) < 1.5e-2
+        assert np.all(subcycle_two_temp["eion"] > 0.0)
+        assert np.all(subcycle_two_temp["eele"] > 0.0)
+        assert_energy_conserved("biermann_equal_subcycle")
+
         # A large coefficient makes the FLASH thermal-magnetic speed, rather than
         # ideal-MHD waves, set the initial step.
         run_case("biermann_cfl", 1.0, [
@@ -88,6 +106,42 @@ def test_run():
         ])
         cfl_history = athena_read.hst("biermann_cfl.mhd.hst")
         assert cfl_history["dt"][0] < 5.0e-5
+
+        # Keep the retained legacy shock treatment live and observable.  A steep
+        # pressure profile plus compression activates the directional mask; the
+        # dedicated subcycle deliberately uses its endpoint cochain instead, so this
+        # compatibility check belongs on the stage-coupled path.
+        legacy_mask_fields = {}
+        for basename, suppress in (("biermann_legacy_masked", "true"),
+                                   ("biermann_legacy_unmasked", "false")):
+            run_case(basename, 1.0, [
+                "mesh/nx1=32", "mesh/nx2=32",
+                "meshblock/nx1=16", "meshblock/nx2=16",
+                "mesh/x1min=-0.25", "mesh/x1max=0.75",
+                "problem/pressure_amplitude=2.0",
+                "problem/compression_rate_x1=4.0",
+                "problem/compression_rate_x2=0.0",
+                "problem/compression_rate_x3=0.0",
+                "mhd/biermann_coefficient=5.0",
+                "mhd/biermann_subcycle=false",
+                f"mhd/biermann_shock_suppression={suppress}",
+                "mhd/biermann_shock_threshold=0.1",
+                "mhd/biermann_shock_compression_threshold=0.02",
+                "time/tlim=0.001", "time/align_outputs=true",
+                "output1/dt=0.001", "output2/dt=0.001",
+                "output2/data_format=%24.17e", "output3/dt=0.001",
+                "output3/data_format=%24.17e", "output4/dt=-1",
+            ])
+            field, two_temp = load_profile(basename)
+            legacy_mask_fields[suppress] = np.asarray(field["bcc3"])
+            for key in ("eion", "eele", "tion", "tele"):
+                assert np.all(np.isfinite(two_temp[key]))
+                assert np.all(two_temp[key] > 0.0)
+            assert_energy_conserved(basename)
+        masked_norm = np.linalg.norm(legacy_mask_fields["true"])
+        unmasked_norm = np.linalg.norm(legacy_mask_fields["false"])
+        assert masked_norm > 0.0
+        assert masked_norm < 0.25*unmasked_norm
 
         # Exercise the full 3D arithmetic flux-CT path on a small mesh.
         run_case("biermann_3d", 1.0, [

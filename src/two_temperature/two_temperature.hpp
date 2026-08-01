@@ -74,6 +74,13 @@ class TwoTemperature {
   void Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
             int il, int iu, int jl, int ju, int kl, int ku);
 
+  // Close a Biermann RK stage while preserving its independently evolved electron
+  // energy: ion energy is total internal minus electron energy.  This also refreshes
+  // component primitives, temperatures, and material thermodynamic caches.
+  void CloseBiermannStage(
+      DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
+      int il, int iu, int jl, int ju, int kl, int ku);
+
   // Apply exact, energy-conserving ion/electron temperature relaxation over dt.
   void Exchange(Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
                 int il, int iu, int jl, int ju, int kl, int ku);
