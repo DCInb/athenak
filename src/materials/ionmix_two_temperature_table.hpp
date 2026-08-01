@@ -104,6 +104,15 @@ struct IonmixDensityLocation {
   int query_flags = ionmix_query_in_bounds;
 };
 
+// Density-interpolated endpoint energies for one native temperature interval. The
+// owning inverse query keeps one cache per material because their temperature grids
+// need not be identical.
+struct IonmixEnergyIntervalCache {
+  Real lower_energy = 0.0;
+  Real upper_energy = 0.0;
+  int temperature_lower = -1;
+};
+
 struct IonmixTwoTemperatureState {
   IonmixComponentState ion;
   IonmixComponentState electron;
@@ -216,10 +225,13 @@ struct IonmixTwoTemperatureTableDevice {
                        const bool allow_geometric) const {
     if (fraction <= 0.0) return lower;
     if (fraction >= 1.0) return upper;
+    // Fix the contraction order so inline cache context cannot change rounded table
+    // values or mixed-inverse bisection decisions on CUDA.
     if (allow_geometric && lower > 0.0 && upper > 0.0) {
-      return exp((1.0-fraction)*log(lower)+fraction*log(upper));
+      return exp(Kokkos::fma(fraction, log(upper),
+                             (1.0-fraction)*log(lower)));
     }
-    return (1.0-fraction)*lower+fraction*upper;
+    return Kokkos::fma(fraction, upper, (1.0-fraction)*lower);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -341,6 +353,31 @@ struct IonmixTwoTemperatureTableDevice {
         temperature_to_kelvin, ionmix_temperature_below_table,
         ionmix_temperature_above_table);
     return StateAtLocations(component, density, temperature);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ComponentEnergyFromPreparedDensityTemperature(
+      const IonmixComponent component, const IonmixDensityLocation &prepared_density,
+      const Real code_temperature, IonmixEnergyIntervalCache &cache) const {
+    AxisLocation density;
+    density.lower = prepared_density.lower;
+    density.fraction = prepared_density.fraction;
+    density.query_flags = prepared_density.query_flags;
+    const AxisLocation temperature = Locate(
+        log_temperature_kelvin, ntemperature, code_temperature,
+        temperature_to_kelvin, ionmix_temperature_below_table,
+        ionmix_temperature_above_table);
+    const int energy_field = EnergyField(component);
+    if (cache.temperature_lower != temperature.lower) {
+      cache.lower_energy =
+          ValueAtTemperatureIndex(energy_field, density, temperature.lower);
+      cache.upper_energy =
+          ValueAtTemperatureIndex(energy_field, density, temperature.lower+1);
+      cache.temperature_lower = temperature.lower;
+    }
+    return specific_energy_from_cgs*InterpolatePair(
+        cache.lower_energy, cache.upper_energy, temperature.fraction,
+        FieldAllowsGeometricInterpolation(energy_field));
   }
 
   KOKKOS_INLINE_FUNCTION

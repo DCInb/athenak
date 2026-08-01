@@ -144,6 +144,11 @@ struct MaterialMixtureDevice {
     SpeciesDensityCache material1;
   };
 
+  struct MixedEnergyIntervalCache {
+    IonmixEnergyIntervalCache material0;
+    IonmixEnergyIntervalCache material1;
+  };
+
   struct ComponentPairAtTemperature {
     ComponentAtTemperature ion;
     ComponentAtTemperature electron;
@@ -256,6 +261,33 @@ struct MaterialMixtureDevice {
         y0*state0.specific_internal_energy+y1*state1.specific_internal_energy;
     result.query_flags = state0.query_flags | state1.query_flags;
     return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real SpeciesComponentEnergyFromCachedDensity(
+      const IonmixTwoTemperatureTableDevice &table,
+      const IonmixComponent component, const Real temperature,
+      const SpeciesDensityCache &density_cache,
+      IonmixEnergyIntervalCache &energy_cache) const {
+    if (density_cache.status == 1) return 0.0;
+    return table.ComponentEnergyFromPreparedDensityTemperature(
+        component, density_cache.location, temperature, energy_cache);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MixtureComponentEnergyFromCachedDensity(
+      const IonmixComponent component, const Real temperature,
+      const Real y0_in, const MixedDensityCache &density_cache,
+      MixedEnergyIntervalCache &energy_cache) const {
+    const Real y0 = ClampMassFraction(y0_in);
+    const Real y1 = 1.0-y0;
+    const Real energy0 = SpeciesComponentEnergyFromCachedDensity(
+        material0_table, component, temperature, density_cache.material0,
+        energy_cache.material0);
+    const Real energy1 = SpeciesComponentEnergyFromCachedDensity(
+        material1_table, component, temperature, density_cache.material1,
+        energy_cache.material1);
+    return y0*energy0+y1*energy1;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -549,13 +581,14 @@ struct MaterialMixtureDevice {
     // supports CH/He tables with different native temperature grids.
     if (target_energy == minimum.specific_internal_energy) return minimum;
     if (target_energy == maximum.specific_internal_energy) return maximum;
+    MixedEnergyIntervalCache energy_cache;
     Real log_low = log(minimum_temperature);
     Real log_high = log(maximum_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real log_trial = 0.5*(log_low+log_high);
-      const ComponentAtTemperature trial = MixtureComponentFromCachedDensity(
-          component, density, exp(log_trial), y0, cache);
-      if (trial.specific_internal_energy < target_energy) {
+      const Real trial_energy = MixtureComponentEnergyFromCachedDensity(
+          component, exp(log_trial), y0, cache, energy_cache);
+      if (trial_energy < target_energy) {
         log_low = log_trial;
       } else {
         log_high = log_trial;

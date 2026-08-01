@@ -8,6 +8,27 @@ import pytest
 import test_suite.testutils as testutils
 
 
+def test_mixed_inverse_interval_energy_cache_source():
+    local_source_root = Path(__file__).resolve().parent.parents[2]
+    material_source = (
+        local_source_root / "src/materials/material_mixture.hpp").read_text(
+            encoding="utf-8")
+    ionmix_source = (
+        local_source_root / "src/materials/ionmix_two_temperature_table.hpp"
+    ).read_text(encoding="utf-8")
+
+    assert "struct IonmixEnergyIntervalCache" in ionmix_source
+    assert "Kokkos::fma(fraction, upper" in ionmix_source
+    cached_inverse = material_source.split(
+        "ComponentAtTemperature MixtureComponentFromRhoSpecificEnergyCached(",
+        1)[1].split(
+            "ComponentAtTemperature MixtureComponentFromRhoSpecificEnergy(",
+            1)[0]
+    assert "MixedEnergyIntervalCache energy_cache;" in cached_inverse
+    assert cached_inverse.count(
+        "MixtureComponentEnergyFromCachedDensity(") == 1
+
+
 test_directory = Path(__file__).resolve().parent
 source_root = test_directory.parents[2]
 driver = test_directory / "tabular_material_mixture_driver.cpp"
