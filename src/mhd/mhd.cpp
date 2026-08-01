@@ -191,6 +191,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
                  biermann_subcycle_cfl_max));
     biermann_subcycle_max_steps = pin->GetOrAddInteger(
         "mhd", "biermann_subcycle_max_steps", 100000);
+    biermann_reduced_closure = pin->GetOrAddBoolean(
+        "mhd", "biermann_reduced_closure", false);
     if (!std::isfinite(biermann_subcycle_cfl) ||
         biermann_subcycle_cfl <= 0.0 ||
         biermann_subcycle_cfl > biermann_subcycle_cfl_max) {

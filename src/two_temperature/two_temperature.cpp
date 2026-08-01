@@ -93,6 +93,25 @@ void StoreMaterialTemperaturesAndFlags(
       static_cast<Real>(previous_flags | state.query_flags | additional_query_flags);
 }
 
+KOKKOS_INLINE_FUNCTION
+void StoreMaterialElectronState(
+    DvceArray5D<Real> temperature, DvceArray5D<Real> thermodynamics,
+    const materials::MaterialElectronState &state,
+    const int additional_query_flags,
+    const int m, const int k, const int j, const int i) {
+  temperature(m, 1, k, j, i) = state.electron_temperature;
+  thermodynamics(
+      m, two_temperature::TwoTemperature::electron_pressure, k, j, i) =
+      state.electron_pressure;
+  thermodynamics(
+      m, two_temperature::TwoTemperature::electron_number_density_cgs, k, j, i) =
+      state.electron_number_density_cgs;
+  const int previous_flags = static_cast<int>(thermodynamics(
+      m, two_temperature::TwoTemperature::eos_query_flags, k, j, i));
+  thermodynamics(m, two_temperature::TwoTemperature::eos_query_flags, k, j, i) =
+      static_cast<Real>(previous_flags | state.query_flags | additional_query_flags);
+}
+
 } // namespace
 
 namespace two_temperature {
@@ -718,7 +737,8 @@ void TwoTemperature::RefreshMaterialThermodynamics(
 
 void TwoTemperature::CloseBiermannStage(
     DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
-    int il, int iu, int jl, int ju, int kl, int ku) {
+    int il, int iu, int jl, int ju, int kl, int ku,
+    bool full_thermodynamics) {
   const int nmb1 = pmy_pack_->nmb_thispack-1;
   const int iion_ = iion;
   const int iele_ = iele;
@@ -749,6 +769,37 @@ void TwoTemperature::CloseBiermannStage(
       w(m, iele_, k, j, i) = eele/density;
       temp(m, 0, k, j, i) = gm1*eion/(density*fi);
       temp(m, 1, k, j, i) = gm1*eele/(density*fe);
+    });
+  } else if (!full_thermodynamics && material_mixture_.UsesTabularEOS()) {
+    auto mixture = material_mixture_;
+    auto temp = temperature;
+    auto thermo = thermodynamics;
+    par_for("two_temp_refresh_biermann_electron", DevExeSpace(), 0, nmb1,
+            kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real density = w(m, IDN, k, j, i);
+      const Real y0 = mixture.Material0MassFractionFromPrimitive(w, m, k, j, i);
+      const Real eele_raw = cons(m, iele_, k, j, i);
+      const Real eint_before = w(m, IEN, k, j, i);
+      const BiermannClosedState closed = closure.CloseSelected(
+          density, eint_before, eele_raw, y0);
+      if (closed.internal_energy > eint_before) {
+        cons(m, IEN, k, j, i) += closed.internal_energy-eint_before;
+        w(m, IEN, k, j, i) = closed.internal_energy;
+      }
+      const Real eele = closed.electron_energy;
+      const Real eion = closed.ion_energy;
+      cons(m, iion_, k, j, i) = eion;
+      cons(m, iele_, k, j, i) = eele;
+      w(m, iion_, k, j, i) = eion/density;
+      w(m, iele_, k, j, i) = eele/density;
+      const int ion_query_flags = mixture.IonSpecificEnergyQueryFlags(
+          density, eion/density, closed.material0_mass_fraction);
+      const materials::MaterialElectronState state =
+          mixture.ElectronStateFromRhoSpecificEnergy(
+              density, eele/density, closed.material0_mass_fraction);
+      StoreMaterialElectronState(
+          temp, thermo, state, closed.query_flags | ion_query_flags, m, k, j, i);
     });
   } else {
     auto mixture = material_mixture_;
@@ -781,7 +832,7 @@ void TwoTemperature::CloseBiermannStage(
           temp, thermo, state, closed.query_flags, m, k, j, i);
     });
   }
-  if (pradiation != nullptr) {
+  if (full_thermodynamics && pradiation != nullptr) {
     pradiation->UpdateDiagnostics(cons, prim, il, iu, jl, ju, kl, ku);
   }
 }

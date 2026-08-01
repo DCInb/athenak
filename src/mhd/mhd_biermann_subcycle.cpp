@@ -243,7 +243,8 @@ TaskStatus MHD::BiermannCloseInterior(Driver *pdrive, int stage) {
       u0, b0, w0, bcc0, false,
       indcs.is, indcs.ie, indcs.js, indcs.je, indcs.ks, indcs.ke);
   ptwo_temp->CloseBiermannStage(
-      u0, w0, indcs.is, indcs.ie, indcs.js, indcs.je, indcs.ks, indcs.ke);
+      u0, w0, indcs.is, indcs.ie, indcs.js, indcs.je, indcs.ks, indcs.ke,
+      !biermann_reduced_closure);
   return TaskStatus::complete;
 }
 
@@ -259,7 +260,8 @@ TaskStatus MHD::BiermannConToPrim(Driver *pdrive, int stage) {
   int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
   peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
   ptwo_temp->CloseBiermannStage(
-      u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);
+      u0, w0, 0, n1m1, 0, n2m1, 0, n3m1,
+      biermann_stage_full_thermodynamics);
   return TaskStatus::complete;
 }
 

@@ -71,6 +71,7 @@ biermann_coefficient = 2.7875722321043606e-4
 biermann_minimum_electron_fraction = 1.0e-12
 biermann_shock_suppression = true
 biermann_shock_threshold = 8.0e-1
+biermann_reduced_closure = true
 
 <materials>
 nmaterials = 2

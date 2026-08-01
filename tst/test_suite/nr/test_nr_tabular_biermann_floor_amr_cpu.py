@@ -134,6 +134,7 @@ def run_case(kind, refined):
         "mhd/biermann_coefficient=100.0",
         "mhd/biermann_subcycle=true",
         "mhd/biermann_subcycle_cfl=0.15",
+        "mhd/biermann_reduced_closure=true",
         "mhd/biermann_shock_suppression=false",
         f"mhd/pfloor={FLOOR if kind == 'pressure' else 0.0}",
         f"mhd/tfloor={FLOOR if kind == 'temperature' else 0.0}",

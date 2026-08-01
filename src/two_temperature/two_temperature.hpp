@@ -75,11 +75,13 @@ class TwoTemperature {
             int il, int iu, int jl, int ju, int kl, int ku);
 
   // Close a Biermann RK stage while preserving its independently evolved electron
-  // energy: ion energy is total internal minus electron energy.  This also refreshes
-  // component primitives, temperatures, and material thermodynamic caches.
+  // energy: ion energy is total internal minus electron energy.  Intermediate tabular
+  // stages may refresh only the electron state consumed by the Biermann operator; a
+  // half-step endpoint always requests the complete canonical thermodynamic cache.
   void CloseBiermannStage(
       DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
-      int il, int iu, int jl, int ju, int kl, int ku);
+      int il, int iu, int jl, int ju, int kl, int ku,
+      bool full_thermodynamics = true);
 
   // Apply exact, energy-conserving ion/electron temperature relaxation over dt.
   void Exchange(Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,

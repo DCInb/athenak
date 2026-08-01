@@ -402,8 +402,13 @@ void Driver::ExecuteBiermannHalfStep(Mesh *pm, Real interval) {
     }
 
     pmhd->biermann_substep_dt = h;
+    const bool closes_half_step = (h >= remaining);
+    pmhd->biermann_stage_full_thermodynamics = !pmhd->biermann_reduced_closure;
     ExecuteTaskList(pm, "biermann_stage", 1);
+    pmhd->biermann_stage_full_thermodynamics =
+        !pmhd->biermann_reduced_closure || closes_half_step;
     ExecuteTaskList(pm, "biermann_stage", 2);
+    pmhd->biermann_stage_full_thermodynamics = true;
 
     pmhd->biermann_substeps_last_cycle++;
     pmhd->biermann_substeps_total++;
@@ -417,7 +422,7 @@ void Driver::ExecuteBiermannHalfStep(Mesh *pm, Real interval) {
 
     // Assign zero explicitly on the closing step.  This avoids an extra tiny step from
     // subtraction roundoff and makes the two half-interval sums equal the macro dt.
-    if (h >= remaining) {
+    if (closes_half_step) {
       remaining = 0.0;
     } else {
       remaining -= h;

@@ -153,6 +153,13 @@ def relative_l2_norm(left, right):
     return np.linalg.norm(left-right)/denominator
 
 
+def assert_tables_exact(left, right):
+    """Require the reduced closure to preserve every emitted endpoint value."""
+    assert set(left) == set(right)
+    for key in left:
+        np.testing.assert_array_equal(left[key], right[key], err_msg=key)
+
+
 def test_run():
     try:
         prepare_case()
@@ -193,10 +200,17 @@ def test_run():
         common_subcycle_flags = [
             "mhd/biermann_shock_suppression=false",
         ]
+        run_case("tabular_biermann_subcycle_full", SUBCYCLE_COEFFICIENT, [
+            *common_subcycle_flags,
+            "mhd/biermann_subcycle=true",
+            f"mhd/biermann_subcycle_cfl={SUBCYCLE_CFL}",
+            "mhd/biermann_reduced_closure=false",
+        ])
         run_case("tabular_biermann_subcycle", SUBCYCLE_COEFFICIENT, [
             *common_subcycle_flags,
             "mhd/biermann_subcycle=true",
             f"mhd/biermann_subcycle_cfl={SUBCYCLE_CFL}",
+            "mhd/biermann_reduced_closure=true",
         ])
         run_case("tabular_biermann_fine_legacy", SUBCYCLE_COEFFICIENT, [
             *common_subcycle_flags,
@@ -214,8 +228,18 @@ def test_run():
             "tab/tabular_biermann_fine_legacy.two_temperature.00001.tab")
         subcycle_history = athena_read.hst(
             "tabular_biermann_subcycle.mhd.hst")
+        full_field = athena_read.tab(
+            "tab/tabular_biermann_subcycle_full.biermann.00001.tab")
+        full_two_temp = athena_read.tab(
+            "tab/tabular_biermann_subcycle_full.two_temperature.00001.tab")
+        full_history = athena_read.hst(
+            "tabular_biermann_subcycle_full.mhd.hst")
         legacy_history = athena_read.hst(
             "tabular_biermann_fine_legacy.mhd.hst")
+
+        assert_tables_exact(subcycle_field, full_field)
+        assert_tables_exact(subcycle_two_temp, full_two_temp)
+        assert_tables_exact(subcycle_history, full_history)
 
         ordinary_battery_dt = expected_biermann_dt(SUBCYCLE_COEFFICIENT)
         assert ordinary_battery_dt < 0.5*T_FINAL

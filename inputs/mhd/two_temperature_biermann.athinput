@@ -81,6 +81,7 @@ biermann_coefficient = 0.1
 biermann_subcycle = false
 biermann_subcycle_cfl = 0.15
 biermann_subcycle_max_steps = 100000
+biermann_reduced_closure = false
 biermann_shock_suppression = true
 biermann_shock_threshold = 0.25
 # Directional compression Mach number where shock suppression begins; it is

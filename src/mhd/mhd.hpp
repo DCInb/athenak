@@ -140,9 +140,16 @@ class MHD {
   // The driver owns the outer Strang composition; these values coordinate each local
   // SSPRK2 microstep and expose lightweight production diagnostics.
   bool biermann_subcycle = false;
+  // Explicit opt-in because arbitrary user boundary callbacks may consume the complete
+  // material cache between SSPRK stages.  DCI's boundary callback only fills radiation.
+  bool biermann_reduced_closure = false;
   Real biermann_subcycle_cfl = 0.0;
   int biermann_subcycle_max_steps = 0;
   Real biermann_substep_dt = 0.0;
+  // The driver sets this only for the final SSPRK stage of a half-step.  Intermediate
+  // stages retain the conservative/floor closure but refresh only Biermann's electron
+  // pressure and number-density inputs.
+  bool biermann_stage_full_thermodynamics = true;
   int biermann_substeps_last_cycle = 0;
   Real biermann_dt_min_last_cycle = 0.0;
   Real biermann_dt_max_last_cycle = 0.0;
