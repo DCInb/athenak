@@ -12,6 +12,7 @@
 
 #include "athena.hpp"
 #include "driver/driver.hpp"
+#include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
 #include "mesh/mesh.hpp"
 #include "mhd/mhd.hpp"
@@ -20,8 +21,11 @@
 namespace laser {
 
 void Laser::AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) {
-  TaskID location = pmy_pack_->pmhd->id.srctrms;
-  TaskID dependency = pmy_pack_->pmhd->id.duale;
+  // Insert between the carrier fluid's dual-energy and source-term tasks.
+  TaskID location = use_mhd_fluid_ ? pmy_pack_->pmhd->id.srctrms
+                                   : pmy_pack_->phydro->id.srctrms;
+  TaskID dependency = use_mhd_fluid_ ? pmy_pack_->pmhd->id.duale
+                                     : pmy_pack_->phydro->id.duale;
   id.initialize = tl["stagen"]->InsertTask(
       &Laser::InitializeStep, this, dependency, location);
   dependency = id.initialize;
@@ -38,6 +42,7 @@ void Laser::AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) {
 TaskStatus Laser::InitializeStep(Driver *pdrive, int stage) {
   stage_has_power_ = UpdateBeamPowers(pmy_pack_->pmesh->time, pmy_pack_->pmesh->dt);
   diagnostics_ = LaserDiagnostics();
+  actual_transport_iterations_ = 0;
   if (!stage_has_power_) {
     transport_state_ = LaserTransportState::finished;
     if (!instantaneous_data_zero_) {
@@ -91,7 +96,7 @@ TaskStatus Laser::ApplySource(Driver *pdrive, int stage) {
   int iele = electron_index_;
   bool heat_electrons = deposition_target_ == DepositionTarget::electron;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
-  auto u0 = pmy_pack_->pmhd->u0;
+  auto u0 = FluidCons();
   auto data = cell_data;
   auto energy_start = cumulative_energy_start_;
   par_for("laser_apply_source", DevExeSpace(), 0, nmb1,

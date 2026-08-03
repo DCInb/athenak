@@ -1,5 +1,5 @@
 {
-  "local_watch_dir": "./run",
+  "local_watch_dir": "./build",
   "remote_host": "192.168.3.20",
   "remote_user": "mengqi",
   "remote_dir": "/home/mengqi/data/DCI_3D",

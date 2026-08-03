@@ -410,6 +410,13 @@ OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
   temperature_.sync_device();
   values_.sync_device();
 
+  // Pre-log the two axes.  Both are constant for the lifetime of the table while the
+  // lookup evaluates them on every call, so this removes four of the six axis logarithms
+  // per material lookup.  The kernel runs on the device deliberately: filling these on
+  // the host could differ from the device log() in the last ulp and would turn a pure
+  // hoist into a roundoff-perturbing change.
+  BuildLogAxes();
+
   if (global_variable::my_rank == 0) {
     const char *value_mode = log_interpolation_ ? "log-interpolated" :
         (geometric_interpolation_ ? "zero-safe geometrically interpolated" :
@@ -427,11 +434,49 @@ OpacityTable::OpacityTable(ParameterInput *pin, int expected_groups,
 
 //----------------------------------------------------------------------------------------
 
+//----------------------------------------------------------------------------------------
+//! Fill the pre-logged axis arrays.  Kept out of the constructor because nvcc forbids
+//! extended device lambdas there.
+
+void OpacityTable::BuildLogAxes() {
+  Kokkos::realloc(log_density_, ndensity_);
+  Kokkos::realloc(log_temperature_, ntemperature_);
+  Kokkos::realloc(log_values_, 3, ngroups_, ndensity_, ntemperature_);
+  {
+    auto table_values = values_.d_view;
+    auto table_log_values = log_values_.d_view;
+    const Real sentinel = kNonPositiveLog;
+    par_for("opacity_log_values", DevExeSpace(), 0, 2, 0, ngroups_-1,
+            0, ndensity_-1, 0, ntemperature_-1,
+    KOKKOS_LAMBDA(const int kind, const int g, const int id, const int it) {
+      const Real value = table_values(kind, g, id, it);
+      table_log_values(kind, g, id, it) = (value > 0.0) ? log(value) : sentinel;
+    });
+  }
+  auto d_axis = density_.d_view;
+  auto t_axis = temperature_.d_view;
+  auto log_d_axis = log_density_.d_view;
+  auto log_t_axis = log_temperature_.d_view;
+  par_for("opacity_log_density_axis", DevExeSpace(), 0, ndensity_-1,
+  KOKKOS_LAMBDA(const int id) {
+    log_d_axis(id) = log(d_axis(id));
+  });
+  par_for("opacity_log_temperature_axis", DevExeSpace(), 0, ntemperature_-1,
+  KOKKOS_LAMBDA(const int it) {
+    log_t_axis(it) = log(t_axis(it));
+  });
+}
+
+//----------------------------------------------------------------------------------------
+
 OpacityTableDevice OpacityTable::DeviceData() const {
   OpacityTableDevice result;
   result.density = density_.d_view;
   result.temperature = temperature_.d_view;
+  result.log_density = log_density_.d_view;
+  result.log_temperature = log_temperature_.d_view;
   result.values = values_.d_view;
+  result.log_values = log_values_.d_view;
   result.ndensity = ndensity_;
   result.ntemperature = ntemperature_;
   result.log_interpolation = log_interpolation_;

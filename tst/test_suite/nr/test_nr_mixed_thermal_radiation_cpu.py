@@ -17,6 +17,8 @@ from test_suite.nr.mixed_thermal_radiation_utils import (
     electron_heat_capacity_fraction,
     mixed_opacity,
     prepare_case,
+    run_mixed_transport_probe,
+    write_opacity_table,
 )
 
 
@@ -124,6 +126,83 @@ def transport_timestep():
     return float(match.group(1))
 
 
+def last_group_transport_timestep():
+    # Give groups 0--18 finite diffusion rates but make only group 19 thin/AP.
+    # The anisotropic vacuum faces then have distinct directional maxima, all
+    # selected from the final iteration of the face-local group loop.
+    write_opacity_table(material0_table, 0, "last-group-ap")
+    write_opacity_table(material1_table, 1, "last-group-ap")
+    command = [
+        "./athena", "-i", str(input_file),
+        "job/basename=mixed_radiation_last_group_dt",
+        "mesh/nx1=16", "mesh/nx2=8", "mesh/nx3=4",
+        "meshblock/nx1=8", "meshblock/nx2=8", "meshblock/nx3=4",
+        "mesh/ix2_bc=inflow", "mesh/ox2_bc=inflow",
+        "mesh/ix3_bc=inflow", "mesh/ox3_bc=inflow",
+        "problem/yl=1.0", "problem/yr=0.0",
+        "time/nlim=0", "time/tlim=1.0", "time/initial_dt=-1.0",
+        "output1/dt=-1.0", "output2/dt=-1.0", "output3/dt=-1.0",
+        "thermal_radiation/couple_matter=false",
+        "thermal_radiation/source_cfl=0.0",
+        "thermal_radiation/c_light=100.0",
+        "thermal_radiation/transport_discretization=asymptotic-preserving",
+        "thermal_radiation/initial_profile=step",
+        "thermal_radiation/initial_radiation_temperature=1.0",
+        "thermal_radiation/initial_radiation_temperature_right=0.5",
+        "thermal_radiation/initial_radiation_x1=0.0",
+    ]
+    result = subprocess.run(command, text=True, capture_output=True,
+                            timeout=60.0, check=False)
+    if result.returncode != 0:
+        pytest.fail(
+            f"Last-group AP timestep run failed:\n{result.stdout}\n{result.stderr}")
+    match = re.search(r"cycle=0\s+time=[^\s]+\s+dt=([^\s]+)", result.stdout)
+    assert match is not None, result.stdout
+    return float(match.group(1))
+
+
+def source_timestep(material0_fraction):
+    command = [
+        "./athena", "-i", str(input_file),
+        "job/basename=mixed_radiation_source_dt",
+        f"problem/yl={material0_fraction}",
+        f"problem/yr={material0_fraction}",
+        "time/nlim=0", "time/tlim=1.0", "time/initial_dt=-1.0",
+        "output1/dt=-1.0", "output2/dt=-1.0",
+        "thermal_radiation/source_cfl=0.05",
+        "thermal_radiation/arad=1000.0",
+    ]
+    result = subprocess.run(command, text=True, capture_output=True,
+                            timeout=60.0, check=False)
+    if result.returncode != 0:
+        pytest.fail(
+            f"Mixed source timestep run failed:\n{result.stdout}\n{result.stderr}")
+    match = re.search(r"cycle=0\s+time=[^\s]+\s+dt=([^\s]+)", result.stdout)
+    assert match is not None, result.stdout
+    return float(match.group(1))
+
+
+def expected_source_timestep(initial, material0_fraction):
+    density = 1.0
+    arad = 1000.0
+    tele = initial["tele"][0]
+    blackbody = arad*tele**4
+    initial_blackbody = arad*0.1**4
+    source_rate = 0.0
+    for group in range(NGROUPS):
+        equilibrium = blackbody*planck_group_fraction(
+            GROUP_BOUNDS[group], GROUP_BOUNDS[group+1], tele)
+        energy = initial_blackbody*planck_group_fraction(
+            GROUP_BOUNDS[group], GROUP_BOUNDS[group+1], 0.1)
+        kappaa = mixed_opacity(
+            "absorption", group, density, material0_fraction)
+        kappae = mixed_opacity(
+            "emission", group, density, material0_fraction)
+        source_rate += abs(kappae*equilibrium-kappaa*energy)
+    # The driver applies its global CFL number after the source-specific limit.
+    return 0.4*0.05*density*initial["eele"][0]/source_rate
+
+
 def test_run():
     try:
         prepare_case(input_file, material0_table, material1_table)
@@ -152,9 +231,25 @@ def test_run():
                                 for name in ("ch", "he", "mixed")]
         assert len(set(initial_temperatures)) == 3
 
+        # Exercise prepared mixed-opacity locations in the source-CFL reduction at
+        # both pure-material endpoints and in a genuinely mixed cell.
+        for name, fraction in (("ch", 1.0), ("he", 0.0), ("mixed", 0.25)):
+            assert source_timestep(fraction) == pytest.approx(
+                expected_source_timestep(results[name][0], fraction), rel=4.0e-6)
+
         # Twenty mixed-opacity groups retain the causal AP CFL without an ngroups factor.
         assert transport_timestep() == pytest.approx(
             0.4/(16.0*100.0), rel=3.0e-6)
+
+        for output in run_mixed_transport_probe(
+                input_file, "mixed_radiation_flux_3d_cpu"):
+            output.unlink()
+
+        # Only g=19 is optically thin.  Its AP rates are 0.5/dx in each
+        # direction, so after the independent directional maxima are summed the
+        # driver CFL gives dt=0.4/[c_hat*(16+8+4)].
+        assert last_group_transport_timestep() == pytest.approx(
+            0.4/(100.0*(16.0+8.0+4.0)), rel=3.0e-6)
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

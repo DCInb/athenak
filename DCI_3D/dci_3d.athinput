@@ -13,9 +13,9 @@ mu = 1.4444444444444444
 
 <mesh>
 nghost = 2
-nx1 = 500
-x1min = -2.0
-x1max = 1.5
+nx1 = 512
+x1min = -1.0
+x1max = 3
 ix1_bc = outflow
 ox1_bc = outflow
 
@@ -31,8 +31,20 @@ x3max = 1.0
 ix3_bc = outflow
 ox3_bc = outflow
 
+# Keep each rank's 128 MeshBlocks in complete x1-directed tubes.  This symmetric
+# map balances both mixed-material work and ray residence without an x1 MPI cut.
+meshblock_order = x1_rank_map
+meshblock_rank_map_x3_0 = 0,1,1,0,2,3,3,2
+meshblock_rank_map_x3_1 = 0,1,1,0,2,3,3,2
+meshblock_rank_map_x3_2 = 0,1,1,0,2,3,3,2
+meshblock_rank_map_x3_3 = 0,1,1,0,2,3,3,2
+meshblock_rank_map_x3_4 = 4,5,5,4,6,7,7,6
+meshblock_rank_map_x3_5 = 4,5,5,4,6,7,7,6
+meshblock_rank_map_x3_6 = 4,5,5,4,6,7,7,6
+meshblock_rank_map_x3_7 = 4,5,5,4,6,7,7,6
+
 <meshblock>
-nx1 = 50
+nx1 = 32
 nx2 = 32
 nx3 = 32
 
@@ -47,7 +59,7 @@ align_outputs = true
 initial_dt = 5.0e-5
 walltime_restart_only = true
 
-<mhd>
+<hydro>
 eos = ideal
 reconstruct = plm
 rsolver = llf
@@ -71,6 +83,10 @@ biermann_coefficient = 2.7875722321043606e-4
 biermann_minimum_electron_fraction = 1.0e-12
 biermann_shock_suppression = true
 biermann_shock_threshold = 8.0e-1
+
+biermann_subcycle = true
+biermann_subcycle_cfl = 0.15
+biermann_subcycle_max_steps = 100000
 biermann_reduced_closure = true
 
 <materials>
@@ -80,6 +96,7 @@ material0_name = CH
 material0_abar = 6.5
 material0_zbar = 3.5
 material0_zeff = 5.285714285714286
+
 material1_name = He
 material1_abar = 4.002602
 material1_zbar = 2.0
@@ -87,14 +104,14 @@ material1_zeff = 2.0
 
 # The tables are generated locally from the audited archive.  The launcher stages
 # byte-identical copies in each run directory and overrides these repo-relative paths.
-material0_eos_table_file = DCI_3D/material_tables/ch.2t_eos
-material1_eos_table_file = DCI_3D/material_tables/he.2t_eos
+material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch.2t_eos
+material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
 eos_table_bounds = clamp
 eos_table_interpolation = geometric
 
-material0_opacity_table_file = DCI_3D/material_tables/ch_20g.opacity
-material1_opacity_table_file = DCI_3D/material_tables/he_20g.opacity
+material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
+material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
 material0_opacity_interpolation = geometric
 material1_opacity_interpolation = geometric
 material0_opacity_coordinate_interpolation = log
@@ -175,15 +192,15 @@ conservation_tolerance = 1.0e-10
 periodic_transport = false
 report_diagnostics = true
 
-# Gaussian lens aperture converges onto 89.5 percent of the projected 50-degree cap area.
+# The right-hand Gaussian lens irradiates the positive-x outer shell surface.
 beam0_power = 2.0e19
 beam0_wavelength = 1.053e-4
 beam0_nrays = 4096
 beam0_geometry = lens
-beam0_lens_x1 = 1.5
+beam0_lens_x1 = 3.0
 beam0_lens_x2 = 0.0
 beam0_lens_x3 = 0.0
-beam0_target_x1 = -0.8
+beam0_target_x1 = 1.0
 beam0_target_x2 = 0.0
 beam0_target_x3 = 0.0
 beam0_aperture_radius = 0.72
@@ -216,7 +233,7 @@ dt = 2.5e-2
 <output2>
 file_type = bin
 atomic_write = true
-variable = mhd_w_bcc
+variable = fluid_w
 id = fluid_xy
 slice_x3 = 0.0
 dt = 1.0e-1
@@ -224,7 +241,7 @@ dt = 1.0e-1
 <output3>
 file_type = bin
 atomic_write = true
-variable = mhd_3t
+variable = fluid_3t
 id = three_t_xy
 slice_x3 = 0.0
 dt = 1.0e-1
@@ -240,7 +257,7 @@ dt = 1.0e-1
 <output5>
 file_type = bin
 atomic_write = true
-variable = mhd_w_bcc
+variable = fluid_w
 id = fluid_xz
 slice_x2 = 0.0
 dt = 1.0e-1
@@ -248,7 +265,7 @@ dt = 1.0e-1
 <output6>
 file_type = bin
 atomic_write = true
-variable = mhd_3t
+variable = fluid_3t
 id = three_t_xz
 slice_x2 = 0.0
 dt = 1.0e-1
@@ -265,7 +282,7 @@ dt = 1.0e-1
 <output8>
 file_type = bin
 atomic_write = true
-variable = mhd_w_bcc
+variable = fluid_w
 id = fluid
 single_file_per_rank = false
 dt = 5.0e-1
@@ -273,7 +290,7 @@ dt = 5.0e-1
 <output9>
 file_type = bin
 atomic_write = true
-variable = mhd_3t
+variable = fluid_3t
 id = three_t
 single_file_per_rank = false
 dt = 5.0e-1

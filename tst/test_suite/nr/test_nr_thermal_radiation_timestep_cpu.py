@@ -115,6 +115,21 @@ def test_run():
         expected_diffusion = 0.4*1.5*100.0/64.0**2
         assert dt_diffusion == pytest.approx(expected_diffusion, rel=2.0e-6)
 
+        # Directional face maxima must remain independent before their rates are
+        # summed.  With D=1/(3*kappa), the anisotropic 3-D mesh gives distinct
+        # x1:x2:x3 contributions of 16^2:8^2:4^2.
+        anisotropic = transport_flags(
+            "fld_dt_anisotropic_3d", resolution=16, opacity=100.0)
+        anisotropic.extend([
+            "mesh/nx2=8", "mesh/nx3=4",
+            "meshblock/nx2=8", "meshblock/nx3=4",
+            "thermal_radiation/initial_profile=uniform",
+            "thermal_radiation/flux_limiter=none",
+        ])
+        expected_anisotropic = 0.4*1.5*100.0/(16.0**2 + 8.0**2 + 4.0**2)
+        assert run_case(diffusion_input, anisotropic)[0] == pytest.approx(
+            expected_anisotropic, rel=2.0e-6)
+
         # In the optically thin limit dt scales as dx/c_hat, not as
         # rho*kappa*dx^2/c_hat.  It is invariant to another four decades in opacity.
         streaming_dt = {}
@@ -221,6 +236,7 @@ def test_run():
         source_dt = run_case(
             relax_input,
             ["job/basename=fld_dt_source", *source_common])[0]
+        assert source_dt == pytest.approx(3.75e-6, rel=2.0e-6)
         half_source_dt = run_case(
             relax_input,
             ["job/basename=fld_dt_source_half", *source_common,

@@ -22,6 +22,18 @@ enum OpacityKind {
   opacity_emission = 2
 };
 
+//! Sentinel stored in `log_values` for table entries that have no logarithm.  Any real
+//! log(v) for a positive double is >= log(DBL_MIN) ~= -708, so -DBL_MAX/2 is
+//! unambiguous and a single comparison separates the two branches.
+constexpr Real kNonPositiveLog = -8.988465674311579e+307;
+
+struct OpacityTableLocation {
+  int id0 = 0;
+  int it0 = 0;
+  Real fd = 0.0;
+  Real ft = 0.0;
+};
+
 //----------------------------------------------------------------------------------------
 //! \struct OpacityTableDevice
 //! \brief Lightweight device-copyable view of a tabulated opacity model.
@@ -29,7 +41,16 @@ enum OpacityKind {
 struct OpacityTableDevice {
   DvceArray1D<Real> density;
   DvceArray1D<Real> temperature;
+  // Axis logarithms, evaluated once on the device at load time.  The axes are constant
+  // per table, so recomputing log(density(lower)) and log(density(upper)) inside every
+  // lookup costs four of the six axis transcendentals for nothing.  They are filled by a
+  // device kernel rather than on the host so the stored value is bit-identical to the
+  // one the inline log() produced, which keeps this a byte-exact change.
+  DvceArray1D<Real> log_density;
+  DvceArray1D<Real> log_temperature;
   DvceArray4D<Real> values;
+  // log(values), with kNonPositiveLog wherever the entry is not positive.
+  DvceArray4D<Real> log_values;
   int ndensity = 0;
   int ntemperature = 0;
   bool log_interpolation = false;
@@ -42,16 +63,15 @@ struct OpacityTableDevice {
   Real emission_scale = 1.0;
 
   KOKKOS_INLINE_FUNCTION
-  Real Get(int kind, int group, Real code_density, Real code_temperature) const {
+  OpacityTableLocation Locate(Real code_density, Real code_temperature) const {
     Real d = code_density*density_scale;
     Real t = code_temperature*temperature_scale;
 
-    int id0 = 0;
-    Real fd = 0.0;
+    OpacityTableLocation location;
     if (ndensity > 1) {
       if (d >= density(ndensity-1)) {
-        id0 = ndensity-2;
-        fd = 1.0;
+        location.id0 = ndensity-2;
+        location.fd = 1.0;
       } else if (d > density(0)) {
         int lower = 0;
         int upper = ndensity-1;
@@ -63,22 +83,20 @@ struct OpacityTableDevice {
             lower = middle;
           }
         }
-        id0 = lower;
+        location.id0 = lower;
         if (log_coordinates) {
-          fd = (log(d)-log(density(lower)))/
-               (log(density(upper))-log(density(lower)));
+          location.fd = (log(d)-log_density(lower))/
+                        (log_density(upper)-log_density(lower));
         } else {
-          fd = (d-density(lower))/(density(upper)-density(lower));
+          location.fd = (d-density(lower))/(density(upper)-density(lower));
         }
       }
     }
 
-    int it0 = 0;
-    Real ft = 0.0;
     if (ntemperature > 1) {
       if (t >= temperature(ntemperature-1)) {
-        it0 = ntemperature-2;
-        ft = 1.0;
+        location.it0 = ntemperature-2;
+        location.ft = 1.0;
       } else if (t > temperature(0)) {
         int lower = 0;
         int upper = ntemperature-1;
@@ -90,38 +108,64 @@ struct OpacityTableDevice {
             lower = middle;
           }
         }
-        it0 = lower;
+        location.it0 = lower;
         if (log_coordinates) {
-          ft = (log(t)-log(temperature(lower)))/
-               (log(temperature(upper))-log(temperature(lower)));
+          location.ft = (log(t)-log_temperature(lower))/
+                        (log_temperature(upper)-log_temperature(lower));
         } else {
-          ft = (t-temperature(lower))/(temperature(upper)-temperature(lower));
+          location.ft = (t-temperature(lower))/(temperature(upper)-temperature(lower));
         }
       }
     }
+    return location;
+  }
 
-    int id1 = (ndensity > 1) ? id0+1 : id0;
-    int it1 = (ntemperature > 1) ? it0+1 : it0;
-    const Real v00 = values(kind, group, id0, it0);
-    const Real v01 = values(kind, group, id0, it1);
-    const Real v10 = values(kind, group, id1, it0);
-    const Real v11 = values(kind, group, id1, it1);
+  KOKKOS_INLINE_FUNCTION
+  Real Get(int kind, int group, const OpacityTableLocation &location) const {
+    int id1 = (ndensity > 1) ? location.id0+1 : location.id0;
+    int it1 = (ntemperature > 1) ? location.it0+1 : location.it0;
     Real result;
-    if (geometric_interpolation && v00 > 0.0 && v01 > 0.0 &&
-        v10 > 0.0 && v11 > 0.0) {
-      const Real lower = (1.0-ft)*log(v00)+ft*log(v01);
-      const Real upper = (1.0-ft)*log(v10)+ft*log(v11);
-      result = exp((1.0-fd)*lower+fd*upper);
-    } else {
-      const Real lower = (1.0-ft)*v00+ft*v01;
-      const Real upper = (1.0-ft)*v10+ft*v11;
-      result = (1.0-fd)*lower+fd*upper;
-      if (log_interpolation) result = exp(result);
+    // Geometric interpolation used to evaluate log() on all four corners of every
+    // (group, kind) lookup.  The deck runs 20 groups against a two-material table and
+    // Couple performs two kinds, so that was ~320 log plus 80 exp per cell, repeated on
+    // every face by AddFluxes and again by the transport limiter.  The corner logarithms
+    // are properties of the table, so they are stored once; only the final exp is left.
+    // This mirrors what the IONMIX table already does with its own log_values.
+    if (geometric_interpolation) {
+      const Real l00 = log_values(kind, group, location.id0, location.it0);
+      const Real l01 = log_values(kind, group, location.id0, it1);
+      const Real l10 = log_values(kind, group, id1, location.it0);
+      const Real l11 = log_values(kind, group, id1, it1);
+      // A non-positive table entry has no logarithm; the loader marks those corners
+      // with a sentinel so the zero-safe linear branch is selected exactly as before,
+      // without having to load the linear values just to test their sign.
+      if (l00 > kNonPositiveLog && l01 > kNonPositiveLog &&
+          l10 > kNonPositiveLog && l11 > kNonPositiveLog) {
+        const Real lower = (1.0-location.ft)*l00+location.ft*l01;
+        const Real upper = (1.0-location.ft)*l10+location.ft*l11;
+        result = exp((1.0-location.fd)*lower+location.fd*upper);
+        if (kind == opacity_transport) return result*transport_scale;
+        if (kind == opacity_absorption) return result*absorption_scale;
+        return result*emission_scale;
+      }
     }
+    const Real v00 = values(kind, group, location.id0, location.it0);
+    const Real v01 = values(kind, group, location.id0, it1);
+    const Real v10 = values(kind, group, id1, location.it0);
+    const Real v11 = values(kind, group, id1, it1);
+    const Real lower = (1.0-location.ft)*v00+location.ft*v01;
+    const Real upper = (1.0-location.ft)*v10+location.ft*v11;
+    result = (1.0-location.fd)*lower+location.fd*upper;
+    if (log_interpolation) result = exp(result);
 
     if (kind == opacity_transport) return result*transport_scale;
     if (kind == opacity_absorption) return result*absorption_scale;
     return result*emission_scale;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real Get(int kind, int group, Real code_density, Real code_temperature) const {
+    return Get(kind, group, Locate(code_density, code_temperature));
   }
 };
 
@@ -140,6 +184,8 @@ class OpacityTable {
 
   OpacityTableDevice DeviceData() const;
 
+  void BuildLogAxes();
+
  private:
   int ndensity_;
   int ntemperature_;
@@ -155,27 +201,55 @@ class OpacityTable {
 
   DualArray1D<Real> density_;
   DualArray1D<Real> temperature_;
+  DualArray1D<Real> log_density_;
+  DualArray1D<Real> log_temperature_;
   DualArray4D<Real> values_;
+  DualArray4D<Real> log_values_;
 };
 
 //----------------------------------------------------------------------------------------
 //! \struct MixedOpacityTableDevice
 //! \brief Partial-density, mass-weighted additive two-material opacity closure.
 
+struct MixedOpacityTableLocation {
+  OpacityTableLocation material0;
+  OpacityTableLocation material1;
+  Real material0_mass_fraction = 0.0;
+};
+
 struct MixedOpacityTableDevice {
   OpacityTableDevice material0;
   OpacityTableDevice material1;
 
   KOKKOS_INLINE_FUNCTION
-  Real Get(int kind, int group, Real density, Real temperature, Real y0_in) const {
+  MixedOpacityTableLocation Locate(
+      Real density, Real temperature, Real y0_in) const {
+    MixedOpacityTableLocation location;
     const Real y0 = fmin(fmax(y0_in, 0.0), 1.0);
-    Real result = 0.0;
-    if (y0 > 0.0) result += y0*material0.Get(kind, group, density*y0, temperature);
+    location.material0_mass_fraction = y0;
+    if (y0 > 0.0) {
+      location.material0 = material0.Locate(density*y0, temperature);
+    }
     if (y0 < 1.0) {
-      result += (1.0-y0)*material1.Get(
-          kind, group, density*(1.0-y0), temperature);
+      location.material1 = material1.Locate(density*(1.0-y0), temperature);
+    }
+    return location;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real Get(int kind, int group, const MixedOpacityTableLocation &location) const {
+    const Real y0 = location.material0_mass_fraction;
+    Real result = 0.0;
+    if (y0 > 0.0) result += y0*material0.Get(kind, group, location.material0);
+    if (y0 < 1.0) {
+      result += (1.0-y0)*material1.Get(kind, group, location.material1);
     }
     return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real Get(int kind, int group, Real density, Real temperature, Real y0_in) const {
+    return Get(kind, group, Locate(density, temperature, y0_in));
   }
 };
 

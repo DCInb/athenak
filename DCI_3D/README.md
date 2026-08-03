@@ -10,7 +10,7 @@ listed below.  The archive audit and every user-versus-reference decision are re
 
 - Uniform three-dimensional Cartesian mesh and outflow fluid boundaries.
 - CH shell density `1.1 g/cm3`, inner radius `0.8 mm`, outer radius `1.0 mm`.
-- Far-side spherical cap about the `-x1` axis with a 50-degree polar half-angle
+- Far-side spherical cap about the `+x1` axis with a 50-degree polar half-angle
   (100-degree full cone).
 - Helium ambient density `1.0e-5 g/cm3`.
 - Initial common ion, electron, and radiation temperature `11,606 K` (approximately
@@ -18,6 +18,23 @@ listed below.  The archive audit and every user-versus-reference decision are re
 - Zero initial magnetic field, dual-energy MHD, Biermann battery, and Spitzer
   electron-ion exchange.
 - One conservative user scalar stores `rho*Y_CH`; `Y_He=1-Y_CH`.
+
+## Choosing the carrier fluid
+
+The deck runs on either carrier.  Renaming the `<mhd>` block to `<hydro>` (and nothing
+else) switches the case to pure hydrodynamics: the same target, laser drive, tabular
+CH/He 3T closure, 20-group AP-FLD transport, dual energy, and Spitzer exchange, with no
+magnetic field evolved at all.  The `biermann_*` parameters stay in the block and are
+reported as ignored on startup, because the Biermann battery is a magnetic-field source
+and has no meaning without `<mhd>`.
+
+The `<output>` blocks ask for `fluid_w` and `fluid_3t`.  These resolve to `mhd_w_bcc` /
+`mhd_3t` under `<mhd>` and to `hydro_w` / `hydro_3t` under `<hydro>`, so no output block
+needs editing when the carrier changes.
+
+The user history keeps all 21 columns in both modes.  Under `<hydro>` the three magnetic
+diagnostics `mag_E`, `abs_B`, and `divB` are identically zero, which keeps the two modes
+directly comparable.
 
 With tabular materials, the Biermann implementation evaluates electron number density as
 `n_e=rho sum_s(Y_s Z_s/A_s)`.  The pinned dimensionless coefficient is therefore
@@ -126,17 +143,19 @@ conservation residual.  The exact initial and evolved-state sweeps are recorded 
 `LASER_TRANSPORT_CONVERGENCE.md`.
 
 ```text
-lens center             (+1.5, 0, 0) mm
+lens center             positive-x boundary (+3.0 mm production; +2.0 mm calibration)
 hard/Gaussian aperture  0.72 mm
-target plane center     (-0.8, 0, 0) mm
+target plane center     (+1.0, 0, 0) mm (outer-surface apex)
 target Gaussian radius  0.58 mm
 ```
 
-The inner cap projects to `0.8 sin(50 deg) = 0.61284 mm`; the `0.58 mm` target radius
-covers `89.5%` of that projected area.  The lens geometry supplies the requested
-convergence while the straight-ray propagation option keeps the prescribed focal map
-unambiguous.  The `laser` slice/full-volume outputs contain path length, optical depth,
-segment count, and deposited-power fields for ray/deposition visualization.
+The outer cap projects to `1.0 sin(50 deg) = 0.76604 mm`; the `0.58 mm` target radius
+covers `57.3%` of that projected area.  Rays propagate from right to left and encounter
+the curved outer CH surface before reaching the tangent focal plane at its apex.  The
+lens geometry supplies the requested convergence while the straight-ray propagation
+option keeps the prescribed focal map unambiguous.  The `laser` slice/full-volume outputs
+contain path length, optical depth, segment count, and deposited-power fields for
+ray/deposition visualization.
 
 ### Laser-ray visualization
 
@@ -188,7 +207,8 @@ rule.  The lower-energy flag is allowed in at most five percent of cells because
 requested 11,606 K start is only 0.013 percent above the helium table edge; density-high,
 temperature, and energy-high flags retain a strict zero tolerance.
 Integrating `rad_Pesc` permits the chain-energy budget to include radiation boundary loss.
-All 20 individual group fields remain available in `mhd_3t` outputs.
+All 20 individual group fields remain available in `fluid_3t` (`mhd_3t`/`hydro_3t`)
+outputs.
 
 Central `x1-x2` and `x1-x3` fluid/3T/laser slices are written every `0.1 ns`.
 Full-volume fluid/3T/laser fields are written every `0.5 ns`, and restarts every `1 ns`.

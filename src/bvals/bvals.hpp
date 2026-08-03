@@ -163,9 +163,15 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
   void InitRecvIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
   TaskStatus InitFluxRecv(const int nvar) override;
 
-  // functions to communicate CC data
-  TaskStatus PackAndSendCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
-  TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
+  // Functions to communicate CC data.  `nvar_in` communicates only the first `nvar_in`
+  // components of the array instead of all of them; the default -1 means all.  This is
+  // for operator-split stages that modify a leading subset of the conserved vector and
+  // would otherwise pay for a full-width halo, e.g. the Biermann subcycle.  The caller
+  // is responsible for having posted a matching InitRecv(nvar_in).
+  TaskStatus PackAndSendCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
+                           const int nvar_in = -1);
+  TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
+                             const int nvar_in = -1);
   // functions to communicate fluxes of CC data
   TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
                                DvceFaceFld5D<Real> *extra_flx = nullptr);

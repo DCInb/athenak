@@ -14,8 +14,8 @@ mu = 1.4444444444444444
 <mesh>
 nghost = 2
 nx1 = 500
-x1min = -2.0
-x1max = 1.5
+x1min = -1.5
+x1max = 2.0
 ix1_bc = outflow
 ox1_bc = outflow
 nx2 = 256
@@ -170,10 +170,10 @@ beam0_power = 2.0e19
 beam0_wavelength = 1.053e-4
 beam0_nrays = 4096
 beam0_geometry = lens
-beam0_lens_x1 = 1.5
+beam0_lens_x1 = 2.0
 beam0_lens_x2 = 0.0
 beam0_lens_x3 = 0.0
-beam0_target_x1 = -0.8
+beam0_target_x1 = 1.0
 beam0_target_x2 = 0.0
 beam0_target_x3 = 0.0
 beam0_aperture_radius = 0.72
@@ -206,7 +206,7 @@ dt = -1.0
 <output2>
 file_type = bin
 atomic_write = true
-variable = mhd_w_bcc
+variable = fluid_w
 id = fluid_xy
 slice_x3 = 0.0
 dt = -1.0
@@ -214,7 +214,7 @@ dt = -1.0
 <output3>
 file_type = bin
 atomic_write = true
-variable = mhd_3t
+variable = fluid_3t
 id = three_t_xy
 slice_x3 = 0.0
 dt = -1.0
@@ -230,7 +230,7 @@ dt = -1.0
 <output5>
 file_type = bin
 atomic_write = true
-variable = mhd_w_bcc
+variable = fluid_w
 id = fluid_xz
 slice_x2 = 0.0
 dt = -1.0
@@ -238,7 +238,7 @@ dt = -1.0
 <output6>
 file_type = bin
 atomic_write = true
-variable = mhd_3t
+variable = fluid_3t
 id = three_t_xz
 slice_x2 = 0.0
 dt = -1.0
@@ -254,7 +254,7 @@ dt = -1.0
 <output8>
 file_type = bin
 atomic_write = true
-variable = mhd_w_bcc
+variable = fluid_w
 id = fluid
 single_file_per_rank = false
 dt = -1.0
@@ -262,7 +262,7 @@ dt = -1.0
 <output9>
 file_type = bin
 atomic_write = true
-variable = mhd_3t
+variable = fluid_3t
 id = three_t
 single_file_per_rank = false
 dt = -1.0

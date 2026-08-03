@@ -5,6 +5,11 @@
 //========================================================================================
 //! \file dci_3d.cpp
 //! \brief Three-dimensional laser drive of an open CH spherical shell with CH/He 3T.
+//!
+//! The deck selects the carrier fluid: a <mhd> block runs the full 3T MHD problem with
+//! the Biermann battery, while a <hydro> block runs exactly the same target, laser, and
+//! radiation physics with no magnetic field at all.  Everything below is written against
+//! whichever module the input file created.
 
 #include <cmath>
 #include <cstdlib>
@@ -13,6 +18,7 @@
 
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
+#include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
 #include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
@@ -28,7 +34,7 @@
 
 namespace {
 
-constexpr int kHistoryFields = 20;
+constexpr int kHistoryFields = 21;
 
 void DCIHistory(HistoryData *pdata, Mesh *pm);
 void VacuumRadiationBoundary(Mesh *pm);
@@ -41,6 +47,67 @@ void VacuumRadiationBoundary(Mesh *pm);
 
 bool NearlyEqual(const Real lhs, const Real rhs, const Real scale = 1.0) {
   return std::abs(lhs-rhs) <= 1.0e-12*std::fmax(scale, 1.0);
+}
+
+//----------------------------------------------------------------------------------------
+//! Carrier-fluid view of the problem: the members below are the only fluid state this
+//! problem generator touches, so the rest of the file never branches on <hydro>/<mhd>.
+//! Face and cell-centred magnetic fields are left empty in the hydrodynamic case; every
+//! use is guarded by is_mhd.
+
+struct DCIFluid {
+  bool is_mhd = false;
+  EquationOfState *peos = nullptr;
+  two_temperature::TwoTemperature *ptwo = nullptr;
+  materials::MaterialMixture *pmaterials = nullptr;
+  mhd::BiermannBattery *pbiermann = nullptr;
+  bool use_dual_energy = false;
+  int nuser_scalars = 0;
+  DvceArray5D<Real> u0, w0;
+  DvceArray5D<Real> flx1, flx2, flx3;
+  DvceArray5D<Real> bcc0;
+  DvceArray4D<Real> b0x1f, b0x2f, b0x3f;
+};
+
+DCIFluid SelectFluid(MeshBlockPack *pmbp) {
+  DCIFluid fluid;
+  if (pmbp->pmhd != nullptr && pmbp->phydro != nullptr) {
+    ProblemError("dci_3d requires exactly one of the <mhd> and <hydro> blocks");
+  }
+  if (pmbp->pmhd != nullptr) {
+    auto *pmhd = pmbp->pmhd;
+    fluid.is_mhd = true;
+    fluid.peos = pmhd->peos;
+    fluid.ptwo = pmhd->ptwo_temp;
+    fluid.pmaterials = pmhd->pmaterials;
+    fluid.pbiermann = pmhd->pbiermann;
+    fluid.use_dual_energy = pmhd->use_dual_energy;
+    fluid.nuser_scalars = pmhd->nuser_scalars;
+    fluid.u0 = pmhd->u0;
+    fluid.w0 = pmhd->w0;
+    fluid.flx1 = pmhd->uflx.x1f;
+    fluid.flx2 = pmhd->uflx.x2f;
+    fluid.flx3 = pmhd->uflx.x3f;
+    fluid.bcc0 = pmhd->bcc0;
+    fluid.b0x1f = pmhd->b0.x1f;
+    fluid.b0x2f = pmhd->b0.x2f;
+    fluid.b0x3f = pmhd->b0.x3f;
+  } else if (pmbp->phydro != nullptr) {
+    auto *phydro = pmbp->phydro;
+    fluid.peos = phydro->peos;
+    fluid.ptwo = phydro->ptwo_temp;
+    fluid.pmaterials = phydro->pmaterials;
+    fluid.use_dual_energy = phydro->use_dual_energy;
+    fluid.nuser_scalars = phydro->nuser_scalars;
+    fluid.u0 = phydro->u0;
+    fluid.w0 = phydro->w0;
+    fluid.flx1 = phydro->uflx.x1f;
+    fluid.flx2 = phydro->uflx.x2f;
+    fluid.flx3 = phydro->uflx.x3f;
+  } else {
+    ProblemError("dci_3d requires an <mhd> or <hydro> block");
+  }
+  return fluid;
 }
 
 } // namespace
@@ -65,36 +132,42 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (restart) return;
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
-  if (pmbp->pmhd == nullptr || pmbp->plaser == nullptr) {
-    ProblemError("dci_3d requires <mhd> and <laser> blocks");
+  if (pmbp->plaser == nullptr) {
+    ProblemError("dci_3d requires a <laser> block");
   }
-  auto *pmhd = pmbp->pmhd;
-  auto *ptwo = pmhd->ptwo_temp;
+  DCIFluid fluid = SelectFluid(pmbp);
+  auto *ptwo = fluid.ptwo;
   if (ptwo == nullptr || ptwo->pradiation == nullptr) {
-    ProblemError("dci_3d requires two-temperature MHD and thermal radiation");
+    ProblemError("dci_3d requires a two-temperature fluid and thermal radiation");
   }
-  if (pmhd->pbiermann == nullptr || !pmhd->use_dual_energy) {
-    ProblemError("dci_3d requires Biermann battery and dual energy");
+  // The Biermann battery is a magnetic-field source, so it exists only in the MHD deck.
+  // The hydrodynamic deck is the same problem with B identically zero.
+  if (fluid.is_mhd && fluid.pbiermann == nullptr) {
+    ProblemError("dci_3d MHD mode requires the Biermann battery");
+  }
+  if (!fluid.use_dual_energy) {
+    ProblemError("dci_3d requires dual energy");
   }
   if (!pmy_mesh_->three_d) {
     ProblemError("dci_3d requires a three-dimensional Cartesian mesh");
   }
-  if (pmhd->nuser_scalars != 1) {
+  if (fluid.nuser_scalars != 1) {
     ProblemError("dci_3d requires exactly one user scalar for rho*X_CH");
   }
-  if (pmhd->pmaterials == nullptr) {
+  if (fluid.pmaterials == nullptr) {
     ProblemError("dci_3d requires the two-material CH/He closure");
   }
-  if (!pmhd->pmaterials->UsesTabularEOS()) {
+  if (!fluid.pmaterials->UsesTabularEOS()) {
     ProblemError("dci_3d requires both audited CH and He two-temperature EOS tables");
   }
   if (ptwo->pradiation->ngroups != 20) {
     ProblemError("dci_3d requires the 20 reference radiation groups");
   }
-  if (!pmhd->peos->eos_data.is_gamma_law) {
-    ProblemError("dci_3d tabular material mode requires its gamma-law MHD carrier");
+  if (!fluid.peos->eos_data.is_gamma_law) {
+    ProblemError("dci_3d tabular material mode requires its gamma-law carrier");
   }
-  if (!NearlyEqual(pmhd->pbiermann->coefficient,
+  if (fluid.is_mhd &&
+      !NearlyEqual(fluid.pbiermann->coefficient,
                    2.7875722321043606e-4,
                    2.7875722321043606e-4)) {
     ProblemError("dci_3d requires the material-number-density Biermann normalization");
@@ -156,10 +229,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const bool allow_laser_transport_variants = pin->GetOrAddBoolean(
       "problem", "allow_laser_transport_variants", false);
   const Real pi = std::acos(-1.0);
-  const Real projected_inner_radius =
-      inner_radius*std::sin(opening_half_angle_deg*pi/180.0);
+  const Real projected_outer_radius =
+      outer_radius*std::sin(opening_half_angle_deg*pi/180.0);
   const Real covered_area_fraction =
-      SQR(target_radius/projected_inner_radius);
+      SQR(target_radius/projected_outer_radius);
   const bool production_transport =
       max_reflections == 64 && max_mpi_waves >= 64 &&
       NearlyEqual(reflection_offset, 1.0e-5) &&
@@ -171,9 +244,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (geometry != "lens" || profile != "gaussian" ||
       !NearlyEqual(lens_x1, pmy_mesh_->mesh_size.x1max,
                    std::abs(pmy_mesh_->mesh_size.x1max)) ||
-      !NearlyEqual(target_x1, -inner_radius, inner_radius) ||
+      !NearlyEqual(target_x1, outer_radius, outer_radius) ||
+      !(lens_x1 > target_x1) ||
       !(aperture_radius > target_radius) || !(target_radius > 0.0) ||
-      target_radius > projected_inner_radius || covered_area_fraction < 0.85 ||
+      target_radius > projected_outer_radius || covered_area_fraction < 0.5 ||
       covered_area_fraction > 1.0 ||
       !NearlyEqual(profile_radius, aperture_radius, aperture_radius) ||
       beam_rays < 4096 ||
@@ -191,21 +265,22 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int js = indcs.js, je = indcs.je;
   const int ks = indcs.ks, ke = indcs.ke;
   const int nmb1 = pmbp->nmb_thispack - 1;
-  const int scalar_index = pmhd->pmaterials->ScalarIndex();
-  const auto material_mixture = pmhd->pmaterials->DeviceData();
+  const int scalar_index = fluid.pmaterials->ScalarIndex();
+  const auto material_mixture = fluid.pmaterials->DeviceData();
   const Real code_temperature =
       material_mixture.CodeTemperatureFromKelvin(temperature_kelvin);
   auto size = pmbp->pmb->mb_size;
-  auto w0 = pmhd->w0;
-  auto bcc0 = pmhd->bcc0;
+  auto w0 = fluid.w0;
   const Real cos_half_angle =
       std::cos(opening_half_angle_deg*pi/180.0);
 
   Kokkos::deep_copy(w0, 0.0);
-  Kokkos::deep_copy(bcc0, 0.0);
-  Kokkos::deep_copy(pmhd->b0.x1f, 0.0);
-  Kokkos::deep_copy(pmhd->b0.x2f, 0.0);
-  Kokkos::deep_copy(pmhd->b0.x3f, 0.0);
+  if (fluid.is_mhd) {
+    Kokkos::deep_copy(fluid.bcc0, 0.0);
+    Kokkos::deep_copy(fluid.b0x1f, 0.0);
+    Kokkos::deep_copy(fluid.b0x2f, 0.0);
+    Kokkos::deep_copy(fluid.b0x3f, 0.0);
+  }
 
   par_for("pgen_dci_3d", DevExeSpace(), 0, nmb1,
           ks, ke, js, je, is, ie,
@@ -217,7 +292,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real x3 = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                 size.d_view(m).x3max);
     const Real radius = sqrt(x1*x1 + x2*x2 + x3*x3);
-    const Real axis_cosine = (radius > 0.0) ? -x1/radius : -1.0;
+    const Real axis_cosine = (radius > 0.0) ? x1/radius : -1.0;
 
     const Real inside_outer =
         0.5*(1.0 - tanh((radius-outer_radius)/transition_width));
@@ -244,8 +319,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     w0(m, scalar_index, k, j, i) = ch_mass_fraction;
   });
 
-  pmhd->peos->PrimToCons(
-      w0, bcc0, pmhd->u0, is, ie, js, je, ks, ke);
+  if (fluid.is_mhd) {
+    pmbp->pmhd->peos->PrimToCons(
+        w0, fluid.bcc0, fluid.u0, is, ie, js, je, ks, ke);
+  } else {
+    pmbp->phydro->peos->PrimToCons(w0, fluid.u0, is, ie, js, je, ks, ke);
+  }
 }
 
 namespace {
@@ -259,8 +338,9 @@ namespace {
 
 void VacuumRadiationBoundary(Mesh *pm) {
   auto *pmbp = pm->pmb_pack;
-  auto *prad = pmbp->pmhd->ptwo_temp->pradiation;
-  auto u0 = pmbp->pmhd->u0;
+  const DCIFluid fluid = SelectFluid(pmbp);
+  auto *prad = fluid.ptwo->pradiation;
+  auto u0 = fluid.u0;
   auto mb_bcs = pmbp->pmb->mb_bcs;
   auto &indcs = pm->mb_indcs;
   const int ng = indcs.ng;
@@ -313,8 +393,8 @@ void VacuumRadiationBoundary(Mesh *pm) {
 
 void DCIHistory(HistoryData *pdata, Mesh *pm) {
   auto *pmbp = pm->pmb_pack;
-  auto *pmhd = pmbp->pmhd;
-  auto *ptwo = pmhd->ptwo_temp;
+  DCIFluid fluid = SelectFluid(pmbp);
+  auto *ptwo = fluid.ptwo;
   auto *prad = ptwo->pradiation;
 
   pdata->nhist = kHistoryFields;
@@ -325,6 +405,8 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   pdata->label[4] = "CH_mass";
   pdata->label[5] = "mat_E";
   pdata->label[6] = "kin_E";
+  // The magnetic columns are retained (as identical zeros) when the deck runs the
+  // hydrodynamic carrier so that the two modes produce comparable history files.
   pdata->label[7] = "mag_E";
   pdata->label[8] = "eion_E";
   pdata->label[9] = "eele_E";
@@ -338,17 +420,22 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   pdata->label[17] = "rad_x";
   pdata->label[18] = "eos_floor";
   pdata->label[19] = "eos_bad";
+  pdata->label[20] = "divB";
 
-  auto u0 = pmhd->u0;
-  auto bcc0 = pmhd->bcc0;
-  auto flx1 = pmhd->uflx.x1f;
-  auto flx2 = pmhd->uflx.x2f;
-  auto flx3 = pmhd->uflx.x3f;
+  const bool have_magnetic = fluid.is_mhd;
+  auto u0 = fluid.u0;
+  auto bcc0 = fluid.bcc0;
+  auto b0x1f = fluid.b0x1f;
+  auto b0x2f = fluid.b0x2f;
+  auto b0x3f = fluid.b0x3f;
+  auto flx1 = fluid.flx1;
+  auto flx2 = fluid.flx2;
+  auto flx3 = fluid.flx3;
   auto mb_bcs = pmbp->pmb->mb_bcs;
   auto laser_data = pmbp->plaser->cell_data;
   auto thermodynamics = ptwo->thermodynamics;
   auto size = pmbp->pmb->mb_size;
-  const int scalar_index = pmhd->pmaterials->ScalarIndex();
+  const int scalar_index = fluid.pmaterials->ScalarIndex();
   const int iion = ptwo->iion;
   const int iele = ptwo->iele;
   const int ifirst = prad->ifirst;
@@ -387,9 +474,9 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
         const Real momentum_squared = SQR(u0(m, IM1, k, j, i)) +
                                       SQR(u0(m, IM2, k, j, i)) +
                                       SQR(u0(m, IM3, k, j, i));
-        const Real b1 = bcc0(m, IBX, k, j, i);
-        const Real b2 = bcc0(m, IBY, k, j, i);
-        const Real b3 = bcc0(m, IBZ, k, j, i);
+        const Real b1 = have_magnetic ? bcc0(m, IBX, k, j, i) : 0.0;
+        const Real b2 = have_magnetic ? bcc0(m, IBY, k, j, i) : 0.0;
+        const Real b3 = have_magnetic ? bcc0(m, IBZ, k, j, i) : 0.0;
         const Real b2sum = b1*b1 + b2*b2 + b3*b3;
         Real erad = 0.0;
         Real erad_soft = 0.0;
@@ -457,6 +544,17 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
         local.the_array[18] =
             ((eos_flags & materials::ionmix_energy_below_table) != 0) ? 1.0 : 0.0;
         local.the_array[19] = ((eos_flags & disallowed_eos_flags) != 0) ? 1.0 : 0.0;
+        // Volume-integrated |div B| from the face fields.  Constrained transport keeps
+        // this at roundoff, so it is the diagnostic that shows whether a closure or
+        // subcycling change has quietly broken the CT invariant.  Identically zero for
+        // the hydrodynamic carrier, which stores no magnetic field at all.
+        Real divb = 0.0;
+        if (have_magnetic) {
+          divb = (b0x1f(m, k, j, i+1)-b0x1f(m, k, j, i))/dx1 +
+                 (b0x2f(m, k, j+1, i)-b0x2f(m, k, j, i))/dx2 +
+                 (b0x3f(m, k+1, j, i)-b0x3f(m, k, j, i))/dx3;
+        }
+        local.the_array[20] = volume*fabs(divb);
         sum += local;
       }, Kokkos::Sum<array_sum::GlobalSum>(sum_this_rank));
   Kokkos::fence();

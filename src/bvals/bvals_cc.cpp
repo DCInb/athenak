@@ -39,11 +39,14 @@ MeshBoundaryValuesCC::MeshBoundaryValuesCC(MeshBlockPack *pp, ParameterInput *pi
 //! 5D Kokkos View of coarsened (restricted) array data also required with SMR/AMR
 
 TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
-                                               DvceArray5D<Real> &ca) {
+                                               DvceArray5D<Real> &ca,
+                                               const int nvar_in) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
-  int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
+  // 2nd index from L of the input array is NVAR; a caller may restrict the exchange
+  // to the leading nvar_in components (see the header).
+  int nvar = (nvar_in < 0) ? a.extent_int(1) : nvar_in;
 
   {int my_rank = global_variable::my_rank;
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -258,7 +261,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
 // \brief Unpack boundary buffers
 
 TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
-                                                 DvceArray5D<Real> &ca) {
+                                                 DvceArray5D<Real> &ca,
+                                                 const int nvar_in) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -298,7 +302,9 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 
   //----- STEP 2: buffers have all completed, so unpack
 
-  int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
+  // 2nd index from L of the input array is NVAR; a caller may restrict the exchange
+  // to the leading nvar_in components (see the header).
+  int nvar = (nvar_in < 0) ? a.extent_int(1) : nvar_in;
   auto &mblev = pmy_pack->pmb->mb_lev;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)

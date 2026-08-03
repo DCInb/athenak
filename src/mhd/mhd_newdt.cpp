@@ -187,7 +187,7 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   if (pmy_pack->pmesh->three_d) { dtnew = std::min(dtnew, dt3); }
 
   // compute timestep for diffusion
-  if (pcond != nullptr) {
+  if (pcond != nullptr && !pcond->IsImplicit()) {
     pcond->NewTimeStep(w0, peos->eos_data);
   }
   if (pvisc != nullptr) {

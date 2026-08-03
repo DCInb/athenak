@@ -164,8 +164,9 @@ class Laser {
   void InitializeRays();
   void TraceStraightRays(bool preserve_off_rank = false);
   void TraceRefractiveRays(bool preserve_off_rank = false);
-  void CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next);
-  void SeedActiveQueue();
+  int CompactActiveQueue(DvceArray1D<int> current, DvceArray1D<int> next,
+                         int current_count);
+  int SeedActiveQueue();
   int CountActiveRays();
   void BookRemainingRays();
   void PrepareOutgoingRays();
@@ -177,6 +178,16 @@ class Laser {
 
  private:
   MeshBlockPack *pmy_pack_;
+  // The laser is an auxiliary module of whichever Newtonian 2T fluid the deck
+  // configured.  These accessors hide the <hydro>/<mhd> choice from the transport and
+  // deposition kernels; they must be called at task time because the fluid Views are
+  // reallocated after construction.
+  bool use_mhd_fluid_ = false;
+  DvceArray5D<Real> FluidCons() const;
+  DvceArray5D<Real> FluidPrim() const;
+  DvceArray5D<Real> FluidTemperature() const;
+  DvceArray5D<Real> FluidThermodynamics() const;
+
   std::vector<BeamConfig> beams_;
   DepositionTarget deposition_target_;
   AbsorptionModel absorption_model_;
@@ -231,6 +242,7 @@ class Laser {
   DvceArray1D<int> active_queue_a_, active_queue_b_;
   DvceArray1D<int> ray_destination_rank_;
   DvceArray1D<LaserBlockInfo> global_block_info_;
+  bool global_block_info_built_ = false;
   DvceArray1D<int> mpi_send_counts_, mpi_send_offsets_, mpi_pack_cursors_;
   DvceArray1D<LaserRayPacket> mpi_send_packets_, mpi_recv_packets_;
   Kokkos::View<LaserRayPacket *, LayoutWrapper, Kokkos::SharedHostPinnedSpace>
@@ -253,6 +265,7 @@ class Laser {
   int mpi_local_active_ = 0;
   int mpi_global_active_ = 0;
   int mpi_wave_ = 0;
+  int actual_transport_iterations_ = 0;
 
 #if MPI_PARALLEL_ENABLED
   MPI_Comm mpi_comm_ = MPI_COMM_NULL;

@@ -15,6 +15,21 @@
   The inverse-bremsstrahlung convention, ray-power accounting, and electron deposition
   path follow this model.
 
+## Electron thermal conduction
+
+- FLASH 4.6.2 User Guide, “General Implicit Diffusion Solver” and “Thermal
+  Conductivity,”
+  <https://flash.rochester.edu/site/flashcode/user_support/flash4_ug_4p62/node122.html>.
+  AthenaK follows the centered variable-coefficient stencil and theta method described
+  there.  Conductivity and flux limiting are time lagged over a solve; the electron EOS
+  energy remains nonlinear.  The same reference supplies the harmonic, min/max, and
+  Larsen saturated-flux limiters and the fixed-temperature/zero-gradient boundary choices.
+
+- FLASH 4.6.2 User Guide, “Spitzer High-Z,”
+  <https://flash.rochester.edu/site/flashcode/user_support/flash4_ug_4p62/node139.html>.
+  The `SpitzerHighZ` electron conductivity, including the (1/(1+3.3/\bar Z))
+  correction, is the dimensional conductivity used by this benchmark.
+
 ## Biermann discretization and radiation-MHD implementation
 
 - C. Graziani, P. Tzeferacos, D. Lee, D. Q. Lamb, K. Weide, M. Fatenejad, and
@@ -74,4 +89,3 @@ The automated checks deliberately do not assert megagauss amplitudes, experiment
 ablation-front positions, or late-time magnetic transport. Those require the missing
 material and transport physics listed in `README.md` and an experiment-specific
 dimensionalization.
-

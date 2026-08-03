@@ -245,8 +245,8 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
   }
 
   // (10) LASER ENERGY DEPOSITION
-  // Laser is an auxiliary 2T MHD module and inserts its stage tasks between the MHD
-  // dual-energy and ordinary source-term tasks.
+  // Laser is an auxiliary 2T module of whichever fluid (<hydro> or <mhd>) was created,
+  // and inserts its stage tasks between that fluid's dual-energy and source-term tasks.
   if (pin->DoesBlockExist("laser")) {
     plaser = new laser::Laser(this, pin);
     plaser->AssembleTasks(tl_map);

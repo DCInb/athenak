@@ -118,7 +118,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
     pmaterials = new materials::MaterialMixture(
-        pin, nmhd, nuser_scalars, peos->eos_data.gamma, ppack->punit);
+        pin, "mhd", nmhd, nuser_scalars, peos->eos_data.gamma, ppack->punit);
     use_tabular_material_eos = pmaterials->UsesTabularEOS();
   }
   bool use_two_temperature = pin->GetOrAddBoolean("mhd", "two_temperature", false);
@@ -260,7 +260,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       pin->DoesParameterExist("mhd","alpha_aniso") ||
       pin->DoesParameterExist("mhd","alpha_spitzer")) {
     if (peos->eos_data.is_gamma_law) {
-      pcond = new Conduction("mhd", ppack, pin);
+      pcond = new Conduction("mhd", ppack, pin, ptwo_temp, pmaterials);
     } else {
       std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
                 << "Thermal conduction in MHD requires ideal gas EOS" << std::endl;
@@ -293,11 +293,13 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (pvisc != nullptr || presist != nullptr || pcond != nullptr || psrc != nullptr ||
+    if (pvisc != nullptr || presist != nullptr ||
+        (pcond != nullptr && !pcond->IsImplicit()) || psrc != nullptr ||
         pin->DoesBlockExist("shearing_box")) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<mhd>/dual_energy is not yet compatible with viscosity, "
-                << "resistivity, thermal conduction, MHD source terms, or shearing box"
+                << "resistivity, explicit thermal conduction, MHD source terms, or "
+                << "shearing box"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }

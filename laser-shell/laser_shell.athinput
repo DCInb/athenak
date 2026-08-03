@@ -18,11 +18,13 @@ x1min = -2.0
 x1max = 1.5
 ix1_bc = outflow
 ox1_bc = outflow
+
 nx2 = 400
 x2min = -1.0
 x2max = 1.0
 ix2_bc = outflow
 ox2_bc = outflow
+
 nx3 = 400
 x3min = -1.0
 x3max = 1.0

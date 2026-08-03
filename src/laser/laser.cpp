@@ -21,6 +21,7 @@
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
+#include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
 #include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
@@ -168,21 +169,40 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     device_counters_("laser-counters", 8),
     cumulative_energy_start_("laser-energy-start", 1, 1, 1, 1, 1),
     pmy_pack_(ppack) {
-  if (ppack->pmhd == nullptr || ppack->pmhd->ptwo_temp == nullptr) {
-    LaserInputError("requires <mhd>/two_temperature=true");
+  // Couple to whichever Newtonian 2T fluid the deck configured.  <hydro> and <mhd> are
+  // mutually exclusive here: a two-fluid <ion-neutral> deck has no single 2T carrier.
+  const bool have_hydro = ppack->phydro != nullptr &&
+                          ppack->phydro->ptwo_temp != nullptr;
+  const bool have_mhd = ppack->pmhd != nullptr &&
+                        ppack->pmhd->ptwo_temp != nullptr;
+  if (have_hydro && have_mhd) {
+    LaserInputError("cannot be used with both <hydro> and <mhd> two-temperature fluids");
   }
-  if (!ppack->pmhd->peos->eos_data.is_gamma_law ||
+  if (!have_hydro && !have_mhd) {
+    LaserInputError("requires <hydro>/two_temperature=true or "
+                    "<mhd>/two_temperature=true");
+  }
+  use_mhd_fluid_ = have_mhd;
+
+  EquationOfState *fluid_eos =
+      use_mhd_fluid_ ? ppack->pmhd->peos : ppack->phydro->peos;
+  two_temperature::TwoTemperature *fluid_two_temp =
+      use_mhd_fluid_ ? ppack->pmhd->ptwo_temp : ppack->phydro->ptwo_temp;
+  materials::MaterialMixture *fluid_materials =
+      use_mhd_fluid_ ? ppack->pmhd->pmaterials : ppack->phydro->pmaterials;
+
+  if (!fluid_eos->eos_data.is_gamma_law ||
       ppack->pcoord->is_special_relativistic ||
       ppack->pcoord->is_general_relativistic) {
-    LaserInputError("currently supports only Newtonian gamma-law MHD");
+    LaserInputError("currently supports only Newtonian gamma-law hydro/MHD");
   }
-  electron_index_ = ppack->pmhd->ptwo_temp->iele;
-  gamma_minus_one_ = ppack->pmhd->peos->eos_data.gamma - 1.0;
+  electron_index_ = fluid_two_temp->iele;
+  gamma_minus_one_ = fluid_eos->eos_data.gamma - 1.0;
   electron_heat_capacity_fraction_ =
-      ppack->pmhd->ptwo_temp->ElectronHeatCapacityFraction();
-  use_material_mixture_ = ppack->pmhd->pmaterials != nullptr;
+      fluid_two_temp->ElectronHeatCapacityFraction();
+  use_material_mixture_ = fluid_materials != nullptr;
   if (use_material_mixture_) {
-    material_mixture_ = ppack->pmhd->pmaterials->DeviceData();
+    material_mixture_ = fluid_materials->DeviceData();
   }
 
   std::string target = pin->GetOrAddString("laser", "deposition_target", "electron");
@@ -679,6 +699,14 @@ bool Laser::UpdateBeamPowers(Real time, Real dt) {
 void Laser::RefreshGlobalBlockInfo() {
   Mesh *mesh = pmy_pack_->pmesh;
   int nmb_total = mesh->nmb_total;
+  // The descriptors are a pure function of the block tree and the rank map, so on a
+  // static mesh they only need building once.  AMR is the only thing in this code that
+  // remaps gids or ranks after setup, so rebuild unconditionally there and cache
+  // otherwise; this was O(nmb_total) of host work plus one H2D on every RK stage.
+  if (global_block_info_built_ && !mesh->adaptive &&
+      global_block_info_.extent_int(0) == nmb_total) {
+    return;
+  }
   if (global_block_info_.extent_int(0) != nmb_total) {
     Kokkos::realloc(global_block_info_, nmb_total);
   }
@@ -722,6 +750,7 @@ void Laser::RefreshGlobalBlockInfo() {
     host_blocks(gid) = info;
   }
   Kokkos::deep_copy(global_block_info_, host_blocks);
+  global_block_info_built_ = true;
 }
 
 Laser::~Laser() {
@@ -730,6 +759,28 @@ Laser::~Laser() {
   MPI_Finalized(&finalized);
   if (!finalized && mpi_comm_ != MPI_COMM_NULL) MPI_Comm_free(&mpi_comm_);
 #endif
+}
+
+//----------------------------------------------------------------------------------------
+//! Fluid state accessors.  Resolve the configured carrier at call time: the Hydro/MHD
+//! constructors reallocate these Views after the Laser object is built.
+
+DvceArray5D<Real> Laser::FluidCons() const {
+  return use_mhd_fluid_ ? pmy_pack_->pmhd->u0 : pmy_pack_->phydro->u0;
+}
+
+DvceArray5D<Real> Laser::FluidPrim() const {
+  return use_mhd_fluid_ ? pmy_pack_->pmhd->w0 : pmy_pack_->phydro->w0;
+}
+
+DvceArray5D<Real> Laser::FluidTemperature() const {
+  return use_mhd_fluid_ ? pmy_pack_->pmhd->ptwo_temp->temperature
+                        : pmy_pack_->phydro->ptwo_temp->temperature;
+}
+
+DvceArray5D<Real> Laser::FluidThermodynamics() const {
+  return use_mhd_fluid_ ? pmy_pack_->pmhd->ptwo_temp->thermodynamics
+                        : pmy_pack_->phydro->ptwo_temp->thermodynamics;
 }
 
 } // namespace laser

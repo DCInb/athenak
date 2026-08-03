@@ -130,17 +130,22 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
     TaskID b_restu = tl["biermann_stage"]->AddTask(
         &MHD::RestrictU, this, b_closed);
     TaskID b_sendu = tl["biermann_stage"]->AddTask(
-        &MHD::SendU, this, b_restu);
+        &MHD::BiermannSendU, this, b_restu);
     TaskID b_recvu = tl["biermann_stage"]->AddTask(
-        &MHD::RecvU, this, b_sendu);
+        &MHD::BiermannRecvU, this, b_sendu);
+    // Branch the B halo from the CT update rather than from the completed U halo.
+    // RestrictB touches only b0/coarse_b0, so serialising it behind RecvU bought
+    // nothing but a latency round -- and at microstep cadence that round is paid eight
+    // times per cycle instead of once.  Both halos must land before the physical BCs.
     TaskID b_restb = tl["biermann_stage"]->AddTask(
-        &MHD::RestrictB, this, b_recvu);
+        &MHD::RestrictB, this, b_closed);
     TaskID b_sendb = tl["biermann_stage"]->AddTask(
         &MHD::SendB, this, b_restb);
     TaskID b_recvb = tl["biermann_stage"]->AddTask(
         &MHD::RecvB, this, b_sendb);
+    TaskID b_halos = b_recvu | b_recvb;
     TaskID b_bcs = tl["biermann_stage"]->AddTask(
-        &MHD::ApplyPhysicalBCs, this, b_recvb);
+        &MHD::ApplyPhysicalBCs, this, b_halos);
     TaskID b_prol = tl["biermann_stage"]->AddTask(
         &MHD::Prolongate, this, b_bcs);
     TaskID b_c2p = tl["biermann_stage"]->AddTask(
@@ -266,7 +271,7 @@ TaskStatus MHD::Fluxes(Driver *pdrive, int stage) {
   }
 
   // Add diffusive fluxes
-  if (pcond != nullptr) {
+  if (pcond != nullptr && !pcond->IsImplicit()) {
     pcond->AddHeatFluxes(w0, peos->eos_data, uflx);
   }
   if (pvisc != nullptr) {
@@ -671,6 +676,9 @@ TaskStatus MHD::TwoTempExchange(Driver *pdrive, int stage) {
   int n1m1 = indcs.nx1 + 2*indcs.ng - 1;
   int n2m1 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng - 1 : 0;
   int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
+  if (pcond != nullptr && pcond->IsImplicit()) {
+    pcond->SolveImplicit(pmy_pack->pmesh->dt, u0, w0, pbval_u, ptwo_temp);
+  }
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
   return NewTimeStep(pdrive, pdrive->nexp_stages);

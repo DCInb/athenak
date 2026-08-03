@@ -354,12 +354,23 @@ void Driver::ExecuteBiermannHalfStep(Mesh *pm, Real interval) {
     // invalid limit.  Exiting before the reduction can strand the healthy ranks inside
     // MPI_Allreduce.  Positive infinity is deliberate: it is the no-local-restriction
     // sentinel returned for a vanishing local Biermann characteristic speed.
-    int invalid_limit = (!(limit > 0.0) || std::isnan(limit)) ? 1 : 0;
-    int any_invalid_limit = 0;
-    MPI_Allreduce(&invalid_limit, &any_invalid_limit, 1, MPI_INT, MPI_MAX,
+    //
+    // The validity flag and the limit share one MIN reduction: a rank votes -1 when its
+    // local limit is unusable, so MIN over the flag slot reproduces the MAX over the
+    // old integer flag exactly.  An invalid rank contributes +infinity to the limit slot
+    // so a NaN can never reach the reduction and corrupt the healthy ranks' minimum;
+    // that rank aborts on the flag before the limit is ever used.  With every local
+    // limit valid the reduced value is bit-identical to the previous two-collective
+    // form, because the operands, operation and communicator are unchanged.
+    const bool invalid_limit = (!(limit > 0.0) || std::isnan(limit));
+    Real limit_reduction[2];
+    limit_reduction[0] = invalid_limit ? -1.0 : 0.0;
+    limit_reduction[1] = invalid_limit
+        ? std::numeric_limits<Real>::infinity() : limit;
+    MPI_Allreduce(MPI_IN_PLACE, limit_reduction, 2, MPI_ATHENA_REAL, MPI_MIN,
                   MPI_COMM_WORLD);
-    if (any_invalid_limit != 0) {
-      if (invalid_limit != 0) {
+    if (limit_reduction[0] < 0.0) {
+      if (invalid_limit) {
         std::cerr << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "Invalid local Biermann subcycle timestep limit on "
                   << "rank " << global_variable::my_rank << ": " << limit
@@ -368,8 +379,7 @@ void Driver::ExecuteBiermannHalfStep(Mesh *pm, Real interval) {
       MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
       std::exit(EXIT_FAILURE);
     }
-    MPI_Allreduce(MPI_IN_PLACE, &limit, 1, MPI_ATHENA_REAL, MPI_MIN,
-                  MPI_COMM_WORLD);
+    limit = limit_reduction[1];
 #else
     if (!(limit > 0.0) || std::isnan(limit)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__

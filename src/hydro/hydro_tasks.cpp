@@ -64,7 +64,8 @@ void Hydro::AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> 
   id.sendf     = tl["stagen"]->AddTask(&Hydro::SendFlux, this, id.flux);
   id.recvf     = tl["stagen"]->AddTask(&Hydro::RecvFlux, this, id.sendf);
   id.rkupdt    = tl["stagen"]->AddTask(&Hydro::RKUpdate, this, id.recvf);
-  id.srctrms   = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, this, id.rkupdt);
+  id.duale     = tl["stagen"]->AddTask(&Hydro::DualEnergyStep, this, id.rkupdt);
+  id.srctrms   = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, this, id.duale);
   id.sendu_oa  = tl["stagen"]->AddTask(&Hydro::SendU_OA, this, id.srctrms);
   id.recvu_oa  = tl["stagen"]->AddTask(&Hydro::RecvU_OA, this, id.sendu_oa);
   id.restu     = tl["stagen"]->AddTask(&Hydro::RestrictU, this, id.recvu_oa);
@@ -105,7 +106,7 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
   // with SMR/AMR post receives for fluxes of U
   // do not post receives for fluxes when stage < 0 (i.e. ICs)
   if (pmy_pack->pmesh->multilevel && (stage >= 0)) {
-    tstat = pbval_u->InitFluxRecv(nhydro+nscalars);
+    tstat = pbval_u->InitFluxRecv(nhydro+nscalars + (use_dual_energy ? 1 : 0));
   }
   if (tstat != TaskStatus::complete) return tstat;
 
@@ -194,7 +195,7 @@ TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
   }
 
   // Add diffusion fluxes
-  if (pcond != nullptr) {
+  if (pcond != nullptr && !pcond->IsImplicit()) {
     pcond->AddHeatFluxes(w0, peos->eos_data, uflx);
   }
   if (pvisc != nullptr) {
@@ -225,7 +226,8 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
   // Only execute BoundaryVaLUES function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
-    tstat = pbval_u->PackAndSendFluxCC(uflx);
+    tstat = pbval_u->PackAndSendFluxCC(uflx,
+        use_dual_energy ? &dual_vf : nullptr);
   }
   return tstat;
 }
@@ -239,7 +241,8 @@ TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
   // Only execute BoundaryValues function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
-    tstat = pbval_u->RecvAndUnpackFluxCC(uflx);
+    tstat = pbval_u->RecvAndUnpackFluxCC(uflx,
+        use_dual_energy ? &dual_vf : nullptr);
   }
   return tstat;
 }
@@ -413,6 +416,7 @@ TaskStatus Hydro::ConToPrim(Driver *pdrive, int stage) {
   int n1m1 = indcs.nx1 + 2*ng - 1;
   int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
   int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
+  SynchronizeDualEnergyFromTotal();
   peos->ConsToPrim(u0, w0, false, 0, n1m1, 0, n2m1, 0, n3m1);
   if (ptwo_temp != nullptr) {
     ptwo_temp->Sync(u0, w0, 0, n1m1, 0, n2m1, 0, n3m1);
@@ -440,6 +444,9 @@ TaskStatus Hydro::TwoTempExchange(Driver *pdrive, int stage) {
   int n1m1 = indcs.nx1 + 2*indcs.ng - 1;
   int n2m1 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng - 1 : 0;
   int n3m1 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng - 1 : 0;
+  if (pcond != nullptr && pcond->IsImplicit()) {
+    pcond->SolveImplicit(pmy_pack->pmesh->dt, u0, w0, pbval_u, ptwo_temp);
+  }
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
   return NewTimeStep(pdrive, pdrive->nexp_stages);

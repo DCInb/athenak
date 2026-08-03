@@ -97,6 +97,7 @@ def test_run():
         assert completed["remaining"] == 0.0
         assert completed["remaining_fraction"] == 0.0
         assert_remaining_partition(completed, 0.0, 0.0)
+        assert 0 < completed["iterations"] < 16*completed["waves"]
         assert "laser_remaining_ray:" not in completed_log
 
         # A planar critical surface turns exactly once with hysteresis enabled,

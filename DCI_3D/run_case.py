@@ -31,6 +31,20 @@ CALIBRATION_INPUT = CASE_DIR / "dci_3d_calibration.athinput"
 TABLE_GENERATOR = CASE_DIR / "generate_reference_tables.py"
 MATERIAL_TABLE_DIR = CASE_DIR / "material_tables"
 MATERIAL_TABLE_MANIFEST = MATERIAL_TABLE_DIR / "manifest.json"
+
+# UCX transport settings for the eight-GPU node.  Deliberately empty: UCX_TLS is exported
+# by bashrc_athenaK, and no explicit UCX_RNDV_THRESH is set.
+#
+# An override was added and then removed.  The large cuMemHostRegister cost that motivated
+# it is a *warm-up transient*, not a steady-state cost: with the automatic threshold the
+# first cycle costs ~10.1 s and the run settles to 2.54 s/cycle by cycle 11 as UCX's
+# registration cache fills.  Forcing eager transport flattens the warm-up (2.55 s on cycle
+# one) but leaves a permanently slower steady state of 2.81 s/cycle, because the halo
+# packets then arrive as many small fragments instead of one zero-copy transfer.  The
+# crossover is near 80 cycles; production runs are thousands, so the default wins.
+# Measured over 20 cycles per setting -- see DCI_3D/perf_ledger.md, cards A4 and A4b.
+MPI_TRANSPORT_ENV = {}
+
 ARCHIVE_SHA256 = "952708009c9e3bc00dc645e11c9c0f804614def9c70cc999b78c92f16c8a96cf"
 EXPECTED_MATERIAL_TABLES = {
     "ch.2t_eos": {
@@ -1463,8 +1477,13 @@ def memory_is_accepted(memory: dict[str, object]) -> bool:
     )
 
 
+def env_prefix(env: dict[str, str]) -> str:
+    """Render the launch environment as a reproducible shell prefix."""
+    return "".join(f"{key}={shlex.quote(value)} " for key, value in env.items())
+
+
 def print_dry_run(run_dir: Path, command: list[str], devices: list[str]) -> None:
-    env = {"CUDA_VISIBLE_DEVICES": ",".join(devices)}
+    env = {"CUDA_VISIBLE_DEVICES": ",".join(devices), **MPI_TRANSPORT_ENV}
     print(f"mkdir -p {shlex.quote(str(run_dir))}")
     print(
         "cp -a "
@@ -1472,7 +1491,7 @@ def print_dry_run(run_dir: Path, command: list[str], devices: list[str]) -> None
         f"{shlex.quote(str(run_dir / 'material_tables') + '/')}"
     )
     print(
-        f"CUDA_VISIBLE_DEVICES={shlex.quote(env['CUDA_VISIBLE_DEVICES'])} "
+        env_prefix(env)
         + shlex.join(shell_command(run_dir, command))
     )
 
@@ -1768,6 +1787,7 @@ def run_production_segments(
 ) -> int:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+    env.update(MPI_TRANSPORT_ENV)
     current_time = 0.0 if current_restart is None else current_restart.time
     current_cycle = 0 if current_restart is None else current_restart.cycle
     run_id = status.get("run_id")
@@ -2070,9 +2090,9 @@ def print_production_resume_dry_run(
             wall_time=wall_time,
         )
         print("# Start prepared production phase 1 from t=0; target is exactly 5.0 ns.")
-        env = {"CUDA_VISIBLE_DEVICES": ",".join(devices)}
+        env = {"CUDA_VISIBLE_DEVICES": ",".join(devices), **MPI_TRANSPORT_ENV}
         print(
-            f"CUDA_VISIBLE_DEVICES={shlex.quote(env['CUDA_VISIBLE_DEVICES'])} "
+            env_prefix(env)
             + shlex.join(shell_command(run_dir, mpi))
         )
         return
@@ -2104,9 +2124,9 @@ def print_production_resume_dry_run(
         f"# Resume phase {phase} from t={restart.time:.17g}, cycle={restart.cycle}; "
         f"target remains exactly {target:.1f} ns."
     )
-    env = {"CUDA_VISIBLE_DEVICES": ",".join(devices)}
+    env = {"CUDA_VISIBLE_DEVICES": ",".join(devices), **MPI_TRANSPORT_ENV}
     print(
-        f"CUDA_VISIBLE_DEVICES={shlex.quote(env['CUDA_VISIBLE_DEVICES'])} "
+        env_prefix(env)
         + shlex.join(shell_command(run_dir, mpi))
     )
 
@@ -2220,7 +2240,7 @@ def main() -> int:
                 print("# Stop after atomically writing state=prepared; launch later with --resume.")
             else:
                 print(
-                    f"CUDA_VISIBLE_DEVICES={shlex.quote(','.join(devices))} "
+                    env_prefix({"CUDA_VISIBLE_DEVICES": ",".join(devices), **MPI_TRANSPORT_ENV})
                     + shlex.join(shell_command(run_dir, mpi))
                 )
             print(
@@ -2286,6 +2306,7 @@ def main() -> int:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+        env.update(MPI_TRANSPORT_ENV)
         status: dict[str, Any] = {
             "mode": args.mode,
             "ranks": args.ranks,

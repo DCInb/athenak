@@ -63,14 +63,23 @@ Real PlanckIntegral(Real x) {
            - x3*x2*x2*x2*x2/13305600.0;
   }
 
+  // exp(-n*x) is a geometric sequence: one exp plus a running multiply replaces the 64
+  // independent transcendentals this loop used to evaluate.  The terms fall off like
+  // e^(-n*x) with x >= 0.5 here, so the series is also truncated as soon as a term can no
+  // longer change the double-precision sum -- typically after a handful of steps.
   Real tail = 0.0;
+  const Real q = exp(-x);
+  const Real x2 = x*x;
+  const Real x3 = x2*x;
+  Real qn = q;
   for (int n = 1; n <= 64; ++n) {
-    Real rn = static_cast<Real>(n);
-    Real invn = 1.0/rn;
-    Real invn2 = invn*invn;
-    Real term = exp(-rn*x)*(x*x*x*invn + 3.0*x*x*invn2
-                            + 6.0*x*invn2*invn + 6.0*invn2*invn2);
+    const Real invn = 1.0/static_cast<Real>(n);
+    const Real invn2 = invn*invn;
+    const Real term = qn*(x3*invn + 3.0*x2*invn2
+                          + 6.0*x*invn2*invn + 6.0*invn2*invn2);
     tail += term;
+    if (term <= 1.0e-17*tail) break;
+    qn *= q;
   }
   return fmin(fmax(kPlanckIntegralInfinity - tail, 0.0),
               kPlanckIntegralInfinity);
@@ -209,31 +218,115 @@ Real FLDFaceStabilityRate(const FLDLinearization &properties, Real energy,
          + 0.5*normal_speed/dx_normal;
 }
 
-struct FLDFaceState {
-  Real energy_left;
-  Real energy_right;
-  Real energy;
-  Real density;
-  Real electron_temperature;
-  Real material0_mass_fraction;
-  Real gradient;
-  Real normal_gradient;
-};
-
 KOKKOS_INLINE_FUNCTION
 Real RadiationEnergy(const DvceArray5D<Real> &w, int m, int n,
                      int k, int j, int i) {
   return w(m, IDN, k, j, i)*w(m, n, k, j, i);
 }
 
+// Group-independent material state used by the batched radiation transport kernels.
+struct FLDFaceMaterialState {
+  Real density;
+  Real electron_temperature;
+  Real material0_mass_fraction;
+};
+
+struct FLDRadiationFaceState {
+  Real energy_left;
+  Real energy_right;
+  Real energy;
+  Real gradient;
+  Real normal_gradient;
+};
+
 KOKKOS_INLINE_FUNCTION
-FLDFaceState X1FaceState(const DvceArray5D<Real> &w,
-                         const DvceArray5D<Real> &temperature,
-                         int m, int n, int iele,
-                         int k, int j, int i, bool multi_d, bool three_d,
-                         Real dx1, Real dx2, Real dx3, Real gm1, Real fe,
-                         bool use_materials,
-                         const materials::MaterialMixtureDevice &mixture) {
+FLDFaceMaterialState X1FaceMaterialState(
+    const DvceArray5D<Real> &w, const DvceArray5D<Real> &temperature,
+    int m, int iele, int k, int j, int i, Real gm1, Real fe,
+    bool use_materials, const materials::MaterialMixtureDevice &mixture) {
+  FLDFaceMaterialState state;
+  const Real density_left = w(m, IDN, k, j, i-1);
+  const Real density_right = w(m, IDN, k, j, i);
+  state.density = 0.5*(density_left+density_right);
+  state.material0_mass_fraction = 0.0;
+  if (use_materials) {
+    const Real y_left = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i-1);
+    const Real y_right = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i);
+    const Real density_sum = density_left+density_right;
+    state.material0_mass_fraction = (density_sum > 0.0)
+        ? (density_left*y_left+density_right*y_right)/density_sum
+        : 0.5*(y_left+y_right);
+    state.electron_temperature = 0.5*(
+        temperature(m, 1, k, j, i-1)+temperature(m, 1, k, j, i));
+  } else {
+    state.electron_temperature =
+        0.5*gm1*(w(m, iele, k, j, i-1)+w(m, iele, k, j, i))/fe;
+  }
+  return state;
+}
+
+KOKKOS_INLINE_FUNCTION
+FLDFaceMaterialState X2FaceMaterialState(
+    const DvceArray5D<Real> &w, const DvceArray5D<Real> &temperature,
+    int m, int iele, int k, int j, int i, Real gm1, Real fe,
+    bool use_materials, const materials::MaterialMixtureDevice &mixture) {
+  FLDFaceMaterialState state;
+  const Real density_left = w(m, IDN, k, j-1, i);
+  const Real density_right = w(m, IDN, k, j, i);
+  state.density = 0.5*(density_left+density_right);
+  state.material0_mass_fraction = 0.0;
+  if (use_materials) {
+    const Real y_left = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j-1, i);
+    const Real y_right = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i);
+    const Real density_sum = density_left+density_right;
+    state.material0_mass_fraction = (density_sum > 0.0)
+        ? (density_left*y_left+density_right*y_right)/density_sum
+        : 0.5*(y_left+y_right);
+    state.electron_temperature = 0.5*(
+        temperature(m, 1, k, j-1, i)+temperature(m, 1, k, j, i));
+  } else {
+    state.electron_temperature =
+        0.5*gm1*(w(m, iele, k, j-1, i)+w(m, iele, k, j, i))/fe;
+  }
+  return state;
+}
+
+KOKKOS_INLINE_FUNCTION
+FLDFaceMaterialState X3FaceMaterialState(
+    const DvceArray5D<Real> &w, const DvceArray5D<Real> &temperature,
+    int m, int iele, int k, int j, int i, Real gm1, Real fe,
+    bool use_materials, const materials::MaterialMixtureDevice &mixture) {
+  FLDFaceMaterialState state;
+  const Real density_left = w(m, IDN, k-1, j, i);
+  const Real density_right = w(m, IDN, k, j, i);
+  state.density = 0.5*(density_left+density_right);
+  state.material0_mass_fraction = 0.0;
+  if (use_materials) {
+    const Real y_left = mixture.Material0MassFractionFromPrimitive(
+        w, m, k-1, j, i);
+    const Real y_right = mixture.Material0MassFractionFromPrimitive(
+        w, m, k, j, i);
+    const Real density_sum = density_left+density_right;
+    state.material0_mass_fraction = (density_sum > 0.0)
+        ? (density_left*y_left+density_right*y_right)/density_sum
+        : 0.5*(y_left+y_right);
+    state.electron_temperature = 0.5*(
+        temperature(m, 1, k-1, j, i)+temperature(m, 1, k, j, i));
+  } else {
+    state.electron_temperature =
+        0.5*gm1*(w(m, iele, k-1, j, i)+w(m, iele, k, j, i))/fe;
+  }
+  return state;
+}
+
+KOKKOS_INLINE_FUNCTION
+FLDRadiationFaceState X1RadiationFaceState(
+    const DvceArray5D<Real> &w, int m, int n, int k, int j, int i,
+    bool multi_d, bool three_d, Real dx1, Real dx2, Real dx3) {
   Real el = RadiationEnergy(w, m, n, k, j, i-1);
   Real er = RadiationEnergy(w, m, n, k, j, i);
   Real grad1 = (er-el)/dx1;
@@ -254,42 +347,19 @@ FLDFaceState X1FaceState(const DvceArray5D<Real> &w,
     grad3 = (elu-ell+eru-erl)/(4.0*dx3);
   }
 
-  FLDFaceState state;
+  FLDRadiationFaceState state;
   state.energy_left = el;
   state.energy_right = er;
   state.energy = 0.5*(el+er);
-  const Real density_left = w(m, IDN, k, j, i-1);
-  const Real density_right = w(m, IDN, k, j, i);
-  state.density = 0.5*(density_left+density_right);
-  state.material0_mass_fraction = 0.0;
-  if (use_materials) {
-    const Real y_left = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i-1);
-    const Real y_right = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i);
-    const Real density_sum = density_left+density_right;
-    state.material0_mass_fraction = (density_sum > 0.0)
-        ? (density_left*y_left+density_right*y_right)/density_sum
-        : 0.5*(y_left+y_right);
-    state.electron_temperature = 0.5*(
-        temperature(m, 1, k, j, i-1)+temperature(m, 1, k, j, i));
-  } else {
-    state.electron_temperature =
-        0.5*gm1*(w(m, iele, k, j, i-1)+w(m, iele, k, j, i))/fe;
-  }
   state.gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
   state.normal_gradient = grad1;
   return state;
 }
 
 KOKKOS_INLINE_FUNCTION
-FLDFaceState X2FaceState(const DvceArray5D<Real> &w,
-                         const DvceArray5D<Real> &temperature,
-                         int m, int n, int iele,
-                         int k, int j, int i, bool three_d,
-                         Real dx1, Real dx2, Real dx3, Real gm1, Real fe,
-                         bool use_materials,
-                         const materials::MaterialMixtureDevice &mixture) {
+FLDRadiationFaceState X2RadiationFaceState(
+    const DvceArray5D<Real> &w, int m, int n, int k, int j, int i,
+    bool three_d, Real dx1, Real dx2, Real dx3) {
   Real el = RadiationEnergy(w, m, n, k, j-1, i);
   Real er = RadiationEnergy(w, m, n, k, j, i);
   Real ell = RadiationEnergy(w, m, n, k, j-1, i-1);
@@ -307,41 +377,19 @@ FLDFaceState X2FaceState(const DvceArray5D<Real> &w,
     grad3 = (elu-ell+eru-erl)/(4.0*dx3);
   }
 
-  FLDFaceState state;
+  FLDRadiationFaceState state;
   state.energy_left = el;
   state.energy_right = er;
   state.energy = 0.5*(el+er);
-  const Real density_left = w(m, IDN, k, j-1, i);
-  const Real density_right = w(m, IDN, k, j, i);
-  state.density = 0.5*(density_left+density_right);
-  state.material0_mass_fraction = 0.0;
-  if (use_materials) {
-    const Real y_left = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j-1, i);
-    const Real y_right = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i);
-    const Real density_sum = density_left+density_right;
-    state.material0_mass_fraction = (density_sum > 0.0)
-        ? (density_left*y_left+density_right*y_right)/density_sum
-        : 0.5*(y_left+y_right);
-    state.electron_temperature = 0.5*(
-        temperature(m, 1, k, j-1, i)+temperature(m, 1, k, j, i));
-  } else {
-    state.electron_temperature =
-        0.5*gm1*(w(m, iele, k, j-1, i)+w(m, iele, k, j, i))/fe;
-  }
   state.gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
   state.normal_gradient = grad2;
   return state;
 }
 
 KOKKOS_INLINE_FUNCTION
-FLDFaceState X3FaceState(const DvceArray5D<Real> &w,
-                         const DvceArray5D<Real> &temperature,
-                         int m, int n, int iele,
-                         int k, int j, int i, Real dx1, Real dx2, Real dx3,
-                         Real gm1, Real fe, bool use_materials,
-                         const materials::MaterialMixtureDevice &mixture) {
+FLDRadiationFaceState X3RadiationFaceState(
+    const DvceArray5D<Real> &w, int m, int n, int k, int j, int i,
+    Real dx1, Real dx2, Real dx3) {
   Real el = RadiationEnergy(w, m, n, k-1, j, i);
   Real er = RadiationEnergy(w, m, n, k, j, i);
   Real ell = RadiationEnergy(w, m, n, k-1, j, i-1);
@@ -356,29 +404,10 @@ FLDFaceState X3FaceState(const DvceArray5D<Real> &w,
   Real grad2 = (elu-ell+eru-erl)/(4.0*dx2);
   Real grad3 = (er-el)/dx3;
 
-  FLDFaceState state;
+  FLDRadiationFaceState state;
   state.energy_left = el;
   state.energy_right = er;
   state.energy = 0.5*(el+er);
-  const Real density_left = w(m, IDN, k-1, j, i);
-  const Real density_right = w(m, IDN, k, j, i);
-  state.density = 0.5*(density_left+density_right);
-  state.material0_mass_fraction = 0.0;
-  if (use_materials) {
-    const Real y_left = mixture.Material0MassFractionFromPrimitive(
-        w, m, k-1, j, i);
-    const Real y_right = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i);
-    const Real density_sum = density_left+density_right;
-    state.material0_mass_fraction = (density_sum > 0.0)
-        ? (density_left*y_left+density_right*y_right)/density_sum
-        : 0.5*(y_left+y_right);
-    state.electron_temperature = 0.5*(
-        temperature(m, 1, k-1, j, i)+temperature(m, 1, k, j, i));
-  } else {
-    state.electron_temperature =
-        0.5*gm1*(w(m, iele, k-1, j, i)+w(m, iele, k, j, i))/fe;
-  }
   state.gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
   state.normal_gradient = grad3;
   return state;
@@ -632,8 +661,19 @@ void ThermalRadiation::Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &pr
     Real trad = (profile == 1 && x1v >= xsplit) ? trad_right : trad_left;
     Real total = 0.0;
     Real blackbody = arad*trad*trad*trad*trad;
+    // Roll the lower boundary forward instead of re-evaluating it: a 20-group cell needs
+    // 21 Planck integrals, not 40.  This is the same construction the source-limit
+    // reducer already uses below.
+    Real lower_planck = (trad > 0.0) ? PlanckIntegral(bounds(0)/trad) : 0.0;
     for (int g = 0; g < ng; ++g) {
-      Real eg = blackbody*PlanckGroupFraction(bounds(g), bounds(g+1), trad);
+      Real fraction = 0.0;
+      if (trad > 0.0) {
+        const Real upper_planck = PlanckIntegral(bounds(g+1)/trad);
+        fraction = fmin(fmax(
+            (upper_planck-lower_planck)/kPlanckIntegralInfinity, 0.0), 1.0);
+        lower_planck = upper_planck;
+      }
+      Real eg = blackbody*fraction;
       cons(m, i0+g, k, j, i) = eg;
       prim(m, i0+g, k, j, i) = eg/density;
       total += eg;
@@ -699,80 +739,122 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
   bool use_ap_transport = use_ap_transport_;
 
   auto flx1 = flx.x1f;
-  par_for("thermal_rad_flux1", DevExeSpace(), 0, nmb1, 0, ng-1,
+  par_for("thermal_rad_flux1", DevExeSpace(), 0, nmb1,
           ks, ke, js, je, is, ie+1,
-  KOKKOS_LAMBDA(int m, int g, int k, int j, int i) {
-    int n = i0 + g;
-    FLDFaceState state = X1FaceState(
-        w0, temperature, m, n, iele, k, j, i, multi_d, three_d,
-        size.d_view(m).dx1, size.d_view(m).dx2, size.d_view(m).dx3,
-        gm1, fe, use_materials, mixture);
-    Real kappa = use_mixed_table ? mixed_opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature,
-        state.material0_mass_fraction) : (use_table ? opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
-    Real sigma = state.density*kappa;
-    FLDLinearization properties = FLDProperties(
-        sigma, state.energy, state.gradient, state.normal_gradient,
-        alpha, floor, mode);
-    bool use_ap_face = use_ap_transport && mode != 0 &&
-        (properties.streaming_fraction >= streaming_threshold ||
-         sigma*size.d_view(m).dx1 <= optical_depth_threshold);
-    flx1(m, n, k, j, i) += FLDNumericalFlux(
-        properties, state.normal_gradient, state.energy_left,
-        state.energy_right, chat, use_ap_face);
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+    const Real dx3 = size.d_view(m).dx3;
+    const FLDFaceMaterialState material = X1FaceMaterialState(
+        w0, temperature, m, iele, k, j, i, gm1, fe, use_materials, mixture);
+    OpacityTableLocation opacity_location;
+    MixedOpacityTableLocation mixed_opacity_location;
+    if (use_mixed_table) {
+      mixed_opacity_location = mixed_opacity.Locate(
+          material.density, material.electron_temperature,
+          material.material0_mass_fraction);
+    } else if (use_table) {
+      opacity_location = opacity.Locate(
+          material.density, material.electron_temperature);
+    }
+    for (int g = 0; g < ng; ++g) {
+      const int n = i0 + g;
+      const FLDRadiationFaceState state = X1RadiationFaceState(
+          w0, m, n, k, j, i, multi_d, three_d, dx1, dx2, dx3);
+      const Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, mixed_opacity_location) : (use_table ? opacity.Get(
+          opacity_transport, g, opacity_location) : kt(g));
+      const Real sigma = material.density*kappa;
+      const FLDLinearization properties = FLDProperties(
+          sigma, state.energy, state.gradient, state.normal_gradient,
+          alpha, floor, mode);
+      const bool use_ap_face = use_ap_transport && mode != 0 &&
+          (properties.streaming_fraction >= streaming_threshold ||
+           sigma*dx1 <= optical_depth_threshold);
+      flx1(m, n, k, j, i) += FLDNumericalFlux(
+          properties, state.normal_gradient, state.energy_left,
+          state.energy_right, chat, use_ap_face);
+    }
   });
   if (pmy_pack_->pmesh->one_d) return;
 
   auto flx2 = flx.x2f;
-  par_for("thermal_rad_flux2", DevExeSpace(), 0, nmb1, 0, ng-1,
+  par_for("thermal_rad_flux2", DevExeSpace(), 0, nmb1,
           ks, ke, js, je+1, is, ie,
-  KOKKOS_LAMBDA(int m, int g, int k, int j, int i) {
-    int n = i0 + g;
-    FLDFaceState state = X2FaceState(
-        w0, temperature, m, n, iele, k, j, i, three_d,
-        size.d_view(m).dx1, size.d_view(m).dx2, size.d_view(m).dx3,
-        gm1, fe, use_materials, mixture);
-    Real kappa = use_mixed_table ? mixed_opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature,
-        state.material0_mass_fraction) : (use_table ? opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
-    Real sigma = state.density*kappa;
-    FLDLinearization properties = FLDProperties(
-        sigma, state.energy, state.gradient, state.normal_gradient,
-        alpha, floor, mode);
-    bool use_ap_face = use_ap_transport && mode != 0 &&
-        (properties.streaming_fraction >= streaming_threshold ||
-         sigma*size.d_view(m).dx2 <= optical_depth_threshold);
-    flx2(m, n, k, j, i) += FLDNumericalFlux(
-        properties, state.normal_gradient, state.energy_left,
-        state.energy_right, chat, use_ap_face);
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+    const Real dx3 = size.d_view(m).dx3;
+    const FLDFaceMaterialState material = X2FaceMaterialState(
+        w0, temperature, m, iele, k, j, i, gm1, fe, use_materials, mixture);
+    OpacityTableLocation opacity_location;
+    MixedOpacityTableLocation mixed_opacity_location;
+    if (use_mixed_table) {
+      mixed_opacity_location = mixed_opacity.Locate(
+          material.density, material.electron_temperature,
+          material.material0_mass_fraction);
+    } else if (use_table) {
+      opacity_location = opacity.Locate(
+          material.density, material.electron_temperature);
+    }
+    for (int g = 0; g < ng; ++g) {
+      const int n = i0 + g;
+      const FLDRadiationFaceState state = X2RadiationFaceState(
+          w0, m, n, k, j, i, three_d, dx1, dx2, dx3);
+      const Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, mixed_opacity_location) : (use_table ? opacity.Get(
+          opacity_transport, g, opacity_location) : kt(g));
+      const Real sigma = material.density*kappa;
+      const FLDLinearization properties = FLDProperties(
+          sigma, state.energy, state.gradient, state.normal_gradient,
+          alpha, floor, mode);
+      const bool use_ap_face = use_ap_transport && mode != 0 &&
+          (properties.streaming_fraction >= streaming_threshold ||
+           sigma*dx2 <= optical_depth_threshold);
+      flx2(m, n, k, j, i) += FLDNumericalFlux(
+          properties, state.normal_gradient, state.energy_left,
+          state.energy_right, chat, use_ap_face);
+    }
   });
   if (pmy_pack_->pmesh->two_d) return;
 
   auto flx3 = flx.x3f;
-  par_for("thermal_rad_flux3", DevExeSpace(), 0, nmb1, 0, ng-1,
+  par_for("thermal_rad_flux3", DevExeSpace(), 0, nmb1,
           ks, ke+1, js, je, is, ie,
-  KOKKOS_LAMBDA(int m, int g, int k, int j, int i) {
-    int n = i0 + g;
-    FLDFaceState state = X3FaceState(
-        w0, temperature, m, n, iele, k, j, i,
-        size.d_view(m).dx1, size.d_view(m).dx2, size.d_view(m).dx3,
-        gm1, fe, use_materials, mixture);
-    Real kappa = use_mixed_table ? mixed_opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature,
-        state.material0_mass_fraction) : (use_table ? opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
-    Real sigma = state.density*kappa;
-    FLDLinearization properties = FLDProperties(
-        sigma, state.energy, state.gradient, state.normal_gradient,
-        alpha, floor, mode);
-    bool use_ap_face = use_ap_transport && mode != 0 &&
-        (properties.streaming_fraction >= streaming_threshold ||
-         sigma*size.d_view(m).dx3 <= optical_depth_threshold);
-    flx3(m, n, k, j, i) += FLDNumericalFlux(
-        properties, state.normal_gradient, state.energy_left,
-        state.energy_right, chat, use_ap_face);
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+    const Real dx3 = size.d_view(m).dx3;
+    const FLDFaceMaterialState material = X3FaceMaterialState(
+        w0, temperature, m, iele, k, j, i, gm1, fe, use_materials, mixture);
+    OpacityTableLocation opacity_location;
+    MixedOpacityTableLocation mixed_opacity_location;
+    if (use_mixed_table) {
+      mixed_opacity_location = mixed_opacity.Locate(
+          material.density, material.electron_temperature,
+          material.material0_mass_fraction);
+    } else if (use_table) {
+      opacity_location = opacity.Locate(
+          material.density, material.electron_temperature);
+    }
+    for (int g = 0; g < ng; ++g) {
+      const int n = i0 + g;
+      const FLDRadiationFaceState state = X3RadiationFaceState(
+          w0, m, n, k, j, i, dx1, dx2, dx3);
+      const Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, mixed_opacity_location) : (use_table ? opacity.Get(
+          opacity_transport, g, opacity_location) : kt(g));
+      const Real sigma = material.density*kappa;
+      const FLDLinearization properties = FLDProperties(
+          sigma, state.energy, state.gradient, state.normal_gradient,
+          alpha, floor, mode);
+      const bool use_ap_face = use_ap_transport && mode != 0 &&
+          (properties.streaming_fraction >= streaming_threshold ||
+           sigma*dx3 <= optical_depth_threshold);
+      flx3(m, n, k, j, i) += FLDNumericalFlux(
+          properties, state.normal_gradient, state.energy_left,
+          state.energy_right, chat, use_ap_face);
+    }
   });
 }
 
@@ -826,23 +908,41 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     } else {
       tele = gm1*eele_old/(density*fe);
     }
+    OpacityTableLocation opacity_location;
+    if (use_table) opacity_location = opacity.Locate(density, tele);
+    MixedOpacityTableLocation mixed_location;
+    if (use_mixed_table) mixed_location = mixed_opacity.Locate(density, tele, y0);
     Real blackbody = arad*tele*tele*tele*tele;
     Real positive = 0.0;
     Real negative = 0.0;
+    // Each group boundary is shared with its neighbour, so rolling the lower Planck
+    // integral forward evaluates 21 integrals for 20 groups instead of 40.  Identical
+    // construction to the source-limit reducer further down this file.
+    Real lower_planck = (tele > 0.0) ? PlanckIntegral(bounds(0)/tele) : 0.0;
 
     for (int g = 0; g < ng; ++g) {
       Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
       Real kappaa = use_mixed_table ? mixed_opacity.Get(
-          opacity_absorption, g, density, tele, y0) : (use_table ? opacity.Get(
-          opacity_absorption, g, density, tele) : ka(g));
+          opacity_absorption, g, mixed_location) : (use_table ? opacity.Get(
+          opacity_absorption, g, opacity_location) : ka(g));
       Real kappae = use_mixed_table ? mixed_opacity.Get(
-          opacity_emission, g, density, tele, y0) : (use_table ? opacity.Get(
-          opacity_emission, g, density, tele) : ke(g));
+          opacity_emission, g, mixed_location) : (use_table ? opacity.Get(
+          opacity_emission, g, opacity_location) : ke(g));
       Real siga = density*kappaa;
       Real sige = density*kappae;
-      Real source = sige*blackbody*
-          PlanckGroupFraction(bounds(g), bounds(g+1), tele);
+      Real group_fraction = 0.0;
+      if (tele > 0.0) {
+        const Real upper_planck = PlanckIntegral(bounds(g+1)/tele);
+        group_fraction = fmin(fmax(
+            (upper_planck-lower_planck)/kPlanckIntegralInfinity, 0.0), 1.0);
+        lower_planck = upper_planck;
+      }
+      Real source = sige*blackbody*group_fraction;
       Real updated = (old + dt*chat*source)/(1.0 + dt*chat*siga);
+      // Cache the unscaled update in the primitive slot.  Radiation-group
+      // primitives are not read in Couple(), and every slot is overwritten
+      // with its final specific energy in the second loop below.
+      prim(m, i0+g, k, j, i) = updated;
       Real delta = updated-old;
       if (delta > 0.0) positive += delta;
       if (delta < 0.0) negative += delta;
@@ -850,8 +950,8 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
 
     Real eele_floor = 0.0;
     if (use_materials && mixture.UsesTabularEOS()) {
-      const materials::MaterialThermodynamicState floor_state =
-          mixture.MinimumStateNoSound(
+      const materials::MaterialPressureEnergyState floor_state =
+          mixture.MinimumPressureEnergyState(
               density, y0, pressure_floor, temperature_floor);
       eele_floor = density*floor_state.electron_specific_internal_energy;
     }
@@ -864,17 +964,7 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     Real total_radiation = 0.0;
     for (int g = 0; g < ng; ++g) {
       Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real kappaa = use_mixed_table ? mixed_opacity.Get(
-          opacity_absorption, g, density, tele, y0) : (use_table ? opacity.Get(
-          opacity_absorption, g, density, tele) : ka(g));
-      Real kappae = use_mixed_table ? mixed_opacity.Get(
-          opacity_emission, g, density, tele, y0) : (use_table ? opacity.Get(
-          opacity_emission, g, density, tele) : ke(g));
-      Real siga = density*kappaa;
-      Real sige = density*kappae;
-      Real source = sige*blackbody*
-          PlanckGroupFraction(bounds(g), bounds(g+1), tele);
-      Real updated = (old + dt*chat*source)/(1.0 + dt*chat*siga);
+      Real updated = prim(m, i0+g, k, j, i);
       Real delta = updated-old;
       if (delta > 0.0) delta *= emission_scale;
       Real value = old+delta;
@@ -956,14 +1046,12 @@ void ThermalRadiation::NewTimeStep(
   // faces per cell and recovers dt <= [2 c D sum(dx_d^-2)]^-1 for constant diffusion.
   Real max_rate1 = 0.0;
   int nface1 = nx3*nx2*(nx1+1);
-  int total_faces1 = nmb*ng*nface1;
+  int total_faces1 = nmb*nface1;
   Kokkos::parallel_reduce("thermal_rad_newdt_x1",
       Kokkos::RangePolicy<>(DevExeSpace(), 0, total_faces1),
   KOKKOS_LAMBDA(const int idx, Real &max_rate) {
     int face_idx = idx%nface1;
-    int group_block = idx/nface1;
-    int g = group_block%ng;
-    int m = group_block/ng;
+    int m = idx/nface1;
     int ii = face_idx%(nx1+1);
     int jk = face_idx/(nx1+1);
     int j = jk%nx2 + js;
@@ -975,35 +1063,47 @@ void ThermalRadiation::NewTimeStep(
     Real dx_short = dx1;
     if (multi_d) dx_short = fmin(dx_short, dx2);
     if (three_d) dx_short = fmin(dx_short, dx3);
-    FLDFaceState state = X1FaceState(w0, temperature, m, i0+g, ie, k, j, i,
-        multi_d, three_d, dx1, dx2, dx3, gm1, fe, use_materials, mixture);
-    Real kappa = use_mixed_table ? mixed_opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature,
-        state.material0_mass_fraction) : (use_table ? opacity.Get(
-        opacity_transport, g, state.density, state.electron_temperature) : kt(g));
-    Real sigma = state.density*kappa;
-    FLDLinearization properties = FLDProperties(
-        sigma, state.energy, state.gradient, state.normal_gradient,
-        alpha, floor, mode);
-    bool use_ap_face = use_ap_transport && mode != 0 &&
-        (properties.streaming_fraction >= streaming_threshold ||
-         sigma*dx1 <= optical_depth_threshold);
-    Real rate = FLDFaceStabilityRate(properties, state.energy, state.normal_gradient,
-                                     dx1, dx_short, alpha, floor, mode, use_ap_face);
-    max_rate = fmax(max_rate, rate);
+    const FLDFaceMaterialState material = X1FaceMaterialState(
+        w0, temperature, m, ie, k, j, i, gm1, fe, use_materials, mixture);
+    OpacityTableLocation opacity_location;
+    MixedOpacityTableLocation mixed_opacity_location;
+    if (use_mixed_table) {
+      mixed_opacity_location = mixed_opacity.Locate(
+          material.density, material.electron_temperature,
+          material.material0_mass_fraction);
+    } else if (use_table) {
+      opacity_location = opacity.Locate(
+          material.density, material.electron_temperature);
+    }
+    for (int g = 0; g < ng; ++g) {
+      const FLDRadiationFaceState state = X1RadiationFaceState(
+          w0, m, i0+g, k, j, i, multi_d, three_d, dx1, dx2, dx3);
+      const Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, mixed_opacity_location) : (use_table ? opacity.Get(
+          opacity_transport, g, opacity_location) : kt(g));
+      const Real sigma = material.density*kappa;
+      const FLDLinearization properties = FLDProperties(
+          sigma, state.energy, state.gradient, state.normal_gradient,
+          alpha, floor, mode);
+      const bool use_ap_face = use_ap_transport && mode != 0 &&
+          (properties.streaming_fraction >= streaming_threshold ||
+           sigma*dx1 <= optical_depth_threshold);
+      const Real rate = FLDFaceStabilityRate(
+          properties, state.energy, state.normal_gradient,
+          dx1, dx_short, alpha, floor, mode, use_ap_face);
+      max_rate = fmax(max_rate, rate);
+    }
   }, Kokkos::Max<Real>(max_rate1));
 
   Real max_rate2 = 0.0;
   if (multi_d) {
     int nface2 = nx3*(nx2+1)*nx1;
-    int total_faces2 = nmb*ng*nface2;
+    int total_faces2 = nmb*nface2;
     Kokkos::parallel_reduce("thermal_rad_newdt_x2",
         Kokkos::RangePolicy<>(DevExeSpace(), 0, total_faces2),
     KOKKOS_LAMBDA(const int idx, Real &max_rate) {
       int face_idx = idx%nface2;
-      int group_block = idx/nface2;
-      int g = group_block%ng;
-      int m = group_block/ng;
+      int m = idx/nface2;
       int i = face_idx%nx1 + is;
       int jk = face_idx/nx1;
       int j = jk%(nx2+1) + js;
@@ -1013,36 +1113,48 @@ void ThermalRadiation::NewTimeStep(
       Real dx3 = size.d_view(m).dx3;
       Real dx_short = fmin(dx1, dx2);
       if (three_d) dx_short = fmin(dx_short, dx3);
-      FLDFaceState state = X2FaceState(w0, temperature, m, i0+g, ie, k, j, i,
-          three_d, dx1, dx2, dx3, gm1, fe, use_materials, mixture);
-      Real kappa = use_mixed_table ? mixed_opacity.Get(
-          opacity_transport, g, state.density, state.electron_temperature,
-          state.material0_mass_fraction) : (use_table ? opacity.Get(
-          opacity_transport, g, state.density, state.electron_temperature) : kt(g));
-      Real sigma = state.density*kappa;
-      FLDLinearization properties = FLDProperties(
-          sigma, state.energy, state.gradient, state.normal_gradient,
-          alpha, floor, mode);
-      bool use_ap_face = use_ap_transport && mode != 0 &&
-          (properties.streaming_fraction >= streaming_threshold ||
-           sigma*dx2 <= optical_depth_threshold);
-      Real rate = FLDFaceStabilityRate(properties, state.energy, state.normal_gradient,
-                                       dx2, dx_short, alpha, floor, mode, use_ap_face);
-      max_rate = fmax(max_rate, rate);
+      const FLDFaceMaterialState material = X2FaceMaterialState(
+          w0, temperature, m, ie, k, j, i, gm1, fe, use_materials, mixture);
+      OpacityTableLocation opacity_location;
+      MixedOpacityTableLocation mixed_opacity_location;
+      if (use_mixed_table) {
+        mixed_opacity_location = mixed_opacity.Locate(
+            material.density, material.electron_temperature,
+            material.material0_mass_fraction);
+      } else if (use_table) {
+        opacity_location = opacity.Locate(
+            material.density, material.electron_temperature);
+      }
+      for (int g = 0; g < ng; ++g) {
+        const FLDRadiationFaceState state = X2RadiationFaceState(
+            w0, m, i0+g, k, j, i, three_d, dx1, dx2, dx3);
+        const Real kappa = use_mixed_table ? mixed_opacity.Get(
+            opacity_transport, g, mixed_opacity_location) : (use_table ? opacity.Get(
+            opacity_transport, g, opacity_location) : kt(g));
+        const Real sigma = material.density*kappa;
+        const FLDLinearization properties = FLDProperties(
+            sigma, state.energy, state.gradient, state.normal_gradient,
+            alpha, floor, mode);
+        const bool use_ap_face = use_ap_transport && mode != 0 &&
+            (properties.streaming_fraction >= streaming_threshold ||
+             sigma*dx2 <= optical_depth_threshold);
+        const Real rate = FLDFaceStabilityRate(
+            properties, state.energy, state.normal_gradient,
+            dx2, dx_short, alpha, floor, mode, use_ap_face);
+        max_rate = fmax(max_rate, rate);
+      }
     }, Kokkos::Max<Real>(max_rate2));
   }
 
   Real max_rate3 = 0.0;
   if (three_d) {
     int nface3 = (nx3+1)*nx2*nx1;
-    int total_faces3 = nmb*ng*nface3;
+    int total_faces3 = nmb*nface3;
     Kokkos::parallel_reduce("thermal_rad_newdt_x3",
         Kokkos::RangePolicy<>(DevExeSpace(), 0, total_faces3),
     KOKKOS_LAMBDA(const int idx, Real &max_rate) {
       int face_idx = idx%nface3;
-      int group_block = idx/nface3;
-      int g = group_block%ng;
-      int m = group_block/ng;
+      int m = idx/nface3;
       int i = face_idx%nx1 + is;
       int jk = face_idx/nx1;
       int j = jk%nx2 + js;
@@ -1051,22 +1163,36 @@ void ThermalRadiation::NewTimeStep(
       Real dx2 = size.d_view(m).dx2;
       Real dx3 = size.d_view(m).dx3;
       Real dx_short = fmin(dx1, fmin(dx2, dx3));
-      FLDFaceState state = X3FaceState(w0, temperature, m, i0+g, ie, k, j, i,
-          dx1, dx2, dx3, gm1, fe, use_materials, mixture);
-      Real kappa = use_mixed_table ? mixed_opacity.Get(
-          opacity_transport, g, state.density, state.electron_temperature,
-          state.material0_mass_fraction) : (use_table ? opacity.Get(
-          opacity_transport, g, state.density, state.electron_temperature) : kt(g));
-      Real sigma = state.density*kappa;
-      FLDLinearization properties = FLDProperties(
-          sigma, state.energy, state.gradient, state.normal_gradient,
-          alpha, floor, mode);
-      bool use_ap_face = use_ap_transport && mode != 0 &&
-          (properties.streaming_fraction >= streaming_threshold ||
-           sigma*dx3 <= optical_depth_threshold);
-      Real rate = FLDFaceStabilityRate(properties, state.energy, state.normal_gradient,
-                                       dx3, dx_short, alpha, floor, mode, use_ap_face);
-      max_rate = fmax(max_rate, rate);
+      const FLDFaceMaterialState material = X3FaceMaterialState(
+          w0, temperature, m, ie, k, j, i, gm1, fe, use_materials, mixture);
+      OpacityTableLocation opacity_location;
+      MixedOpacityTableLocation mixed_opacity_location;
+      if (use_mixed_table) {
+        mixed_opacity_location = mixed_opacity.Locate(
+            material.density, material.electron_temperature,
+            material.material0_mass_fraction);
+      } else if (use_table) {
+        opacity_location = opacity.Locate(
+            material.density, material.electron_temperature);
+      }
+      for (int g = 0; g < ng; ++g) {
+        const FLDRadiationFaceState state = X3RadiationFaceState(
+            w0, m, i0+g, k, j, i, dx1, dx2, dx3);
+        const Real kappa = use_mixed_table ? mixed_opacity.Get(
+            opacity_transport, g, mixed_opacity_location) : (use_table ? opacity.Get(
+            opacity_transport, g, opacity_location) : kt(g));
+        const Real sigma = material.density*kappa;
+        const FLDLinearization properties = FLDProperties(
+            sigma, state.energy, state.gradient, state.normal_gradient,
+            alpha, floor, mode);
+        const bool use_ap_face = use_ap_transport && mode != 0 &&
+            (properties.streaming_fraction >= streaming_threshold ||
+             sigma*dx3 <= optical_depth_threshold);
+        const Real rate = FLDFaceStabilityRate(
+            properties, state.energy, state.normal_gradient,
+            dx3, dx_short, alpha, floor, mode, use_ap_face);
+        max_rate = fmax(max_rate, rate);
+      }
     }, Kokkos::Max<Real>(max_rate3));
   }
 
@@ -1080,51 +1206,63 @@ void ThermalRadiation::NewTimeStep(
   int nji = nx2*nx1;
   int ncell = nmb*nkji;
   Real source_dt = FLT_MAX;
-  Kokkos::parallel_reduce("thermal_rad_newdt_source",
-      Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
-  KOKKOS_LAMBDA(const int idx, Real &min_dt) {
-    int m = idx/nkji;
-    int k = (idx-m*nkji)/nji;
-    int j = (idx-m*nkji-k*nji)/nx1;
-    int i = idx-m*nkji-k*nji-j*nx1;
-    i += is;
-    j += js;
-    k += ks;
-    Real density = w0(m, IDN, k, j, i);
-    Real cell_dt = FLT_MAX;
-    Real source_rate = 0.0;
-    Real y0 = 0.0;
-    Real tele;
-    if (use_materials) {
-      y0 = mixture.Material0MassFractionFromPrimitive(w0, m, k, j, i);
-      tele = temperature(m, 1, k, j, i);
-    } else {
-      tele = gm1*w0(m, ie, k, j, i)/fe;
-    }
-    Real blackbody = arad*tele*tele*tele*tele;
+  if (couple && source_cfl > 0.0) {
+    Kokkos::parallel_reduce("thermal_rad_newdt_source",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+    KOKKOS_LAMBDA(const int idx, Real &min_dt) {
+      int m = idx/nkji;
+      int k = (idx-m*nkji)/nji;
+      int j = (idx-m*nkji-k*nji)/nx1;
+      int i = idx-m*nkji-k*nji-j*nx1;
+      i += is;
+      j += js;
+      k += ks;
+      Real density = w0(m, IDN, k, j, i);
+      Real cell_dt = FLT_MAX;
+      Real source_rate = 0.0;
+      Real y0 = 0.0;
+      Real tele;
+      if (use_materials) {
+        y0 = mixture.Material0MassFractionFromPrimitive(w0, m, k, j, i);
+        tele = temperature(m, 1, k, j, i);
+      } else {
+        tele = gm1*w0(m, ie, k, j, i)/fe;
+      }
+      Real blackbody = arad*tele*tele*tele*tele;
+      Real lower_planck = 0.0;
+      if (tele > 0.0) lower_planck = PlanckIntegral(bounds(0)/tele);
+      OpacityTableLocation opacity_location;
+      if (use_table) opacity_location = opacity.Locate(density, tele);
+      MixedOpacityTableLocation mixed_location;
+      if (use_mixed_table) mixed_location = mixed_opacity.Locate(density, tele, y0);
 
-    for (int g = 0; g < ng; ++g) {
-      int n = i0+g;
-      Real energy = density*w0(m, n, k, j, i);
-      if (couple && source_cfl > 0.0) {
-        Real equilibrium = blackbody*
-            PlanckGroupFraction(bounds(g), bounds(g+1), tele);
+      for (int g = 0; g < ng; ++g) {
+        int n = i0+g;
+        Real energy = density*w0(m, n, k, j, i);
+        Real fraction = 0.0;
+        if (tele > 0.0) {
+          Real upper_planck = PlanckIntegral(bounds(g+1)/tele);
+          fraction = fmin(fmax(
+              (upper_planck-lower_planck)/kPlanckIntegralInfinity, 0.0), 1.0);
+          lower_planck = upper_planck;
+        }
+        Real equilibrium = blackbody*fraction;
         Real kappaa = use_mixed_table ? mixed_opacity.Get(
-            opacity_absorption, g, density, tele, y0) : (use_table ? opacity.Get(
-            opacity_absorption, g, density, tele) : ka(g));
+            opacity_absorption, g, mixed_location) : (use_table ? opacity.Get(
+            opacity_absorption, g, opacity_location) : ka(g));
         Real kappae = use_mixed_table ? mixed_opacity.Get(
-            opacity_emission, g, density, tele, y0) : (use_table ? opacity.Get(
-            opacity_emission, g, density, tele) : kem(g));
+            opacity_emission, g, mixed_location) : (use_table ? opacity.Get(
+            opacity_emission, g, opacity_location) : kem(g));
         source_rate += chat*fabs(density*kappae*equilibrium
                                  - density*kappaa*energy);
       }
-    }
-    if (couple && source_cfl > 0.0 && source_rate > 0.0) {
-      Real eele = density*w0(m, ie, k, j, i);
-      cell_dt = fmin(cell_dt, source_cfl*fmax(eele, floor)/source_rate);
-    }
-    min_dt = fmin(min_dt, cell_dt);
-  }, Kokkos::Min<Real>(source_dt));
+      if (source_rate > 0.0) {
+        Real eele = density*w0(m, ie, k, j, i);
+        cell_dt = fmin(cell_dt, source_cfl*fmax(eele, floor)/source_rate);
+      }
+      min_dt = fmin(min_dt, cell_dt);
+    }, Kokkos::Min<Real>(source_dt));
+  }
   dtnew = fmin(transport_dt, source_dt);
 }
 

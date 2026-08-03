@@ -325,8 +325,8 @@ void Laser::InitializeRays() {
   auto queue_a = active_queue_a_; auto queue_b = active_queue_b_;
   auto diag = device_diagnostics_;
   auto counters = device_counters_;
-  auto primitive = pmy_pack_->pmhd->w0;
-  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
+  auto primitive = FluidPrim();
+  auto thermodynamics = FluidThermodynamics();
   auto wavelength = ray_wavelength_;
   bool refractive = propagation_model_ == PropagationModel::refractive;
   Real number_scale = density_scale_cgs_*electron_number_per_gram_;
@@ -480,39 +480,47 @@ void Laser::InitializeRays() {
 }
 
 //----------------------------------------------------------------------------------------
-//! Compact live ray IDs into the next queue using a device prefix scan.
+//! Compact live ray IDs into the next queue using a device prefix scan and return the
+//! deterministic number retained.  Only the populated prefix of the current queue is
+//! scanned; every slot beyond it is the -1 fill written below.
 
-void Laser::CompactActiveQueue(DvceArray1D<int> current,
-                               DvceArray1D<int> next) {
+int Laser::CompactActiveQueue(DvceArray1D<int> current,
+                              DvceArray1D<int> next, int current_count) {
   Kokkos::deep_copy(next, -1);
   auto status = ray_status;
+  int active_count = 0;
   Kokkos::parallel_scan(
-      "laser_compact_queue", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+      "laser_compact_queue",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, current_count),
       KOKKOS_LAMBDA(int index, int &offset, bool final) {
         int ray = current(index);
         int keep = (ray >= 0 &&
                     status(ray) == static_cast<int>(RayStatus::active)) ? 1 : 0;
         if (final && keep) next(offset) = ray;
         offset += keep;
-      });
+      }, active_count);
+  return active_count;
 }
 
 //----------------------------------------------------------------------------------------
 //! Rebuild queue A from ray status. Called at every trace entry so rays that survived
 //! a previous work-capped wave and rays activated by MPI unpack both re-enter the
-//! queue without relying on incremental queue state.
+//! queue without relying on incremental queue state.  Returns the number seeded so the
+//! trace loop can size its launches to the live rays instead of the full ray array.
 
-void Laser::SeedActiveQueue() {
+int Laser::SeedActiveQueue() {
   Kokkos::deep_copy(active_queue_a_, -1);
   auto status = ray_status;
   auto queue = active_queue_a_;
+  int active_count = 0;
   Kokkos::parallel_scan(
       "laser_seed_queue", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
       KOKKOS_LAMBDA(int r, int &offset, bool final) {
         int keep = (status(r) == static_cast<int>(RayStatus::active)) ? 1 : 0;
         if (final && keep) queue(offset) = r;
         offset += keep;
-      });
+      }, active_count);
+  return active_count;
 }
 
 //----------------------------------------------------------------------------------------
@@ -583,9 +591,9 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   auto last_turning_density = ray_last_turning_density_;
   auto path = ray_path_length_; auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
-  auto primitive = pmy_pack_->pmhd->w0;
-  auto temperature = pmy_pack_->pmhd->ptwo_temp->temperature;
-  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
+  auto primitive = FluidPrim();
+  auto temperature = FluidTemperature();
+  auto thermodynamics = FluidThermodynamics();
   auto constant_absorption = ray_constant_absorption_;
   auto wavelength = ray_wavelength_;
   auto zeff = ray_zeff_;
@@ -616,12 +624,15 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   bool use_tabular_materials =
       use_materials && material_mixture.UsesTabularEOS();
 
-  SeedActiveQueue();
+  // Size every launch to the compacted queue rather than to nrays_.  Slots past the
+  // active count hold the -1 fill and exit immediately, so the tail iterations of a
+  // wave were launching thousands of threads that did nothing.
+  int active_count = SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
     DvceArray1D<int> current = (iteration % 2 == 0) ? active_queue_a_ : active_queue_b_;
     DvceArray1D<int> next = (iteration % 2 == 0) ? active_queue_b_ : active_queue_a_;
     Kokkos::parallel_for(
-        "laser_trace_dda", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+        "laser_trace_dda", Kokkos::RangePolicy<>(DevExeSpace(), 0, active_count),
         KOKKOS_LAMBDA(int queue_index) {
           int r = current(queue_index);
           if (r < 0 || status(r) != static_cast<int>(RayStatus::active)) return;
@@ -1054,7 +1065,9 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                                               sizes(new_m).dx3, ks, ke) : ks;
           }
         });
-    CompactActiveQueue(current, next);
+    ++actual_transport_iterations_;
+    active_count = CompactActiveQueue(current, next, active_count);
+    if (active_count == 0) break;
   }
 
   // Rays that hit the per-wave work cap stay active: the caller re-traces them in
@@ -1095,9 +1108,9 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   auto segments = ray_segments_; auto path = ray_path_length_;
   auto data = cell_data;
   auto diag = device_diagnostics_; auto counters = device_counters_;
-  auto primitive = pmy_pack_->pmhd->w0;
-  auto temperature = pmy_pack_->pmhd->ptwo_temp->temperature;
-  auto thermodynamics = pmy_pack_->pmhd->ptwo_temp->thermodynamics;
+  auto primitive = FluidPrim();
+  auto temperature = FluidTemperature();
+  auto thermodynamics = FluidThermodynamics();
   auto constant_absorption = ray_constant_absorption_;
   auto wavelength = ray_wavelength_;
   auto zeff = ray_zeff_;
@@ -1126,12 +1139,13 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   bool use_tabular_materials =
       use_materials && material_mixture.UsesTabularEOS();
 
-  SeedActiveQueue();
+  int active_count = SeedActiveQueue();
   for (int iteration = 0; iteration < max_transport_iterations_; ++iteration) {
     DvceArray1D<int> current = (iteration % 2 == 0) ? active_queue_a_ : active_queue_b_;
     DvceArray1D<int> next = (iteration % 2 == 0) ? active_queue_b_ : active_queue_a_;
     Kokkos::parallel_for(
-        "laser_trace_refractive", Kokkos::RangePolicy<>(DevExeSpace(), 0, nrays_),
+        "laser_trace_refractive",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, active_count),
         KOKKOS_LAMBDA(int queue_index) {
           int r = current(queue_index);
           if (r < 0 || status(r) != static_cast<int>(RayStatus::active)) return;
@@ -1485,7 +1499,9 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             break;
           }
         });
-    CompactActiveQueue(current, next);
+    ++actual_transport_iterations_;
+    active_count = CompactActiveQueue(current, next, active_count);
+    if (active_count == 0) break;
   }
 
   // Rays that hit the per-wave work cap stay active: the caller re-traces them in
@@ -1584,12 +1600,14 @@ void Laser::FinalizeDiagnostics() {
       host_count(3), host_count(4), host_count(5),
       host_count(6), host_count(7)};
   int segment_count = 0;
-  int max_reflections = 0;
+  // Report the maximum rank-local iteration count. This preserves the old per-stage
+  // interpretation without pretending every wave exhausted its configured hard cap.
+  int maximum_count[2] = {0, actual_transport_iterations_};
   Real path_length = 0.0;
   Real max_dispersion_error = 0.0;
   for (int r = 0; r < nrays_; ++r) {
     segment_count += host_segments(r);
-    max_reflections = std::max(max_reflections, host_reflections(r));
+    maximum_count[0] = std::max(maximum_count[0], host_reflections(r));
     path_length += host_path(r);
     max_dispersion_error = fmax(max_dispersion_error, host_dispersion(r));
   }
@@ -1599,7 +1617,7 @@ void Laser::FinalizeDiagnostics() {
     Real reduced_diag[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     int reduced_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int reduced_segments = 0;
-    int reduced_max_reflections = 0;
+    int reduced_maximum_count[2] = {0, 0};
     Real reduced_path = 0.0;
     Real reduced_dispersion_error = 0.0;
     int ierr = MPI_Allreduce(global_diag, reduced_diag, 6, MPI_ATHENA_REAL,
@@ -1613,7 +1631,7 @@ void Laser::FinalizeDiagnostics() {
                            MPI_SUM, mpi_comm_);
     }
     if (ierr == MPI_SUCCESS) {
-      ierr = MPI_Allreduce(&max_reflections, &reduced_max_reflections, 1,
+      ierr = MPI_Allreduce(maximum_count, reduced_maximum_count, 2,
                            MPI_INT, MPI_MAX, mpi_comm_);
     }
     if (ierr == MPI_SUCCESS) {
@@ -1634,7 +1652,8 @@ void Laser::FinalizeDiagnostics() {
     for (int n = 0; n < 6; ++n) global_diag[n] = reduced_diag[n];
     for (int n = 0; n < 8; ++n) global_count[n] = reduced_count[n];
     segment_count = reduced_segments;
-    max_reflections = reduced_max_reflections;
+    maximum_count[0] = reduced_maximum_count[0];
+    maximum_count[1] = reduced_maximum_count[1];
     path_length = reduced_path;
     max_dispersion_error = reduced_dispersion_error;
   }
@@ -1650,13 +1669,12 @@ void Laser::FinalizeDiagnostics() {
   diagnostics_.wave_remaining_rays = global_count[4];
   diagnostics_.reflection_remaining_rays = global_count[5];
   diagnostics_.reflected_rays = global_count[1];
-  diagnostics_.max_reflections = max_reflections;
+  diagnostics_.max_reflections = maximum_count[0];
   diagnostics_.suppressed_turns = global_count[6];
   diagnostics_.reflection_rearms = global_count[7];
   diagnostics_.off_rank_transfers = global_count[2];
   diagnostics_.transport_waves = mpi_wave_+1;
-  diagnostics_.transport_iterations =
-      max_transport_iterations_*diagnostics_.transport_waves;
+  diagnostics_.transport_iterations = maximum_count[1];
   diagnostics_.traced_segments = segment_count;
   diagnostics_.total_path_length = path_length;
   diagnostics_.max_dispersion_error = max_dispersion_error;

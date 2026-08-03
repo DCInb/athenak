@@ -9,6 +9,7 @@
 //! \brief Two-material ideal or separate-ion/electron tabular plasma closure.
 
 #include <memory>
+#include <string>
 #include <type_traits>
 
 #include "athena.hpp"
@@ -584,6 +585,11 @@ struct MaterialMixtureDevice {
     // A mass-weighted sum of two geometric surfaces is not itself geometric.  A short
     // safeguarded log-temperature bisection preserves the exact forward rule and also
     // supports CH/He tables with different native temperature grids.
+    //
+    // The fixed iteration count with no convergence test looks wasteful and was the
+    // target of card A1.  It was replaced with a bracketed false-position solver, gated,
+    // and reverted: capping this loop at a single iteration does not make the run any
+    // faster, so its cost is below measurement here.  See DCI_3D/perf_ledger.md, A1.
     if (target_energy == minimum.specific_internal_energy) return minimum;
     if (target_energy == maximum.specific_internal_energy) return maximum;
     MixedEnergyIntervalCache energy_cache;
@@ -822,6 +828,11 @@ struct MaterialMixtureDevice {
     }
     density_high = fmin(density_high, maximum_density);
 
+    // Caching the three distinct density locations here (card C2) removes ten of the
+    // sixteen density searches and is a natural-looking win.  It is not: measured twice,
+    // on a 3-cycle window and again on a 20-cycle steady state, it is slower both times.
+    // See DCI_3D/perf_ledger.md, C2 -- these kernels are bound by the dependent chain of
+    // scattered table reads, not by the number of searches.
     Real sound_speed_squared = 0.0;
     for (int component_index = 0; component_index < 2; ++component_index) {
       const IonmixComponent component = (component_index == 0)
@@ -868,6 +879,19 @@ struct MaterialMixtureDevice {
  public:
   KOKKOS_INLINE_FUNCTION
   bool UsesTabularEOS() const { return use_tabular_eos; }
+
+  // Bounds used by nonlinear electron-temperature transport operators.  The underlying
+  // composition-aware helpers are private because they also serve the table inverses;
+  // these narrow wrappers expose only the valid shared-temperature interval.
+  KOKKOS_INLINE_FUNCTION
+  Real MinimumTransportTemperature(const Real y0) const {
+    return MinimumTemperatureForComposition(y0);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MaximumTransportTemperature(const Real y0) const {
+    return MaximumTemperatureForComposition(y0);
+  }
 
   // Each table loader reserves enough exponent headroom for four interpolated
   // non-negative pressure contributions (two materials times ion/electron).  This
@@ -1379,17 +1403,22 @@ struct MaterialMixtureDevice {
   // Canonical electron temperature, pressure, and free-electron density from electron
   // specific energy.  The tabular branch deliberately repeats the forward query used by
   // the full-state API after the inverse: this retains trace-material pressure scaling
-  // below a pure table's minimum density.
+  // below a pure table's minimum density.  The repeat reuses the inverse's own density
+  // cache, so it costs one interpolation rather than re-locating the density in both
+  // material tables.
   KOKKOS_INLINE_FUNCTION
   MaterialElectronState ElectronStateFromRhoSpecificEnergy(
       const Real density, const Real electron_specific_energy,
       const Real y0) const {
     MaterialElectronState result;
     if (use_tabular_eos) {
-      const ComponentAtTemperature inverse = MixtureComponentFromRhoSpecificEnergy(
-          IonmixComponent::electron, density, electron_specific_energy, y0);
-      const ComponentAtTemperature electron = MixtureComponentFromRhoTemperature(
-          IonmixComponent::electron, density, inverse.temperature, y0);
+      MixedDensityCache cache;
+      const ComponentAtTemperature inverse =
+          MixtureComponentFromRhoSpecificEnergyCached(
+              IonmixComponent::electron, density, electron_specific_energy,
+              y0, cache);
+      const ComponentAtTemperature electron = MixtureComponentFromCachedDensity(
+          IonmixComponent::electron, density, inverse.temperature, y0, cache);
       result.electron_temperature = electron.temperature;
       result.electron_pressure = electron.pressure;
       result.electron_number_density_cgs = ElectronNumberDensityCgsFromTemperature(
@@ -1740,8 +1769,11 @@ struct MaterialMixtureDevice {
 
 class MaterialMixture {
  public:
-  MaterialMixture(ParameterInput *pin, int first_user_scalar, int nuser_scalars,
-                  Real gamma, units::Units *unit_system = nullptr);
+  // 'block' names the fluid block that owns this closure ("hydro" or "mhd"); it supplies
+  // the default ion/electron exchange time.  Reading it from a fixed block name would
+  // silently create the other fluid's input block.
+  MaterialMixture(ParameterInput *pin, const std::string &block, int first_user_scalar,
+                  int nuser_scalars, Real gamma, units::Units *unit_system = nullptr);
   ~MaterialMixture() = default;
 
   MaterialMixtureDevice DeviceData() const { return data_; }

@@ -27,6 +27,7 @@ class OrbitalAdvectionCC;
 class ShearingBoxCC;
 class Driver;
 namespace two_temperature {class TwoTemperature;}
+namespace materials {class MaterialMixture;}
 
 // constants that enumerate Hydro Riemann Solver options
 enum class Hydro_RSolver {advect, llf, hlle, hllc, roe,    // non-relativistic
@@ -44,6 +45,7 @@ struct HydroTaskIDs {
   TaskID sendf;
   TaskID recvf;
   TaskID rkupdt;
+  TaskID duale;
   TaskID srctrms;
   TaskID sendu_oa;
   TaskID recvu_oa;
@@ -79,6 +81,10 @@ class Hydro {
   int nhydro;             // number of hydro variables (5/4 for ideal/isothermal EOS)
   int nscalars;           // total number of advected scalars, including 2T energies
   int nuser_scalars;      // number of user-requested passive scalars
+  bool use_dual_energy = false;
+  bool use_tabular_material_eos = false;
+  Real dual_energy_eta1 = 1.0e-3;
+  Real dual_energy_eta2 = 1.0e-4;
   DvceArray5D<Real> u0;   // conserved variables
   DvceArray5D<Real> w0;   // primitive variables
 
@@ -97,10 +103,13 @@ class Hydro {
   Conduction *pcond = nullptr;
   SourceTerms *psrc = nullptr;
   two_temperature::TwoTemperature *ptwo_temp = nullptr;
+  materials::MaterialMixture *pmaterials = nullptr;
 
   // following only used for time-evolving flow
   DvceArray5D<Real> u1;       // conserved variables at intermediate step
   DvceFaceFld5D<Real> uflx;   // fluxes of conserved quantities on cell faces
+  DvceFaceFld5D<Real> dual_vf;  // upwind face velocity for 2T compression work
+  DvceArray4D<Real> dual_etot_max;  // local total-energy scale for dual-energy sync
   Real dtnew;
 
   // following used for FOFC
@@ -121,6 +130,7 @@ class Hydro {
   TaskStatus SendFlux(Driver *d, int stage);
   TaskStatus RecvFlux(Driver *d, int stage);
   TaskStatus RKUpdate(Driver *d, int stage);
+  TaskStatus DualEnergyStep(Driver *d, int stage);
   TaskStatus HydroSrcTerms(Driver *d, int stage);
   TaskStatus SendU_OA(Driver *d, int stage);
   TaskStatus RecvU_OA(Driver *d, int stage);
@@ -141,6 +151,10 @@ class Hydro {
   // CalculateFluxes function templated over Riemann Solvers
   template <Hydro_RSolver T>
   void CalculateFluxes(Driver *d, int stage);
+
+  // Two-temperature-backed dual-energy formalism for Newtonian hydrodynamics.
+  void ApplyDualEnergyFormalism(Real dt);
+  void SynchronizeDualEnergyFromTotal();
 
   // first-order flux correction
   void FOFC(Driver *d, int stage);

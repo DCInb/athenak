@@ -186,6 +186,27 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
+        // Decks that must run with either carrier fluid can ask for a 'fluid_*'
+        // variable.  It resolves to the <mhd> or <hydro> spelling of the same
+        // quantity, so switching the fluid block does not require editing every
+        // <output> block.  'fluid_u'/'fluid_w' pick up the cell-centered magnetic
+        // field when the carrier is MHD.
+        const std::string fluid_prefix("fluid_");
+        if (opar.variable.compare(0, fluid_prefix.size(), fluid_prefix) == 0) {
+          const std::string quantity = opar.variable.substr(fluid_prefix.size());
+          if (pm->pmb_pack->pmhd != nullptr) {
+            opar.variable = "mhd_" + quantity;
+            if (quantity == "u" || quantity == "w") opar.variable += "_bcc";
+          } else if (pm->pmb_pack->phydro != nullptr) {
+            opar.variable = "hydro_" + quantity;
+          } else {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Output block '" << opar.block_name << "' requests '"
+                << opar.variable << "' but no <hydro> or <mhd> block was created"
+                << std::endl;
+            exit(EXIT_FAILURE);
+          }
+        }
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
       }
 

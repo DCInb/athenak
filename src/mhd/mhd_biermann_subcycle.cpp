@@ -30,11 +30,56 @@ Real MHD::BiermannSubcycleTimeStepLimit() {
   return biermann_subcycle_cfl * pbiermann->dtnew;
 }
 
+//----------------------------------------------------------------------------------------
+//! Width of the cell-centered halo a Biermann microstage needs.
+//!
+//! A microstep writes only three conserved components: IEN and iele from BiermannRKUpdate
+//! plus AddElectronWorkRHS, and iion which CloseBiermannStage reconstructs.  The twenty
+//! radiation group energies are untouched, so their ghost values are still the ones the
+//! macro-step exchange delivered and re-sending them every microstage is pure overhead --
+//! 28 components where 8 suffice, on the great majority of the 30 CC halo rounds a cycle.
+//!
+//! Three things make the narrowed exchange safe, and all three are load-bearing:
+//!
+//!  * The range starts at IDN, not at IEN.  ConsToPrim writes corrected conserved values
+//!    back into u0 when a density or energy floor fires (ideal_mhd.cpp:157-166), and an
+//!    intermediate microstage only runs ConsToPrim over is-1..ie+1.  A floor firing in an
+//!    owner's second interior cell would therefore never be reproduced in the matching
+//!    ghost at layer is-2, so IDN and the momenta have to travel even though the Biermann
+//!    operator does not touch them.
+//!  * The closing stage of every half-step keeps the full-width exchange.  That is the
+//!    same stage that already restores the complete ghost domain for the closure
+//!    (driver.cpp sets biermann_stage_full_thermodynamics on it), so the radiation groups
+//!    are refreshed before MHD reconstruction is allowed to read the outer ghost layer.
+//!  * Uniform meshes only.  Restriction and prolongation move the full conserved vector
+//!    through the coarse buffers, so narrowing there would need its own analysis.
+
+int MHD::BiermannHaloNumVars() const {
+  const int full = nmhd + nscalars;
+  if (biermann_stage_full_thermodynamics) return full;
+  if (pmy_pack->pmesh->multilevel) return full;
+  if (ptwo_temp == nullptr) return full;
+  const int narrow = ptwo_temp->iele + 1;
+  return (narrow < full) ? narrow : full;
+}
+
+//----------------------------------------------------------------------------------------
+//! Cell-centered halo for one Biermann microstage, sized by BiermannHaloNumVars().
+
+TaskStatus MHD::BiermannSendU(Driver *pdrive, int stage) {
+  return pbval_u->PackAndSendCC(u0, coarse_u0, BiermannHaloNumVars());
+}
+
+TaskStatus MHD::BiermannRecvU(Driver *pdrive, int stage) {
+  return pbval_u->RecvAndUnpackCC(u0, coarse_u0, BiermannHaloNumVars());
+}
+
+//----------------------------------------------------------------------------------------
 //! Post receives needed by one self-contained Biermann stage.  Orbital and shearing
 //! communications deliberately do not participate in microsteps.
 
 TaskStatus MHD::BiermannInitRecv(Driver *pdrive, int stage) {
-  TaskStatus tstat = pbval_u->InitRecv(nmhd + nscalars);
+  TaskStatus tstat = pbval_u->InitRecv(BiermannHaloNumVars());
   if (tstat != TaskStatus::complete) return tstat;
   tstat = pbval_b->InitRecv(3);
   if (tstat != TaskStatus::complete) return tstat;
@@ -51,7 +96,24 @@ TaskStatus MHD::BiermannInitRecv(Driver *pdrive, int stage) {
 
 TaskStatus MHD::BiermannCopyCons(Driver *pdrive, int stage) {
   if (stage == 1) {
-    Kokkos::deep_copy(DevExeSpace(), u1, u0);
+    // Only IEN and iele are ever read back from u1: BiermannRKUpdate blends exactly those
+    // two components, and the macro SSPRK integrator re-seeds the whole register at its
+    // own stage 1.  Copying all nmhd+nscalars components moved fourteen times the data
+    // this microstep can use.  The face registers are copied whole -- BiermannCT reads
+    // all three components of b1.
+    if (ptwo_temp != nullptr) {
+      auto u_start = u1;
+      auto u_now = u0;
+      const int iele = ptwo_temp->iele;
+      par_for("biermann_copy_cons", DevExeSpace(), 0, u0.extent_int(0)-1, 0, 1,
+              0, u0.extent_int(2)-1, 0, u0.extent_int(3)-1, 0, u0.extent_int(4)-1,
+      KOKKOS_LAMBDA(const int m, const int v, const int k, const int j, const int i) {
+        const int n = (v == 0) ? IEN : iele;
+        u_start(m, n, k, j, i) = u_now(m, n, k, j, i);
+      });
+    } else {
+      Kokkos::deep_copy(DevExeSpace(), u1, u0);
+    }
     Kokkos::deep_copy(DevExeSpace(), b1.x1f, b0.x1f);
     Kokkos::deep_copy(DevExeSpace(), b1.x2f, b0.x2f);
     Kokkos::deep_copy(DevExeSpace(), b1.x3f, b0.x3f);
@@ -62,11 +124,44 @@ TaskStatus MHD::BiermannCopyCons(Driver *pdrive, int stage) {
 //----------------------------------------------------------------------------------------
 //! Build only Biermann face fluxes.  AddFluxes uses += because the legacy path adds to
 //! ideal-MHD fluxes, so the dedicated arrays must be cleared first.
+//!
+//! Clearing all nmhd+nscalars components is 28 components of work for the two the
+//! subcycle actually writes (IEN and iele), on three face arrays every microstage.  On a
+//! uniform mesh the other 26 are provably dead: BiermannRKUpdate reads only IEN and iele,
+//! AddPoyntingFluxFromEdgeEMF adds only to IEN, and BiermannSendFlux/RecvFlux -- the one
+//! consumer that would touch the whole array -- return immediately when !multilevel.
+//! With SMR/AMR the flux-correction path does pack every component, so clear everything.
 
 TaskStatus MHD::BiermannFluxes(Driver *pdrive, int stage) {
-  Kokkos::deep_copy(uflx.x1f, 0.0);
-  Kokkos::deep_copy(uflx.x2f, 0.0);
-  Kokkos::deep_copy(uflx.x3f, 0.0);
+  if (pmy_pack->pmesh->multilevel || ptwo_temp == nullptr) {
+    Kokkos::deep_copy(uflx.x1f, 0.0);
+    Kokkos::deep_copy(uflx.x2f, 0.0);
+    Kokkos::deep_copy(uflx.x3f, 0.0);
+  } else {
+    auto flx1 = uflx.x1f;
+    auto flx2 = uflx.x2f;
+    auto flx3 = uflx.x3f;
+    const int iele = ptwo_temp->iele;
+    const int nmb1 = flx1.extent_int(0) - 1;
+    par_for("biermann_clear_flux1", DevExeSpace(), 0, nmb1, 0, 1,
+            0, flx1.extent_int(2)-1, 0, flx1.extent_int(3)-1,
+            0, flx1.extent_int(4)-1,
+    KOKKOS_LAMBDA(int m, int v, int k, int j, int i) {
+      flx1(m, (v == 0) ? IEN : iele, k, j, i) = 0.0;
+    });
+    par_for("biermann_clear_flux2", DevExeSpace(), 0, nmb1, 0, 1,
+            0, flx2.extent_int(2)-1, 0, flx2.extent_int(3)-1,
+            0, flx2.extent_int(4)-1,
+    KOKKOS_LAMBDA(int m, int v, int k, int j, int i) {
+      flx2(m, (v == 0) ? IEN : iele, k, j, i) = 0.0;
+    });
+    par_for("biermann_clear_flux3", DevExeSpace(), 0, nmb1, 0, 1,
+            0, flx3.extent_int(2)-1, 0, flx3.extent_int(3)-1,
+            0, flx3.extent_int(4)-1,
+    KOKKOS_LAMBDA(int m, int v, int k, int j, int i) {
+      flx3(m, (v == 0) ? IEN : iele, k, j, i) = 0.0;
+    });
+  }
   pbiermann->AddFluxes(w0, bcc0, uflx);
   return TaskStatus::complete;
 }

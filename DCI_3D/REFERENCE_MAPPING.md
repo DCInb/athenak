@@ -130,8 +130,10 @@ They are inclined approximately 50 degrees from `-z`, have equal 0.275 mm lens/t
 radii (collimated), and use a shaped pulse inferred to integrate to 7.0982 kJ total.
 Those settings demonstrate the archive's ray and symmetry conventions but conflict with
 the requested 1ω Gaussian converging 10 kJ square drive.  The AthenaK laser therefore
-uses one axial 4,096-ray beam with a 0.72 mm Gaussian aperture focused to 0.58 mm at the
-inner cap.  The target spot covers 89.5 percent of the cap's projected area.  Incident,
+uses one axial 4,096-ray beam launched from the positive-x boundary with a 0.72 mm
+Gaussian aperture focused to 0.58 mm at the positive-x outer-surface apex.  The rays
+propagate right to left and irradiate the curved outer cap before reaching that tangent
+focal plane.  Incident,
 deposited, and escaped-radiation power are recorded for energy closure.  Initial compact
 and production-layout sweeps establish a hard cap of 64.  An evolved 100-cycle
 doubled-mesh sweep additionally brackets the one-percent underdense rearm band, the

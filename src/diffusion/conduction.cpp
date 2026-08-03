@@ -10,6 +10,8 @@
 
 #include <float.h>
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <iostream> // cout
@@ -22,7 +24,19 @@
 #include "mhd/mhd.hpp"
 #include "eos/eos.hpp"
 #include "conduction.hpp"
+#include "materials/material_mixture.hpp"
+#include "two_temperature/two_temperature.hpp"
 #include "units/units.hpp"
+
+namespace {
+
+[[noreturn]] void ConductionError(const std::string &message) {
+  std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
+            << message << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+
+} // namespace
 
 // VanLeer Limiter which takes 2 slopes
 KOKKOS_INLINE_FUNCTION
@@ -62,8 +76,11 @@ Real TempDepKappa(Real temp, Real limit) {
 // diffusivities. The conductivity is kappa = (dens)*alpha, and the energy flux
 // q = -kappa * (dT/dx) = - alpha * d * *dT/dx)
 
-Conduction::Conduction(std::string block, MeshBlockPack *pp, ParameterInput *pin) :
-    pmy_pack(pp) {
+Conduction::Conduction(std::string block, MeshBlockPack *pp, ParameterInput *pin,
+                       two_temperature::TwoTemperature *ptwo_temp,
+                       materials::MaterialMixture *pmaterials) :
+    pmy_pack(pp),
+    pmaterials_(pmaterials) {
   // Read parameters for thermal diffusivity (if any)
   alpha_iso = pin->GetOrAddReal(block,"alpha_iso", 0.0);
   alpha_aniso = pin->GetOrAddReal(block,"alpha_aniso", 0.0);
@@ -71,6 +88,142 @@ Conduction::Conduction(std::string block, MeshBlockPack *pp, ParameterInput *pin
   // Limit on thermal heat flux (saturated conduction)
   q_limit = pin->GetOrAddReal(block,"q_limit",
                      static_cast<Real>(std::numeric_limits<float>::max()));
+
+  const std::string integrator =
+      pin->GetOrAddString(block, "conduction_integrator", "explicit");
+  if (integrator == "explicit") {
+    implicit_ = false;
+    return;
+  }
+  if (integrator != "implicit") {
+    ConductionError("<"+block+">/conduction_integrator must be 'explicit' or "
+                    "'implicit'");
+  }
+  implicit_ = true;
+
+  if (ptwo_temp == nullptr) {
+    ConductionError("Implicit thermal conduction requires <"+block+
+                    ">/two_temperature=true");
+  }
+  if (pp->pmesh->multilevel) {
+    ConductionError("Implicit thermal conduction does not yet support SMR/AMR; "
+                    "the matrix operator currently requires a uniform-level mesh");
+  }
+  if (alpha_aniso != 0.0) {
+    ConductionError("Implicit thermal conduction currently supports isotropic "
+                    "conductivity only");
+  }
+  if (!std::isfinite(alpha_iso) || alpha_iso < 0.0) {
+    ConductionError("<"+block+">/alpha_iso must be finite and non-negative");
+  }
+  if (alpha_iso == 0.0 && !alpha_spitzer) {
+    ConductionError("Implicit thermal conduction requires alpha_iso > 0 or "
+                    "alpha_spitzer=true");
+  }
+  if (alpha_spitzer && (pmaterials_ == nullptr || pp->punit == nullptr)) {
+    ConductionError("Implicit Spitzer conduction requires <materials> and <units>");
+  }
+
+  theta_ = pin->GetOrAddReal(block, "conduction_theta", 1.0);
+  linear_tolerance_ =
+      pin->GetOrAddReal(block, "conduction_linear_tolerance", 1.0e-10);
+  nonlinear_tolerance_ =
+      pin->GetOrAddReal(block, "conduction_nonlinear_tolerance", 1.0e-8);
+  max_iterations_ =
+      pin->GetOrAddInteger(block, "conduction_max_iterations", 400);
+  max_nonlinear_iterations_ = pin->GetOrAddInteger(
+      block, "conduction_max_nonlinear_iterations", 8);
+  report_ = pin->GetOrAddBoolean(block, "conduction_report", false);
+  coulomb_log_ =
+      pin->GetOrAddReal(block, "conduction_coulomb_log", 10.0);
+  spitzer_multiplier_ =
+      pin->GetOrAddReal(block, "conduction_spitzer_multiplier", 1.0);
+  spitzer_temperature_floor_kelvin_ = pin->GetOrAddReal(
+      block, "conduction_temperature_floor_kelvin", 1.0);
+  flux_limit_coefficient_ =
+      pin->GetOrAddReal(block, "conduction_flux_limit_coefficient", 0.06);
+  gamma_minus_one_ = pin->GetReal(block, "gamma")-1.0;
+  electron_heat_capacity_fraction_ = ptwo_temp->ElectronHeatCapacityFraction();
+
+  if (!std::isfinite(theta_) || theta_ <= 0.0 || theta_ > 1.0) {
+    ConductionError("<"+block+">/conduction_theta must be finite and in (0,1]");
+  }
+  if (!std::isfinite(linear_tolerance_) || linear_tolerance_ <= 0.0 ||
+      !std::isfinite(nonlinear_tolerance_) || nonlinear_tolerance_ <= 0.0 ||
+      max_iterations_ <= 0 || max_nonlinear_iterations_ <= 0) {
+    ConductionError("Implicit-conduction tolerances and iteration limits must be "
+                    "positive");
+  }
+  if (!std::isfinite(coulomb_log_) || coulomb_log_ <= 0.0 ||
+      !std::isfinite(spitzer_multiplier_) || spitzer_multiplier_ <= 0.0 ||
+      !std::isfinite(spitzer_temperature_floor_kelvin_) ||
+      spitzer_temperature_floor_kelvin_ < 0.0 ||
+      !std::isfinite(flux_limit_coefficient_) ||
+      flux_limit_coefficient_ <= 0.0) {
+    ConductionError("Implicit Spitzer and flux-limiter coefficients must be finite "
+                    "and positive (the temperature floor may be zero)");
+  }
+
+  const std::string limiter = pin->GetOrAddString(
+      block, "conduction_flux_limiter", alpha_spitzer ? "harmonic" : "none");
+  if (limiter == "none") {
+    flux_limiter_ = FluxLimiter::none;
+  } else if (limiter == "harmonic") {
+    flux_limiter_ = FluxLimiter::harmonic;
+  } else if (limiter == "minmax" || limiter == "min/max") {
+    flux_limiter_ = FluxLimiter::minmax;
+  } else if (limiter == "larsen") {
+    flux_limiter_ = FluxLimiter::larsen;
+  } else {
+    ConductionError("Unknown <"+block+">/conduction_flux_limiter='"+limiter+
+                    "'; expected none, harmonic, minmax, or larsen");
+  }
+
+  const char *boundary_names[6] = {
+      "conduction_x1_inner_boundary", "conduction_x1_outer_boundary",
+      "conduction_x2_inner_boundary", "conduction_x2_outer_boundary",
+      "conduction_x3_inner_boundary", "conduction_x3_outer_boundary"};
+  const char *value_names[6] = {
+      "conduction_x1_inner_value", "conduction_x1_outer_value",
+      "conduction_x2_inner_value", "conduction_x2_outer_value",
+      "conduction_x3_inner_value", "conduction_x3_outer_value"};
+  for (int face = 0; face < 6; ++face) {
+    const std::string type =
+        pin->GetOrAddString(block, boundary_names[face], "neumann");
+    if (type == "neumann" || type == "zero-gradient") {
+      boundary_type_[face] = BoundaryType::neumann;
+    } else if (type == "dirichlet") {
+      boundary_type_[face] = BoundaryType::dirichlet;
+    } else {
+      ConductionError("Unknown <"+block+">/"+boundary_names[face]+"='"+type+
+                      "'; expected neumann or dirichlet");
+    }
+    boundary_value_[face] = pin->GetOrAddReal(block, value_names[face], 0.0);
+    if (!std::isfinite(boundary_value_[face])) {
+      ConductionError("Implicit-conduction boundary values must be finite");
+    }
+  }
+
+  const int nmb = std::max(pp->nmb_thispack, pp->pmesh->nmb_maxperrank);
+  auto &indcs = pp->pmesh->mb_indcs;
+  const int ncells1 = indcs.nx1+2*indcs.ng;
+  const int ncells2 = (indcs.nx2 > 1) ? indcs.nx2+2*indcs.ng : 1;
+  const int ncells3 = (indcs.nx3 > 1) ? indcs.nx3+2*indcs.ng : 1;
+  auto allocate = [&](DvceArray5D<Real> &view) {
+    Kokkos::realloc(view, nmb, 1, ncells3, ncells2, ncells1);
+  };
+  allocate(temperature_old_);
+  allocate(temperature_new_);
+  allocate(conductivity_);
+  allocate(capacity_);
+  allocate(energy_old_);
+  allocate(explicit_laplacian_);
+  allocate(residual_);
+  allocate(direction_);
+  allocate(preconditioned_);
+  allocate(operator_direction_);
+  allocate(correction_);
+  allocate(coarse_scratch_);
 }
 
 //----------------------------------------------------------------------------------------

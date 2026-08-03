@@ -621,6 +621,12 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       outvars.emplace_back("tele", 1,
           &(pm->pmb_pack->phydro->ptwo_temp->temperature));
     }
+    if (variable.compare("hydro_2t") == 0 || variable.compare("hydro_3t") == 0) {
+      auto *ptwo = pm->pmb_pack->phydro->ptwo_temp;
+      outvars.emplace_back(
+          "eos_flags", two_temperature::TwoTemperature::eos_query_flags,
+          &(ptwo->thermodynamics));
+    }
     if (variable.compare("mhd_eion") == 0 || variable.compare("mhd_2t") == 0 ||
         variable.compare("mhd_3t") == 0) {
       auto *ptwo = pm->pmb_pack->pmhd->ptwo_temp;

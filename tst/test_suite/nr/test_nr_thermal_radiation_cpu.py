@@ -130,6 +130,61 @@ def test_run():
             assert np.allclose(total_final, total_initial,
                                rtol=3.0e-12, atol=3.0e-13)
             assert np.all(final["tele"] < initial["tele"])
+
+        # Force emission to exceed the available electron energy.  This
+        # exercises the positive-change limiter with non-unit density and
+        # unequal group updates, so cached energy density cannot be confused
+        # with the final primitive specific energy.
+        basename = "opacity_emission_limited"
+        flags = [
+            f"job/basename={basename}",
+            "thermal_radiation/opacity_interpolation=linear",
+            f"thermal_radiation/opacity_table_file={opacity_table}",
+            "thermal_radiation/arad=100.0",
+            "thermal_radiation/initial_radiation_temperature=0.0",
+        ]
+        assert testutils.run(opacity_input, flags=flags), (
+            "Emission-limited opacity-table run failed.")
+        initial = athena_read.tab(f"tab/{basename}.hydro_3t.00000.tab")
+        final = athena_read.tab(f"tab/{basename}.hydro_3t.00001.tab")
+
+        density = 2.0
+        dt = 0.01
+        tele = initial["tele"]
+        blackbody = 100.0*tele**4
+        bounds = [0.0, 1.0, 100.0]
+        absorption = [1.25, 2.50]
+        emission = [1.875, 3.125]
+        raw_updates = []
+        old_groups = []
+        for group in range(2):
+            old = density*initial[f"erad0{group}"]
+            fraction = planck_group_fraction(
+                bounds[group], bounds[group+1], tele[0])
+            raw = ((old + dt*density*emission[group]*blackbody*fraction)
+                   /(1.0 + dt*density*absorption[group]))
+            old_groups.append(old)
+            raw_updates.append(raw)
+
+        positive = sum(raw-old for raw, old in zip(raw_updates, old_groups))
+        available = density*initial["eele"]
+        emission_scale = available/positive
+        assert np.all(positive > available)
+        assert np.all((emission_scale > 0.0) & (emission_scale < 1.0))
+        for group, (raw, old) in enumerate(zip(raw_updates, old_groups)):
+            expected = (old + emission_scale*(raw-old))/density
+            assert np.allclose(final[f"erad0{group}"], expected,
+                               rtol=3.0e-12, atol=3.0e-13)
+        assert not np.allclose(final["erad01"], raw_updates[1]/density,
+                               rtol=3.0e-12, atol=3.0e-13)
+        assert np.allclose(final["eele"], 0.0, rtol=0.0, atol=3.0e-13)
+        assert np.allclose(final["erad"]-initial["erad"],
+                           initial["eele"]-final["eele"],
+                           rtol=3.0e-12, atol=3.0e-13)
+        total_initial = initial["eion"] + initial["eele"] + initial["erad"]
+        total_final = final["eion"] + final["eele"] + final["erad"]
+        assert np.allclose(total_final, total_initial,
+                           rtol=3.0e-12, atol=3.0e-13)
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

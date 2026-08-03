@@ -67,7 +67,8 @@ void CheckAbar(const int material, const SpeciesProperties &properties,
 
 } // namespace
 
-MaterialMixture::MaterialMixture(ParameterInput *pin, const int first_user_scalar,
+MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
+                                 const int first_user_scalar,
                                  const int nuser_scalars, const Real gamma,
                                  units::Units *unit_system) {
   const int number_of_materials =
@@ -78,17 +79,19 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const int first_user_scala
   const int relative_scalar =
       pin->GetOrAddInteger("materials", "scalar_index", 0);
   if (relative_scalar < 0 || relative_scalar >= nuser_scalars) {
-    MaterialInputError("scalar_index must select a user passive scalar in <mhd>");
+    MaterialInputError("scalar_index must select a user passive scalar in <" +
+                       block + ">");
   }
   constexpr Real monatomic_gamma = 5.0/3.0;
   if (!std::isfinite(gamma) ||
       std::abs(gamma-monatomic_gamma) > 32.0*std::numeric_limits<Real>::epsilon()) {
-    MaterialInputError("two-material MHD currently requires <mhd>/gamma=5/3");
+    MaterialInputError("the two-material closure currently requires <" + block +
+                       ">/gamma=5/3");
   }
 
-  const Real default_exchange_time = pin->GetOrAddReal("mhd", "t_ei", -1.0);
+  const Real default_exchange_time = pin->GetOrAddReal(block, "t_ei", -1.0);
   if (!std::isfinite(default_exchange_time)) {
-    MaterialInputError("the default <mhd>/t_ei must be finite");
+    MaterialInputError("the default <" + block + ">/t_ei must be finite");
   }
   data_.material0 = ReadMaterial(pin, 0, default_exchange_time);
   data_.material1 = ReadMaterial(pin, 1, default_exchange_time);

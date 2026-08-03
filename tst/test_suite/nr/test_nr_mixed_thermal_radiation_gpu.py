@@ -7,7 +7,11 @@ import pytest
 
 import athena_read
 import test_suite.testutils as testutils
-from test_suite.nr.mixed_thermal_radiation_utils import NGROUPS, prepare_case
+from test_suite.nr.mixed_thermal_radiation_utils import (
+    NGROUPS,
+    prepare_case,
+    run_mixed_transport_probe,
+)
 
 
 input_file = Path("mixed_thermal_radiation_gpu.athinput")
@@ -38,6 +42,10 @@ def test_run():
                            rtol=4.0e-13, atol=4.0e-13)
         assert np.all(final["eele"] >= 0.0)
         assert np.all(np.isfinite(final["tele"]))
+
+        for output in run_mixed_transport_probe(
+                input_file, "mixed_radiation_flux_3d_gpu"):
+            output.unlink()
     except Exception as exc:
         pytest.fail(str(exc))
     finally:

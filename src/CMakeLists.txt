@@ -33,6 +33,7 @@ add_executable(
 
         diffusion/ambipolar.cpp
         diffusion/conduction.cpp
+        diffusion/conduction_implicit.cpp
         diffusion/resistivity.cpp
         diffusion/viscosity.cpp
 
@@ -63,6 +64,7 @@ add_executable(
         geodesic-grid/gauss_legendre.cpp
 
         hydro/hydro.cpp
+        hydro/hydro_dual_energy.cpp
         hydro/hydro_fluxes.cpp
         hydro/hydro_fofc.cpp
         hydro/hydro_newdt.cpp

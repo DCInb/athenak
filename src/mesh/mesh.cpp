@@ -590,7 +590,8 @@ void Mesh::NewTimeStep(const Real tlim) {
       dt = std::min(dt, (cfl_no)*(pmb_pack->phydro->pvisc->dtnew) );
     }
     // thermal conduction timestep
-    if (pmb_pack->phydro->pcond != nullptr) {
+    if (pmb_pack->phydro->pcond != nullptr &&
+        !pmb_pack->phydro->pcond->IsImplicit()) {
       dt = std::min(dt, (cfl_no)*(pmb_pack->phydro->pcond->dtnew) );
     }
     // source terms timestep
@@ -610,7 +611,8 @@ void Mesh::NewTimeStep(const Real tlim) {
       dt = std::min(dt, (cfl_no)*(pmb_pack->pmhd->presist->dtnew) );
     }
     // thermal conduction timestep
-    if (pmb_pack->pmhd->pcond != nullptr) {
+    if (pmb_pack->pmhd->pcond != nullptr &&
+        !pmb_pack->pmhd->pcond->IsImplicit()) {
       dt = std::min(dt, (cfl_no)*(pmb_pack->pmhd->pcond->dtnew) );
     }
     // source terms timestep

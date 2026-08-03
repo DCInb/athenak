@@ -2,7 +2,8 @@
 
 This directory is a self-contained AthenaK benchmark for a finite-radius laser incident
 on a smooth CH-like solid/corona interface. The laser heats the electron component by
-inverse bremsstrahlung, thermal multigroup radiation exchanges energy with those
+inverse bremsstrahlung, implicit Spitzer conduction redistributes that heat with a
+saturated-flux limiter, thermal multigroup radiation exchanges energy with those
 electrons, and the resulting nonparallel electron-density and electron-pressure gradients
 generate an out-of-plane Biermann field.
 
@@ -36,7 +37,8 @@ MHD flux/update, including radiation FLD and Biermann fluxes
   -> ray tracing, reflection, inverse-bremsstrahlung deposition
   -> identical source increment to total material energy and electron energy
   -> MHD boundary/CT/primitive update
-  -> end-of-step ion/electron and electron/radiation source exchange
+  -> end-of-step implicit electron conduction
+  -> ion/electron and electron/radiation source exchange
 ```
 
 Thus the laser and thermal-radiation modules communicate through the conservative electron
@@ -89,10 +91,11 @@ attempt to reproduce one particular experimental shot.
 
 Paper comparison is therefore topology- and communication-based. An absolute field
 benchmark requires a consistently dimensionalized Biermann coefficient, material EOS,
-ionization, tabulated multigroup opacity, thermal conduction/Nernst physics, and an
-experiment-specific pulse and target. AthenaK's current thermal-radiation model also omits
-radiation pressure and momentum feedback. See [SOURCES.md](SOURCES.md) for the papers and
-the exact quantities used from each one.
+ionization, tabulated multigroup opacity, magnetized (anisotropic) conduction/Nernst
+physics, and an experiment-specific pulse and target. The current conduction model is
+isotropic and uses the FLASH SpitzerHighZ form with time-lagged coefficients. AthenaK's
+thermal-radiation model also omits radiation pressure and momentum feedback. See
+[SOURCES.md](SOURCES.md) for the papers and the exact quantities used from each one.
 
 
 Unit-consistency note (2026-07 audit): the deck's `arad`, `c_light`,

@@ -1,5 +1,7 @@
 """Analytic regression tests for Hamiltonian 2T laser refraction."""
 
+import os
+
 import numpy as np
 
 import test_suite.testutils as testutils
@@ -19,6 +21,7 @@ def critical_density_cgs(wavelength=1.0):
 
 
 def run_case(basename, flags):
+    log_offset = os.path.getsize(testutils.LOG_FILE_PATH)
     common = [
         f"job/basename={basename}",
         "time/tlim=1.0e-8",
@@ -28,7 +31,7 @@ def run_case(basename, flags):
         f"{basename} refractive laser run failed.")
     data = read_laser_binary(
         f"bin/{basename}.laser_refractive.00001.bin")
-    return {
+    result = {
         name: sum(np.asarray(block).sum()
                   for block in data["mb_data"][name])
         for name in (
@@ -36,6 +39,15 @@ def run_case(basename, flags):
             "laser_dispersion_error", "laser_x1_moment",
             "laser_x2_moment")
     }
+    with open(testutils.LOG_FILE_PATH, encoding="utf-8") as stream:
+        stream.seek(log_offset)
+        lines = [line for line in stream
+                 if line.startswith("laser: launched=")]
+    assert lines, "refractive laser accounting line is missing"
+    diagnostics = dict(token.split("=", 1) for token in lines[-1].split()[1:])
+    result["iterations"] = int(diagnostics["iterations"])
+    result["waves"] = int(diagnostics["waves"])
+    return result
 
 
 def integrate_reference(y, dydx, points=200001):
@@ -53,6 +65,7 @@ def test_run():
 
         # Uniform density: refraction must reduce exactly to a straight ray.
         uniform = run_case("laser_refract_uniform", [])
+        assert 0 < uniform["iterations"] < 256*uniform["waves"]
         assert abs(uniform["laser_path"] - 1.0) < 2.0e-12
         assert abs(uniform["laser_dir1"] - 1.0) < 2.0e-12
         assert abs(uniform["laser_dir2"]) < 2.0e-12

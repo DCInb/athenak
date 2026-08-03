@@ -69,6 +69,17 @@ The conservative total-energy field is not replaced when the auxiliary branch is
 it is changed only if an EOS floor is required.  Static/adaptive mesh interfaces flux
 correct the face velocity along with the component-energy fluxes.
 
+### Hydrodynamic dual energy
+
+The same formalism is available in a `<hydro>` block, with the magnetic terms simply
+absent: the conservative internal energy is \(E_{\rm tot}-|\boldsymbol m|^2/2\rho\), and
+there is no Biermann electron work.  Because that subtraction is usually well conditioned
+without magnetic energy, `<hydro>/dual_energy` defaults to `false`; laser-driven or
+otherwise strongly kinetic-energy-dominated problems should set it to `true` explicitly.
+Everything else — the tabulated `<materials>` closure, multigroup radiation, the material
+LLF flux, and the laser deposition module — is shared between the two carriers, so a 3T
+deck can be moved between `<mhd>` and `<hydro>` by renaming the block.
+
 ## Biermann battery
 
 Two-temperature MHD can optionally add the FLASH-style flux formulation of the Biermann
@@ -100,6 +111,55 @@ The code updates component energies, not temperatures, and assigns one component
 remainder of the fixed total internal energy.  Exchange is therefore conservative to
 roundoff and remains positive and stable for \(\Delta t\gg t_{ei}\).
 
+## Implicit electron thermal conduction
+
+Two-temperature Hydro and MHD can operator-split isotropic electron conduction once per
+complete time step:
+
+\[
+\rho c_{v,e}\frac{T_e^{n+1}-T_e^n}{\Delta t}
+=\theta\,\boldsymbol\nabla\!\cdot(K_e^n\boldsymbol\nabla T_e^{n+1})
+ +(1-\theta)\,\boldsymbol\nabla\!\cdot(K_e^n\boldsymbol\nabla T_e^n).
+\]
+
+The default \(\theta=1\) is backward Euler.  Conductivity and the optional saturated-flux
+limiter are frozen at the old state, following FLASH's implicit diffusion linearization.
+For a tabular material mixture the electron EOS energy is evaluated nonlinearly and its
+finite-difference heat capacity forms Newton systems.  A matrix-free, diagonally
+preconditioned conjugate-gradient solve spans all same-level MeshBlocks and MPI ranks.
+The converged flux divergence is added identically to electron and conservative total
+energy; ion energy is unchanged.  Periodic or block faces use the usual halo exchange,
+while physical faces independently select zero-gradient or fixed-temperature conduction
+boundaries.
+
+Constant diffusivity uses `alpha_iso`, with \(K_e=\rho\,\mathtt{alpha_iso}\).  Setting
+`alpha_spitzer=true` adds the FLASH `SpitzerHighZ` conductivity in physical units.  Its
+classical or saturated value can be selected with `none`, `harmonic`, `minmax`, or
+`larsen` limiting.  A minimal configuration is:
+
+```text
+two_temperature = true
+alpha_spitzer = true
+conduction_integrator = implicit
+conduction_theta = 1.0
+conduction_coulomb_log = 10.0
+conduction_spitzer_multiplier = 1.0
+conduction_flux_limiter = harmonic
+conduction_flux_limit_coefficient = 0.06
+conduction_linear_tolerance = 1.0e-10
+conduction_nonlinear_tolerance = 1.0e-8
+conduction_max_iterations = 400
+conduction_max_nonlinear_iterations = 8
+```
+
+Each face also accepts `conduction_x{1,2,3}_{inner,outer}_boundary`, set to `neumann`
+(the default) or `dirichlet`; a Dirichlet face reads the corresponding `_value` in code
+temperature.  `conduction_report=true` prints iteration, residual, and net conductive
+energy diagnostics.  The explicit conduction path remains the default when
+`conduction_integrator` is omitted.  Implicit conduction is not included in the explicit
+parabolic timestep restriction, but it currently requires a uniform-level mesh and
+rejects SMR/AMR and anisotropic conductivity.
+
 ## Input parameters
 
 Add these parameters to either a `<hydro>` or `<mhd>` block:
@@ -118,6 +178,7 @@ t_ei = 0.2
 - `t_ei > 0` is the constant FLASH-style electron-ion equilibration time in code units.
   `t_ei = 0` gives immediate equilibrium and `t_ei < 0` disables exchange.
 - In an `<mhd>` block, `dual_energy` defaults to `true` when `two_temperature=true`.
+  In a `<hydro>` block it defaults to `false`.
   `dual_energy_eta1` and `dual_energy_eta2` default to `1.0e-3` and `1.0e-4`.
   Set `dual_energy=false` only when reproducing the conservative-only method.
 
@@ -127,6 +188,8 @@ Ready-to-run examples are provided:
 - `inputs/mhd/two_temperature_bw.athinput`
 - `inputs/mhd/two_temperature_dual_energy.athinput` (magnetically dominated SMR test)
 - `inputs/mhd/two_temperature_biermann.athinput` (crossed-gradient battery test)
+- `inputs/tests/implicit_conduction.athinput` (stiff periodic backward-Euler regression)
+- `inputs/tests/implicit_conduction_dirichlet.athinput` (fixed-temperature boundary test)
 
 For three-temperature ion/electron/thermal-radiation calculations, including multigroup
 flux-limited diffusion, see `THERMAL_RADIATION.md`.
@@ -141,23 +204,28 @@ their conservative energy densities also appear as `eion_d` and `eele_d` in the 
 
 ## Current scope
 
-This implementation supports standalone Newtonian ideal-gas hydro and MHD with a common
-gamma and a constant equilibration time.  Optional thermal multigroup radiation is
-documented separately.  The optional 2D/3D Cartesian Biermann battery is documented in
-`BIERMANN_BATTERY.md`.  Relativistic fluids, ion-neutral two-fluid runs, tabulated
-multitemperature equations of state, a locally calculated Spitzer/Lee--More equilibration
-time, and electron-only thermal conduction are not yet implemented.  MHD dual energy is
-currently incompatible with FOFC, viscosity, resistivity, thermal conduction, generic
-MHD source terms, and shearing-box evolution; set `dual_energy=false` to retain the older
-2T path for those combinations.  Thermal multigroup radiation is supported because its
-electron coupling updates the same component-energy reservoir.  The RAGE-like method
-also partitions shock
-heating by pressure; unlike FLASH's entropy-advection alternative, it does not force all
-irreversible shock heating into ions.
+This implementation supports standalone Newtonian gamma-law Hydro and MHD, constant or
+locally calculated Spitzer ion/electron exchange, and electron-only implicit conduction.
+MHD additionally supports composition-aware tabular ion/electron material mixtures.
+Optional thermal multigroup radiation is documented separately, and the optional 2D/3D
+Cartesian Biermann battery is documented in `BIERMANN_BATTERY.md`.  Relativistic fluids
+and ion-neutral two-fluid runs are not supported.  The implicit conduction operator is
+currently isotropic and single-level; magnetized conduction, Nernst advection, nonlocal
+transport, SMR, and AMR remain out of scope.  MHD dual energy is incompatible with FOFC,
+viscosity, resistivity, **explicit** conduction, generic MHD source terms, and shearing-box
+evolution; the implicit electron-conduction path is compatible.  Thermal multigroup
+radiation is supported because its electron coupling updates the same component-energy
+reservoir.  The RAGE-like method also partitions shock heating by pressure; unlike FLASH's
+entropy-advection alternative, it does not force all irreversible shock heating into ions.
 
 The numerical design follows the FLASH User's Guide sections
 [3T capabilities](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node103.html),
 [multitemperature hydrodynamics](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node105.html),
 and [heat exchange](https://flash.rochester.edu/site/flashcode/user_support/flash_ug_devel/node123.html).
+The implicit conduction stencil, theta method, flux limiting, and boundary choices follow
+the FLASH 4.6.2 [general implicit and thermal-conduction
+solver](https://flash.rochester.edu/site/flashcode/user_support/flash4_ug_4p62/node122.html),
+with its [SpitzerHighZ
+conductivity](https://flash.rochester.edu/site/flashcode/user_support/flash4_ug_4p62/node139.html).
 The dual-energy switches and face-velocity compression update follow
 [AthenaK PR #753](https://github.com/IAS-Astrophysics/athenak/pull/753).

@@ -1332,6 +1332,9 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real rho = fmax(w(m, IDN, k, j, i), dfloor);
         Real local_fe = fe;
         Real ne;
+        // The centre cell's log(ne) was redeclared once per direction.  It is the same
+        // value in all three: hoist it, and let x2/x3 read what x1 already evaluated.
+        Real log_ne = 0.0;
         Real electron_activation = 1.0;
         Real dln1;
         if (use_tabular_materials) {
@@ -1348,7 +1351,7 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
               minimum_electron_fraction, minimum_positive, m, k, j, i-1);
           ne = ne_center.value;
           electron_activation = ne_center.activation;
-          const Real log_ne = log(ne);
+          log_ne = log(ne);
           dln1 = fmax(fabs(log(ne_p.value)-log_ne),
                       fabs(log_ne-log(ne_m.value)))/dx1;
         } else if (use_materials) {
@@ -1364,12 +1367,12 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
               w, m, k, j, i-1);
           const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
           const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
-          const Real log_ne = log(ne);
+          log_ne = log(ne);
           dln1 = fmax(fabs(log(ne_p)-log_ne),
                       fabs(log_ne-log(ne_m)))/dx1;
         } else {
           ne = fe*rho;
-          const Real log_ne = log(ne);
+          log_ne = log(ne);
           const Real ne_p = fe*fmax(w(m, IDN, k, j, i+1), dfloor);
           const Real ne_m = fe*fmax(w(m, IDN, k, j, i-1), dfloor);
           dln1 = fmax(fabs(log(ne_p)-log_ne),
@@ -1387,7 +1390,6 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
             const BoundedElectronDensity ne_m = CachedElectronDensityCode(
                 thermodynamics, electron_density_cgs_to_code, rho_m,
                 minimum_electron_fraction, minimum_positive, m, k, j-1, i);
-            const Real log_ne = log(ne);
             dln2 = fmax(fabs(log(ne_p.value)-log_ne),
                         fabs(log_ne-log(ne_m.value)))/dx2;
           } else if (use_materials) {
@@ -1399,11 +1401,9 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
                 w, m, k, j-1, i);
             const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
             const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
-            const Real log_ne = log(ne);
             dln2 = fmax(fabs(log(ne_p)-log_ne),
                         fabs(log_ne-log(ne_m)))/dx2;
           } else {
-            const Real log_ne = log(ne);
             const Real ne_p = fe*fmax(w(m, IDN, k, j+1, i), dfloor);
             const Real ne_m = fe*fmax(w(m, IDN, k, j-1, i), dfloor);
             dln2 = fmax(fabs(log(ne_p)-log_ne),
@@ -1420,7 +1420,6 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
             const BoundedElectronDensity ne_m = CachedElectronDensityCode(
                 thermodynamics, electron_density_cgs_to_code, rho_m,
                 minimum_electron_fraction, minimum_positive, m, k-1, j, i);
-            const Real log_ne = log(ne);
             dln3 = fmax(fabs(log(ne_p.value)-log_ne),
                         fabs(log_ne-log(ne_m.value)))/dx3;
           } else if (use_materials) {
@@ -1432,11 +1431,9 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
                 w, m, k-1, j, i);
             const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
             const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
-            const Real log_ne = log(ne);
             dln3 = fmax(fabs(log(ne_p)-log_ne),
                         fabs(log_ne-log(ne_m)))/dx3;
           } else {
-            const Real log_ne = log(ne);
             const Real ne_p = fe*fmax(w(m, IDN, k+1, j, i), dfloor);
             const Real ne_m = fe*fmax(w(m, IDN, k-1, j, i), dfloor);
             dln3 = fmax(fabs(log(ne_p)-log_ne),

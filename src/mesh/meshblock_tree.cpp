@@ -350,6 +350,49 @@ void MeshBlockTree::CreateZOrderedLLList(LogicalLocation *list, int *pglist, int
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn void MeshBlockTree::CreateX1RankMappedLLList(LogicalLocation *list, int& count,
+//!                                                   const int *rank_map, int nranks)
+//! \brief Assign contiguous GIDs by rank while retaining complete x1 columns.
+//!
+//! rank_map is indexed by (lx3*nx2 + lx2).  This ordering is restricted by the caller
+//! to uniform root grids and avoids rank boundaries normal to x1.
+
+void MeshBlockTree::CreateX1RankMappedLLList(LogicalLocation *list, int& count,
+                                            const int *rank_map, int nranks) {
+  count = 0;
+  const int nx1 = pmesh_->nmb_rootx1;
+  const int nx2 = pmesh_->nmb_rootx2;
+  const int nx3 = pmesh_->nmb_rootx3;
+
+  for (int rank = 0; rank < nranks; ++rank) {
+    for (int lx3 = 0; lx3 < nx3; ++lx3) {
+      for (int lx2 = 0; lx2 < nx2; ++lx2) {
+        if (rank_map[lx3*nx2 + lx2] == rank) {
+          for (int lx1 = 0; lx1 < nx1; ++lx1) {
+            LogicalLocation location;
+            location.lx1 = lx1;
+            location.lx2 = lx2;
+            location.lx3 = lx3;
+            location.level = pmesh_->root_level;
+            MeshBlockTree *block = proot_->FindMeshBlock(location);
+            if (block == nullptr || block->pleaf_ != nullptr) {
+              std::cout << "### FATAL ERROR in " << __FILE__ << " at line "
+                        << __LINE__ << std::endl
+                        << "x1 rank-mapped ordering found a nonuniform root grid."
+                        << std::endl;
+              std::exit(EXIT_FAILURE);
+            }
+            list[count] = location;
+            block->gid_ = count;
+            ++count;
+          }
+        }
+      }
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn MeshBlockTree* MeshBlockTree::FindNeighbor(LogicalLocation myloc,
 //!                                   int ox1, int ox2, int ox3, bool amrflag)
 //! \brief find a neighboring block, called from the root of the tree

@@ -8,8 +8,10 @@
 
 #include "athena.hpp"
 #include "hydro/hydro.hpp"
+#include "materials/material_mixture.hpp"
 #include "eos/eos.hpp"
 #include "eos/ideal_c2p_hyd.hpp"
+#include "two_temperature/two_temperature.hpp"
 
 //----------------------------------------------------------------------------------------
 // ctor: also calls EOS base class constructor
@@ -33,9 +35,18 @@ void IdealHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
                             const int kl, const int ku) {
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
+  const bool use_dual = pmy_pack->phydro->use_dual_energy;
+  const int iion = use_dual ? pmy_pack->phydro->ptwo_temp->iion : -1;
+  const int iele = use_dual ? pmy_pack->phydro->ptwo_temp->iele : -1;
+  const Real dual_eta1 = pmy_pack->phydro->dual_energy_eta1;
   int &nmb = pmy_pack->nmb_thispack;
   auto &eos = eos_data;
   auto &fofc_ = pmy_pack->phydro->fofc;
+  const bool use_materials = pmy_pack->phydro->pmaterials != nullptr;
+  materials::MaterialMixtureDevice material_mixture;
+  if (use_materials) {
+    material_mixture = pmy_pack->phydro->pmaterials->DeviceData();
+  }
 
   const int ni   = (iu - il + 1);
   const int nji  = (ju - jl + 1)*ni;
@@ -64,7 +75,38 @@ void IdealHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
     // (inline function in ideal_c2p_hyd.hpp file)
     HydPrim1D w;
     bool dfloor_used=false, efloor_used=false, tfloor_used=false;
-    SingleC2P_IdealHyd(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+    if (!use_dual) {
+      SingleC2P_IdealHyd(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+    } else {
+      // Dual-energy variant: select between the conservative internal energy and the
+      // advected ion+electron sum, then restore total energy from the selection.
+      if (u.d < eos.dfloor) {
+        u.d = eos.dfloor;
+        dfloor_used = true;
+      }
+      w.d = u.d;
+      const Real di = 1.0/u.d;
+      w.vx = di*u.mx;
+      w.vy = di*u.my;
+      w.vz = di*u.mz;
+      const Real e_k = 0.5*di*(SQR(u.mx) + SQR(u.my) + SQR(u.mz));
+      const Real eint_cons = u.e - e_k;
+      const Real eint_aux = fmax(cons(m, iion, k, j, i), 0.0) +
+                            fmax(cons(m, iele, k, j, i), 0.0);
+      const Real eint_floor = eos.HydroInternalEnergyDensityFloor(w.d);
+      const bool use_cons_e =
+          (eint_cons > 0.0) &&
+          ((dual_eta1 <= 0.0) ||
+           (eint_cons > dual_eta1*fmax(u.e, 1.0e-18)));
+      w.e = use_cons_e ? eint_cons : eint_aux;
+      if (w.e < eint_floor) {
+        w.e = eint_floor;
+        efloor_used = true;
+      }
+      // Keep conservative total energy unless a physical floor was required.  The
+      // auxiliary energy supplies pressure without sacrificing total-energy conservation.
+      u.e = w.e + e_k;
+    }
 
     // set FOFC flag and quit loop if this function called only to check floors
     if (only_testfloors) {
@@ -94,9 +136,15 @@ void IdealHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
       prim(m,IEN,k,j,i) = w.e;
       // convert scalars (if any)
       for (int n=nhyd; n<(nhyd+nscal); ++n) {
-        // apply scalar floor
-        if (cons(m,n,k,j,i) < 0.0) {
-          cons(m,n,k,j,i) = 0.0;
+        if (use_materials && n == material_mixture.scalar_index) {
+          // The material scalar is conservative rho*Y0. Clamp only its mass fraction;
+          // the complementary material remains exactly 1-Y0.
+          cons(m,n,k,j,i) = fmin(fmax(cons(m,n,k,j,i), 0.0), u.d);
+        } else {
+          // Legacy positivity floor for every other advected scalar.
+          if (cons(m,n,k,j,i) < 0.0) {
+            cons(m,n,k,j,i) = 0.0;
+          }
         }
         prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
       }
@@ -126,6 +174,11 @@ void IdealHydro::PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &co
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
   int &nmb = pmy_pack->nmb_thispack;
+  const bool use_materials = pmy_pack->phydro->pmaterials != nullptr;
+  materials::MaterialMixtureDevice material_mixture;
+  if (use_materials) {
+    material_mixture = pmy_pack->phydro->pmaterials->DeviceData();
+  }
 
   par_for("hyd_p2c", DevExeSpace(), 0, (nmb-1), kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -150,7 +203,12 @@ void IdealHydro::PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &co
 
     // convert scalars (if any)
     for (int n=nhyd; n<(nhyd+nscal); ++n) {
-      cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+      if (use_materials && n == material_mixture.scalar_index) {
+        cons(m,n,k,j,i) = u.d*material_mixture.ClampMassFraction(
+            prim(m,n,k,j,i));
+      } else {
+        cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+      }
     }
   });
 

@@ -50,6 +50,11 @@ TaskStatus Hydro::NewTimeStep(Driver *pdrive, int stage) {
   auto &is_special_relativistic_ = pmy_pack->pcoord->is_special_relativistic;
   auto &is_general_relativistic_ = pmy_pack->pcoord->is_general_relativistic;
   auto &is_dynamical_relativistic_ = pmy_pack->pcoord->is_dynamical_relativistic;
+  const bool use_tabular_material_eos_ = use_tabular_material_eos;
+  DvceArray5D<Real> material_thermodynamics;
+  if (use_tabular_material_eos_) {
+    material_thermodynamics = ptwo_temp->thermodynamics;
+  }
   const int nmkji = (pmy_pack->nmb_thispack)*nx3*nx2*nx1;
   const int nkji = nx3*nx2*nx1;
   const int nji  = nx2*nx1;
@@ -105,7 +110,10 @@ TaskStatus Hydro::NewTimeStep(Driver *pdrive, int stage) {
         max_dv3 = fmax(fabs(lm), lp);
       } else {
         Real cs;
-        if (eos.is_ideal) {
+        if (use_tabular_material_eos_) {
+          cs = sqrt(fmax(material_thermodynamics(
+              m, two_temperature::TwoTemperature::sound_speed_squared, k, j, i), 0.0));
+        } else if (eos.is_ideal) {
           cs = sqrt(eos.HydroSoundSpeed2FromRhoEint(
               w0_(m,IDN,k,j,i), w0_(m,IEN,k,j,i)));
         } else         {
@@ -127,7 +135,7 @@ TaskStatus Hydro::NewTimeStep(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->three_d) { dtnew = std::min(dtnew, dt3); }
 
   // compute timestep for diffusion
-  if (pcond != nullptr) {
+  if (pcond != nullptr && !pcond->IsImplicit()) {
     pcond->NewTimeStep(w0, peos->eos_data);
   }
   if (pvisc != nullptr) {

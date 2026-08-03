@@ -10,6 +10,9 @@
 #include <cinttypes>
 #include <limits> // numeric_limits<>
 #include <memory> // make_unique<>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -22,6 +25,142 @@
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
 #endif
+
+namespace {
+
+struct RootGridOrder {
+  bool enabled = false;
+  std::vector<int> rank_map;
+  std::vector<int> nmb_eachrank;
+};
+
+[[noreturn]] void MeshBlockOrderError(const std::string &message) {
+  if (global_variable::my_rank == 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Invalid <mesh>/meshblock_order: " << message
+              << std::endl;
+  }
+  std::exit(EXIT_FAILURE);
+}
+
+RootGridOrder ReadRootGridOrder(ParameterInput *pin, const bool multilevel,
+                                const bool single_file_per_rank,
+                                const int nx1, const int nx2, const int nx3,
+                                const int nmb_total) {
+  RootGridOrder result;
+  if (!pin->DoesParameterExist("mesh", "meshblock_order")) return result;
+
+  const std::string order = pin->GetString("mesh", "meshblock_order");
+  if (order == "z_order") return result;
+  if (order != "x1_tiled" && order != "x1_rank_map") {
+    MeshBlockOrderError("expected 'z_order', 'x1_tiled', or 'x1_rank_map'");
+  }
+  if (multilevel) {
+    MeshBlockOrderError("x1 ordering requires a uniform, single-level grid");
+  }
+  if (single_file_per_rank) {
+    MeshBlockOrderError("x1 ordering requires a shared restart file");
+  }
+  if (nmb_total != nx1*nx2*nx3) {
+    MeshBlockOrderError("x1 ordering requires a uniform root grid");
+  }
+
+  result.rank_map.resize(nx2*nx3);
+  if (order == "x1_tiled") {
+    if (!pin->DoesParameterExist("mesh", "meshblock_tiles_x2") ||
+        !pin->DoesParameterExist("mesh", "meshblock_tiles_x3")) {
+      MeshBlockOrderError("x1_tiled requires meshblock_tiles_x2 and "
+                          "meshblock_tiles_x3");
+    }
+    const int ntiles_x2 = pin->GetInteger("mesh", "meshblock_tiles_x2");
+    const int ntiles_x3 = pin->GetInteger("mesh", "meshblock_tiles_x3");
+    if (ntiles_x2 <= 0 || ntiles_x3 <= 0 ||
+        ntiles_x2*ntiles_x3 != global_variable::nranks) {
+      MeshBlockOrderError("x1_tiled tile counts must be positive and multiply to "
+                          "the MPI rank count");
+    }
+    if (nx2 % ntiles_x2 != 0 || nx3 % ntiles_x3 != 0) {
+      MeshBlockOrderError("root-grid x2 and x3 MeshBlock counts must divide evenly "
+                          "among tiles");
+    }
+    const int tile_nx2 = nx2/ntiles_x2;
+    const int tile_nx3 = nx3/ntiles_x3;
+    for (int lx3 = 0; lx3 < nx3; ++lx3) {
+      for (int lx2 = 0; lx2 < nx2; ++lx2) {
+        result.rank_map[lx3*nx2 + lx2] =
+            lx2/tile_nx2 + ntiles_x2*(lx3/tile_nx3);
+      }
+    }
+  } else {
+    for (int lx3 = 0; lx3 < nx3; ++lx3) {
+      const std::string parameter =
+          "meshblock_rank_map_x3_" + std::to_string(lx3);
+      if (!pin->DoesParameterExist("mesh", parameter)) {
+        MeshBlockOrderError("x1_rank_map requires <mesh>/" + parameter);
+      }
+      const std::string specification = pin->GetString("mesh", parameter);
+      if (specification.empty() || specification.back() == ',') {
+        MeshBlockOrderError(parameter + " must contain one rank per x2 column");
+      }
+      std::istringstream values(specification);
+      std::string token;
+      int lx2 = 0;
+      while (std::getline(values, token, ',')) {
+        std::istringstream item(token);
+        int rank = -1;
+        char trailing = '\0';
+        if (lx2 >= nx2 || !(item >> rank) || (item >> trailing)) {
+          MeshBlockOrderError(parameter + " must contain comma-separated integers");
+        }
+        result.rank_map[lx3*nx2 + lx2] = rank;
+        ++lx2;
+      }
+      if (lx2 != nx2) {
+        MeshBlockOrderError(parameter + " must contain one rank per x2 column");
+      }
+    }
+  }
+
+  result.nmb_eachrank.assign(global_variable::nranks, 0);
+  for (const int rank : result.rank_map) {
+    if (rank < 0 || rank >= global_variable::nranks) {
+      MeshBlockOrderError("rank-map entries must lie in [0, nranks)");
+    }
+    result.nmb_eachrank[rank] += nx1;
+  }
+  for (int rank = 0; rank < global_variable::nranks; ++rank) {
+    if (result.nmb_eachrank[rank] <= 0 ||
+        result.nmb_eachrank[rank] > (1 << NUM_BITS_LID)) {
+      MeshBlockOrderError("every rank must own a nonempty, representable set of tubes");
+    }
+  }
+  result.enabled = true;
+  return result;
+}
+
+void ApplyRootGridOrder(const RootGridOrder &order, const int nmb_total,
+                        int *rank_eachmb, int *gids_eachrank, int *nmb_eachrank) {
+  int begin = 0;
+  for (int rank = 0; rank < global_variable::nranks; ++rank) {
+    gids_eachrank[rank] = begin;
+    nmb_eachrank[rank] = order.nmb_eachrank[rank];
+    const int end = begin + nmb_eachrank[rank];
+    for (int gid = begin; gid < end; ++gid) {
+      rank_eachmb[gid] = rank;
+    }
+    begin = end;
+  }
+  if (begin != nmb_total) {
+    MeshBlockOrderError("internal x1 ownership size mismatch");
+  }
+}
+
+bool SameLogicalLocation(const LogicalLocation &left, const LogicalLocation &right) {
+  return left.lx1 == right.lx1 && left.lx2 == right.lx2 &&
+         left.lx3 == right.lx3 && left.level == right.level;
+}
+
+} // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn void Mesh::BuildTreeFromScratch():
@@ -233,14 +372,23 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   // initial mesh hierarchy construction is completed here
   ptree->CountMeshBlocks(nmb_total);
 
+  const RootGridOrder root_grid_order = ReadRootGridOrder(
+      pin, multilevel, false, nmb_rootx1, nmb_rootx2, nmb_rootx3, nmb_total);
+
   cost_eachmb = new float[nmb_total];
   rank_eachmb = new int[nmb_total];
   lloc_eachmb = new LogicalLocation[nmb_total];
   gids_eachrank = new int[global_variable::nranks];
   nmb_eachrank = new int[global_variable::nranks];
 
-  // following returns LogicalLocation list sorted by Z-ordering, and total # of MBs
-  ptree->CreateZOrderedLLList(lloc_eachmb, nullptr, nmb_total);
+  // Return the requested LogicalLocation order and assign the corresponding GIDs.
+  if (root_grid_order.enabled) {
+    ptree->CreateX1RankMappedLLList(
+        lloc_eachmb, nmb_total, root_grid_order.rank_map.data(),
+        global_variable::nranks);
+  } else {
+    ptree->CreateZOrderedLLList(lloc_eachmb, nullptr, nmb_total);
+  }
 
 #if MPI_PARALLEL_ENABLED
   // check there is at least one MeshBlock per MPI rank
@@ -255,7 +403,12 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   // initialize cost array with the simplest estimate; all the blocks are equal
   // TODO(@user): implement variable cost per MeshBlock as needed
   for (int i=0; i<nmb_total; i++) {cost_eachmb[i] = 1.0;}
-  LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  if (root_grid_order.enabled) {
+    ApplyRootGridOrder(
+        root_grid_order, nmb_total, rank_eachmb, gids_eachrank, nmb_eachrank);
+  } else {
+    LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  }
 
   // create MeshBlockPack for this rank
   int mbp_gids = gids_eachrank[global_variable::my_rank];
@@ -375,6 +528,10 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   nmb_rootx3 = mesh_indcs.nx3/mb_indcs.nx3;
   int current_level = root_level;
 
+  const RootGridOrder root_grid_order = ReadRootGridOrder(
+      pin, multilevel, single_file_per_rank, nmb_rootx1, nmb_rootx2,
+      nmb_rootx3, nmb_total);
+
   // Error check properties of input paraemters for SMR/AMR meshes.
   if (adaptive) {
     max_level = pin->GetOrAddInteger("mesh_refinement", "num_levels", 1) + root_level - 1;
@@ -434,11 +591,28 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   ptree->CreateRootGrid();
   for (int i=0; i<nmb_total; i++) {ptree->AddNodeWithoutRefinement(lloc_eachmb[i]);}
 
-  // check the tree structure by making sure total # of MBs counted in tree same as the
-  // number read from the restart file.
+  // Check the tree and assign GIDs.  A tiled restart must retain the order in which its
+  // data were written; changing an existing Z-order restart in place would misassociate
+  // MeshBlock payloads with logical locations.
   {
     int nnb;
-    ptree->CreateZOrderedLLList(lloc_eachmb, nullptr, nnb);
+    if (root_grid_order.enabled) {
+      LogicalLocation *expected = new LogicalLocation[nmb_total];
+      ptree->CreateX1RankMappedLLList(
+          expected, nnb, root_grid_order.rank_map.data(), global_variable::nranks);
+      if (nnb == nmb_total) {
+        for (int gid = 0; gid < nmb_total; ++gid) {
+          if (!SameLogicalLocation(expected[gid], lloc_eachmb[gid])) {
+            delete [] expected;
+            MeshBlockOrderError("restart MeshBlock order does not match the requested "
+                                "x1 order; use a restart written with that order");
+          }
+        }
+      }
+      delete [] expected;
+    } else {
+      ptree->CreateZOrderedLLList(lloc_eachmb, nullptr, nnb);
+    }
     if (nnb != nmb_total) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
         << std::endl << "Tree reconstruction failed. Total number of blocks in "
@@ -460,7 +634,12 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   }
 #endif
 
-  LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  if (root_grid_order.enabled) {
+    ApplyRootGridOrder(
+        root_grid_order, nmb_total, rank_eachmb, gids_eachrank, nmb_eachrank);
+  } else {
+    LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  }
 
   // create MeshBlockPack for this rank
   int mbp_gids = gids_eachrank[global_variable::my_rank];

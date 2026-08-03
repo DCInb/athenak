@@ -11,11 +11,13 @@
 #include <algorithm>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
 #include "diffusion/viscosity.hpp"
 #include "diffusion/conduction.hpp"
+#include "materials/material_mixture.hpp"
 #include "srcterms/srcterms.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
@@ -34,6 +36,8 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     coarse_w0("cprim",1,1,1,1,1),
     u1("cons1",1,1,1,1,1),
     uflx("uflx",1,1,1,1,1),
+    dual_vf("dual_vf",1,1,1,1,1),
+    dual_etot_max("dual_etot_max",1,1,1,1),
     fofc("fofc",1,1,1,1),
     utest("utest",1,1,1,1,1),
     pmy_pack(ppack) {
@@ -77,8 +81,28 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   // (2) Initialize scalars, two-temperature model, diffusion, and source terms
   nuser_scalars = pin->GetOrAddInteger("hydro", "nscalars", 0);
   nscalars = nuser_scalars;
+  if (pin->DoesBlockExist("materials")) {
+    if (!peos->eos_data.is_gamma_law ||
+        pmy_pack->pcoord->is_special_relativistic ||
+        pmy_pack->pcoord->is_general_relativistic ||
+        pmy_pack->pcoord->is_dynamical_relativistic) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<materials> currently requires Newtonian ideal-gas "
+                << "hydrodynamics" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    pmaterials = new materials::MaterialMixture(
+        pin, "hydro", nhydro, nuser_scalars, peos->eos_data.gamma, ppack->punit);
+    use_tabular_material_eos = pmaterials->UsesTabularEOS();
+  }
   bool use_two_temperature =
       pin->GetOrAddBoolean("hydro", "two_temperature", false);
+  if (use_tabular_material_eos && !use_two_temperature) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "tabular <materials> EOS requires "
+              << "<hydro>/two_temperature=true" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (use_two_temperature) {
     if (!peos->eos_data.is_gamma_law || pmy_pack->pcoord->is_special_relativistic ||
         pmy_pack->pcoord->is_general_relativistic ||
@@ -90,7 +114,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
     ptwo_temp = new two_temperature::TwoTemperature(
-        "hydro", ppack, pin, nhydro + nuser_scalars);
+        "hydro", ppack, pin, nhydro + nuser_scalars, pmaterials);
     nscalars += 2 + ptwo_temp->NumberOfRadiationGroups();
     // 2T scalar advection through the shear boundary is validated, but the FLD
     // diffusive-flux interplay with the shearing-box remap is not — forbid the
@@ -109,6 +133,39 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
 
+  // Hydrodynamics has no magnetic energy to subtract, so total-minus-kinetic is usually
+  // a well-conditioned internal energy and the ordinary 2T pressure partition suffices.
+  // Laser-driven coronae do reach kinetic-energy-dominated states where the subtraction
+  // loses the gas pressure entirely; those decks opt in explicitly.  Unlike MHD this
+  // therefore defaults off, so existing 2T hydro results are unchanged.
+  use_dual_energy = pin->GetOrAddBoolean("hydro", "dual_energy", false);
+  if (use_dual_energy) {
+    if (ptwo_temp == nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/dual_energy requires "
+                << "<hydro>/two_temperature=true" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    dual_energy_eta1 = pin->GetOrAddReal("hydro", "dual_energy_eta1", 1.0e-3);
+    dual_energy_eta2 = pin->GetOrAddReal("hydro", "dual_energy_eta2", 1.0e-4);
+    if (dual_energy_eta1 < 0.0 || dual_energy_eta2 < 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/dual_energy_eta1 and dual_energy_eta2 must be "
+                << "non-negative" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
+  // The Biermann battery is a magnetic-field source term, so it exists only in <mhd>.
+  // Decks that switch a 3T problem between the two carriers keep the parameters in
+  // place; say plainly that they do nothing here rather than dropping them silently.
+  if (pin->GetOrAddBoolean("hydro", "biermann_battery", false) &&
+      global_variable::my_rank == 0) {
+    std::cout << "### WARNING: <hydro>/biermann_battery is ignored; the Biermann "
+              << "battery generates magnetic field and requires an <mhd> block. "
+              << "This run evolves no magnetic field." << std::endl;
+  }
+
   // Viscosity (if requested in input file)
   if (pin->DoesParameterExist("hydro","nu_iso") ||
       pin->DoesParameterExist("hydro","nu_aniso")) {
@@ -122,7 +179,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       pin->DoesParameterExist("hydro","alpha_aniso") ||
       pin->DoesParameterExist("hydro","alpha_spitzer")) {
     if (peos->eos_data.is_gamma_law) {
-      pcond = new Conduction("hydro", ppack, pin);
+      pcond = new Conduction("hydro", ppack, pin, ptwo_temp, pmaterials);
     } else {
       std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
                 << "Thermal conduction in hydro requires ideal gas EOS" << std::endl;
@@ -148,6 +205,22 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   // (3) read time-evolution option [already error checked in driver constructor]
   // Then initialize memory and algorithms for reconstruction and Riemann solvers
   std::string evolution_t = pin->GetString("time","evolution");
+  if (use_dual_energy) {
+    if (evolution_t.compare("dynamic") != 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/dual_energy requires dynamic evolution"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (pvisc != nullptr || (pcond != nullptr && !pcond->IsImplicit()) ||
+        psrc != nullptr || pin->DoesBlockExist("shearing_box")) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/dual_energy is not yet compatible with "
+                << "viscosity, explicit thermal conduction, hydro source terms, or "
+                << "shearing box" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   // allocate memory for conserved and primitive variables
   // With AMR, maximum size of Views are limited by total device memory through an input
@@ -159,6 +232,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
     Kokkos::realloc(u0, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
     Kokkos::realloc(w0, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
+    if (use_dual_energy) {
+      Kokkos::realloc(dual_etot_max, nmb, ncells3, ncells2, ncells1);
+    }
   }
 
   // allocate memory for conserved variables on coarse mesh
@@ -171,9 +247,11 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     Kokkos::realloc(coarse_w0, nmb, (nhydro+nscalars), n_ccells3, n_ccells2, n_ccells1);
   }
 
-  // allocate boundary buffers for conserved (cell-centered) variables
+  // allocate boundary buffers for conserved (cell-centered) variables.  The dual-energy
+  // correction needs one extra refluxed face field (the upwind face velocity).
   pbval_u = new MeshBoundaryValuesCC(ppack, pin, false);
-  pbval_u->InitializeBuffers((nhydro+nscalars));
+  pbval_u->InitializeBuffers((nhydro+nscalars),
+      (nhydro+nscalars) + (use_dual_energy ? 1 : 0));
 
   // Orbital advection and shearing box BCs (if requested in input file)
   if (pin->DoesBlockExist("shearing_box")) {
@@ -188,6 +266,12 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("hydro","fofc",false);
+    if (use_dual_energy && use_fofc) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<hydro>/dual_energy is not yet compatible with FOFC"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     if (use_fofc && ptwo_temp != nullptr) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<hydro>/two_temperature is not yet compatible with "
@@ -248,6 +332,14 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<hydro>/eos=table currently requires rsolver=llf"
                 << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    // Only the LLF flux has a material-EOS variant that takes pressure and sound speed
+    // from the tabulated closure rather than from the gamma-law carrier.
+    if (use_tabular_material_eos && rsolver != "llf") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "tabular <materials> EOS currently requires "
+                << "<hydro>/rsolver=llf" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     // Special relativistic dynamic solvers
@@ -345,6 +437,11 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(uflx.x1f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x2f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x3f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
+      if (use_dual_energy) {
+        Kokkos::realloc(dual_vf.x1f, nmb, 1, ncells3, ncells2, ncells1);
+        Kokkos::realloc(dual_vf.x2f, nmb, 1, ncells3, ncells2, ncells1);
+        Kokkos::realloc(dual_vf.x3f, nmb, 1, ncells3, ncells2, ncells1);
+      }
 
       // allocate array of flags used with FOFC
       if (use_fofc) {
@@ -366,6 +463,7 @@ Hydro::~Hydro() {
   if (pcond != nullptr) {delete pcond;}
   if (pvisc != nullptr) {delete pvisc;}
   if (ptwo_temp != nullptr) {delete ptwo_temp;}
+  if (pmaterials != nullptr) {delete pmaterials;}
   delete peos;
 }
 

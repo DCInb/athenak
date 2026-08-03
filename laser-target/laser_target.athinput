@@ -1,9 +1,17 @@
-# Reduced, fast laser--solid benchmark.  The optical scales correspond to a 351 nm beam
-# incident on a fully ionized CH-like target, while the beam power is deliberately below
-# a full experimental shot so this communication/regression test remains inexpensive.
+# Dimensionally consistent 3D laser-ablation target: tabulated CH/He 3T MHD, 20-group
+# AP-FLD, a 351 nm Gaussian beam, and reduced-closure Biermann subcycling.
 
 <job>
 basename = laser_target
+
+<units>
+# L0=100 um, rho0=1 g/cc, and T0=1 keV for fully ionized CH (mu=13/9).
+# Derived scales: v0=2.5845218867e7 cm/s, t0=0.3869187586 ns,
+# P0=1.7263968815e18 erg/s, and B0=91.6 MG.
+length_cgs = 1.0e-2
+mass_cgs = 1.0e-6
+time_cgs = 3.869187586110799e-10
+mu = 1.4444444444444444
 
 <mesh>
 nghost = 2
@@ -17,16 +25,16 @@ x2min = -0.5
 x2max = 0.5
 ix2_bc = outflow
 ox2_bc = outflow
-nx3 = 1
+nx3 = 64
 x3min = -0.5
 x3max = 0.5
 ix3_bc = outflow
 ox3_bc = outflow
 
 <meshblock>
-nx1 = 16
-nx2 = 16
-nx3 = 1
+nx1 = 32
+nx2 = 32
+nx3 = 32
 
 <time>
 evolution = dynamic
@@ -35,48 +43,130 @@ cfl_number = 0.25
 nlim = -1
 tlim = 2.0e-2
 ndiag = 10
+align_outputs = true
+initial_dt = 1.0e-6
 
 <mhd>
 eos = ideal
 reconstruct = plm
-rsolver = hlle
+rsolver = llf
 gamma = 1.6666666666666667
-density_floor = 1.0e-8
-pressure_floor = 1.0e-10
+dfloor = 1.0e-8
+pfloor = 1.0e-14
+# Just above the CH/He common EOS minimum (1e-3 code = 11604.5 K).  The
+# small offset prevents a roundoff-only temperature_below_table lifetime flag.
+tfloor = 1.0001e-3
+nscalars = 1
 two_temperature = true
 dual_energy = true
-electron_heat_capacity_fraction = 0.5
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+electron_heat_capacity_fraction = 0.7777777777777778
 initial_electron_temperature_ratio = 1.0
-t_ei = -1.0
+t_ei_model = spitzer
+t_ei_coulomb_log = 1.0e1
+t_ei_spitzer_multiplier = 1.0
+t_ei_temperature_floor_kelvin = 1.0
+# FLASH-style implicit electron conduction.  The Spitzer coefficient and harmonic
+# saturated-flux limiter are frozen at the start of each step; the tabular electron EOS
+# remains nonlinear inside the temperature solve.
+alpha_spitzer = true
+conduction_integrator = implicit
+conduction_theta = 1.0
+conduction_coulomb_log = 1.0e1
+conduction_spitzer_multiplier = 1.0
+conduction_temperature_floor_kelvin = 1.0
+conduction_flux_limiter = harmonic
+conduction_flux_limit_coefficient = 6.0e-2
+conduction_linear_tolerance = 1.0e-10
+conduction_nonlinear_tolerance = 1.0e-8
+conduction_max_iterations = 400
+conduction_max_nonlinear_iterations = 8
+conduction_report = false
 biermann_battery = true
-biermann_coefficient = 2.0e-2
+biermann_coefficient = 2.9236304219444733e-3
+biermann_minimum_electron_fraction = 1.0e-12
 biermann_shock_suppression = true
-biermann_shock_threshold = 0.8
+biermann_shock_threshold = 8.0e-1
+biermann_shock_compression_threshold = 2.0e-2
+biermann_subcycle = true
+biermann_subcycle_cfl = 0.15
+biermann_subcycle_max_steps = 100000
+biermann_reduced_closure = true
+
+<materials>
+nmaterials = 2
+scalar_index = 0
+material0_name = CH
+material0_abar = 6.5
+material0_zbar = 3.5
+material0_zeff = 5.285714285714286
+material1_name = He
+material1_abar = 4.002602
+material1_zbar = 2.0
+material1_zeff = 2.0
+
+material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch.2t_eos
+material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
+eos_mixing_rule = partial_density_additive
+eos_table_bounds = clamp
+eos_table_interpolation = geometric
+
+material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
+material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
+material0_opacity_interpolation = geometric
+material1_opacity_interpolation = geometric
+material0_opacity_coordinate_interpolation = log
+material1_opacity_coordinate_interpolation = log
+material0_opacity_density_scale = 1.0
+material1_opacity_density_scale = 1.0
+material0_opacity_temperature_scale = 1.160451812155008e7
+material1_opacity_temperature_scale = 1.160451812155008e7
+material0_opacity_group_bound_scale = 8.617333262145179e-8
+material1_opacity_group_bound_scale = 8.617333262145179e-8
+material0_opacity_transport_scale = 1.0e-2
+material1_opacity_transport_scale = 1.0e-2
+material0_opacity_absorption_scale = 1.0e-2
+material1_opacity_absorption_scale = 1.0e-2
+material0_opacity_emission_scale = 1.0e-2
+material1_opacity_emission_scale = 1.0e-2
 
 <thermal_radiation>
 enabled = true
-n_groups = 3
-arad = 5.0e-2
-c_light = 1.0
+n_groups = 20
+arad = 2.053993385399285e-1
+# Reduced light speed c/10.  Use 1.159953256903243e3 for physical c.
+c_light = 1.159953256903243e2
 initial_radiation_temperature = 2.0e-2
-flux_limiter = levermore-pomraning
+flux_limiter = harmonic
 flux_limit_coefficient = 1.0
-source_cfl = 0.2
+transport_discretization = asymptotic-preserving
+ap_streaming_threshold = 5.0e-1
+ap_optical_depth_threshold = 1.0
+source_cfl = 1.0e-1
 couple_matter = true
-opacity_model = constant
-group_bound_0 = 0.0
-group_bound_1 = 5.0e-2
-group_bound_2 = 5.0e-1
-group_bound_3 = 1.0e2
-kappa_transport_0 = 5.0e4
-kappa_transport_1 = 5.0e4
-kappa_transport_2 = 5.0e4
-kappa_absorption_0 = 2.0e2
-kappa_absorption_1 = 2.0e2
-kappa_absorption_2 = 2.0e2
-kappa_emission_0 = 2.0e2
-kappa_emission_1 = 2.0e2
-kappa_emission_2 = 2.0e2
+opacity_model = mixed-table
+group_bound_0 = 1.0e-3
+group_bound_1 = 1.0e-2
+group_bound_2 = 5.0e-2
+group_bound_3 = 1.0e-1
+group_bound_4 = 1.5e-1
+group_bound_5 = 2.5e-1
+group_bound_6 = 4.0e-1
+group_bound_7 = 5.5e-1
+group_bound_8 = 7.0e-1
+group_bound_9 = 9.0e-1
+group_bound_10 = 1.2
+group_bound_11 = 1.6
+group_bound_12 = 2.0
+group_bound_13 = 2.2
+group_bound_14 = 2.4
+group_bound_15 = 2.6
+group_bound_16 = 2.8
+group_bound_17 = 3.1
+group_bound_18 = 3.5
+group_bound_19 = 4.0
+group_bound_20 = 1.0e1
 
 <laser>
 model = straight
@@ -84,19 +174,16 @@ deposition_target = electron
 electron_temperature_model = two_temperature
 absorption_model = inverse_bremsstrahlung
 unit_system = cgs
-length_scale_cgs = 1.0e-2
-density_scale_cgs = 1.0
-temperature_scale_cgs = 1.160451812155008e7
-power_scale_cgs = 1.0e21
-electron_number_per_gram = 3.2430e23
 inverse_bremsstrahlung_coulomb_log = 5.0
+inverse_bremsstrahlung_temperature_floor = 1.160451812155008e4
 critical_reflection = true
 oblique_turning = true
-max_reflections_per_ray = 2
-reflection_offset_fraction = 1.0e-10
+max_reflections_per_ray = 64
+reflection_offset_fraction = 1.0e-5
+reflection_hysteresis_fraction = 1.0e-2
 nbeams = 1
 max_segments_per_launch = 64
-max_transport_iterations = 128
+max_transport_iterations = 256
 max_mpi_waves = 1024
 gpu_aware_mpi = false
 minimum_power_fraction = 1.0e-14
@@ -104,11 +191,14 @@ conservation_tolerance = 1.0e-10
 periodic_transport = false
 report_diagnostics = true
 
-# Positions and radii remain in code length.  Power and wavelength are cgs because
-# unit_system=cgs.  2e19 erg/s is 2 TW and maps to 0.02 code power.
-beam0_power = 2.0e19
+# Positions and radii are code length; power and wavelength are cgs.  This 3.45 GW
+# drive is 0.02 code power, preserving the original benchmark strength while keeping
+# the electron state below the 10-keV CH/He EOS-table ceiling.
+beam0_power = 3.4527937638889466e16
 beam0_wavelength = 3.51e-5
-beam0_nrays = 129
+# Golden-angle disk sampling: about three rays per transverse cell inside the aperture.
+beam0_nrays = 4096
+beam0_geometry = direction
 beam0_origin_x1 = -0.8
 beam0_origin_x2 = 0.0
 beam0_origin_x3 = 0.0
@@ -116,6 +206,7 @@ beam0_direction_x1 = 1.0
 beam0_direction_x2 = 0.0
 beam0_direction_x3 = 0.0
 beam0_radius = 0.32
+beam0_profile_radius = 0.32
 beam0_profile = gaussian
 beam0_zeff = 3.5
 beam0_start_time = 0.0
@@ -125,7 +216,7 @@ beam0_end_time = 1.2e-2
 user_hist = true
 ambient_density = 1.0e-4
 solid_density = 1.0
-temperature = 2.0e-2
+temperature_kelvin = 2.320903624310016e5
 target_surface = 5.0e-2
 transition_width = 6.0e-2
 corrugation_amplitude = 0.0
@@ -139,18 +230,21 @@ dt = 2.0e-3
 
 <output2>
 file_type = bin
+atomic_write = true
 variable = mhd_w_bcc
 id = fluid
 dt = 1.0e-2
 
 <output3>
 file_type = bin
+atomic_write = true
 variable = mhd_3t
 id = three_t
 dt = 1.0e-2
 
 <output4>
 file_type = bin
+atomic_write = true
 variable = laser
 id = laser
 dt = 1.0e-2

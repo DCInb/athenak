@@ -1,0 +1,79 @@
+# Fixed-temperature-boundary companion to implicit_conduction.athinput.  The perturbation
+# is a sum of discrete sine modes that vanish at the two x1 faces, while the background is
+# held by conduction-specific Dirichlet ghost values.  Two blocks permit a two-rank run.
+
+<job>
+basename = implicit_conduction_dirichlet
+
+<mesh>
+nghost = 3
+nx1 = 64
+x1min = 0.0
+x1max = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 1
+x2min = 0.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = 0.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 32
+nx2 = 1
+nx3 = 1
+
+<time>
+evolution = kinematic
+integrator = rk2
+cfl_number = 0.4
+nlim = 1
+tlim = 1.0e-1
+ndiag = 1
+initial_dt = 1.0e-1
+
+<hydro>
+eos = ideal
+reconstruct = dc
+rsolver = advect
+gamma = 1.6666666666666667
+two_temperature = true
+electron_heat_capacity_fraction = 5.0e-1
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+alpha_iso = 5.0e-2
+conduction_integrator = implicit
+conduction_theta = 1.0
+conduction_linear_tolerance = 1.0e-12
+conduction_nonlinear_tolerance = 1.0e-12
+conduction_max_iterations = 400
+conduction_max_nonlinear_iterations = 4
+conduction_flux_limiter = none
+conduction_x1_inner_boundary = dirichlet
+conduction_x1_outer_boundary = dirichlet
+conduction_x1_inner_value = 1.0
+conduction_x1_outer_value = 1.0
+conduction_report = true
+
+<units>
+length_cgs = 1.0
+mass_cgs = 1.0
+time_cgs = 1.0
+mu = 1.0
+
+<problem>
+boundary = dirichlet
+temperature_background = 1.0
+temperature_amplitude_1 = 1.5e-1
+temperature_amplitude_2 = 1.0e-1
+temperature_amplitude_3 = 5.0e-2
+mode_1 = 1
+mode_2 = 7
+mode_3 = 13
+error_tolerance = 2.0e-10
+conservation_tolerance = 2.0e-12

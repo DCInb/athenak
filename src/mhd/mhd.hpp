@@ -231,6 +231,9 @@ class MHD {
   // ...in the dedicated Biermann SSPRK2 stage task list
   TaskStatus BiermannInitRecv(Driver *d, int stage);
   TaskStatus BiermannCopyCons(Driver *d, int stage);
+  TaskStatus BiermannSendU(Driver *d, int stage);
+  TaskStatus BiermannRecvU(Driver *d, int stage);
+  int BiermannHaloNumVars() const;
   TaskStatus BiermannFluxes(Driver *d, int stage);
   TaskStatus BiermannSendFlux(Driver *d, int stage);
   TaskStatus BiermannRecvFlux(Driver *d, int stage);
