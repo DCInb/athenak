@@ -6,7 +6,7 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file material_mixture.hpp
-//! \brief Two-material ideal or separate-ion/electron tabular plasma closure.
+//! \brief Multi-material ideal or separate-ion/electron tabular plasma closure.
 
 #include <memory>
 #include <string>
@@ -25,6 +25,23 @@ struct SpeciesProperties {
   Real zbar = 1.0;  //!< Ideal-path mean number of free electrons per ion.
   Real zeff = 1.0;  //!< Separate collision model; IONMIX CN4 does not contain Zeff.
   Real t_ei = -1.0; //!< Ion-electron exchange time; negative disables exchange.
+};
+
+//! Largest supported component count.  Raising this costs device registers in every
+//! mixed-cell kernel, so it is deliberately the smallest value the decks require.
+constexpr int kMaxMaterials = 3;
+
+//----------------------------------------------------------------------------------------
+//! \struct MaterialComposition
+//! \brief Mass fractions of the active components, normalized to sum to one.
+//!
+//! The closure carries composition as this small fixed-capacity vector so that mixing
+//! rules are written once for any component count.  `count == 2` reproduces the original
+//! two-material scalar interface exactly, including floating-point association order.
+
+struct MaterialComposition {
+  Real y[kMaxMaterials] = {1.0, 0.0, 0.0};
+  int count = 1;
 };
 
 struct MaterialThermodynamicState {
@@ -92,7 +109,7 @@ struct MaterialTransientExchangeState {
 
 //----------------------------------------------------------------------------------------
 //! \struct MaterialMixtureDevice
-//! \brief Device-copyable two-material closure represented by rho*Y0.
+//! \brief Device-copyable closure represented by nmaterials-1 advected mass fractions.
 //!
 //! In tabular mode a mixed cell has one bulk velocity, one shared ion temperature, and
 //! one shared electron temperature.  The selected, explicit mixing rule is
@@ -107,10 +124,18 @@ struct MaterialTransientExchangeState {
 //! finite pressure for an absent material.
 
 struct MaterialMixtureDevice {
+  // material0/material1 remain named members so the two-material call sites and their
+  // exact arithmetic are untouched; index 2 onward live in the array below.
   SpeciesProperties material0;
   SpeciesProperties material1;
   IonmixTwoTemperatureTableDevice material0_table;
   IonmixTwoTemperatureTableDevice material1_table;
+  SpeciesProperties extra_material[kMaxMaterials-2];
+  IonmixTwoTemperatureTableDevice extra_material_table[kMaxMaterials-2];
+  //! Number of active components. Two selects the original scalar-composition paths.
+  int nmaterials = 2;
+  //! Absolute indices of the nmaterials-1 advected mass-fraction scalars.
+  int scalar_indices[kMaxMaterials-1] = {-1, -1};
   int scalar_index = -1;  //!< Absolute primitive/conserved variable index.
   bool use_tabular_eos = false;
   Real gamma_minus_one = 2.0/3.0;
@@ -119,6 +144,54 @@ struct MaterialMixtureDevice {
   Real wave_speed_safety = 1.05;
 
   static constexpr Real atomic_mass_unit_cgs = 1.660538921e-24;
+
+  //! Uniform indexed access to the named first two components and the array tail.
+  KOKKOS_INLINE_FUNCTION
+  const SpeciesProperties &Species(const int index) const {
+    if (index == 0) return material0;
+    if (index == 1) return material1;
+    return extra_material[index-2];
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  const IonmixTwoTemperatureTableDevice &SpeciesTable(const int index) const {
+    if (index == 0) return material0_table;
+    if (index == 1) return material1_table;
+    return extra_material_table[index-2];
+  }
+
+  //! Composition from the nmaterials-1 advected fractions; the final component is the
+  //! remainder.  Clamping each fraction and renormalizing keeps every mixing rule a
+  //! convex combination even where advection overshoots slightly.
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromFractions(const Real *fractions) const {
+    MaterialComposition result;
+    result.count = nmaterials;
+    Real assigned = 0.0;
+    for (int n = 0; n < nmaterials-1; ++n) {
+      const Real value = fmin(fmax(fractions[n], 0.0), 1.0);
+      result.y[n] = value;
+      assigned += value;
+    }
+    result.y[nmaterials-1] = 1.0-assigned;
+    if (!(result.y[nmaterials-1] >= 0.0)) {
+      // Overshoot: renormalize the supplied fractions and leave no remainder.
+      result.y[nmaterials-1] = 0.0;
+      const Real inverse = (assigned > 0.0) ? 1.0/assigned : 0.0;
+      for (int n = 0; n < nmaterials-1; ++n) result.y[n] *= inverse;
+    }
+    return result;
+  }
+
+  //! Two-material composition preserving the original y0/(1-y0) arithmetic exactly.
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromY0(const Real y0_in) const {
+    MaterialComposition result;
+    result.count = 2;
+    result.y[0] = ClampMassFraction(y0_in);
+    result.y[1] = 1.0-result.y[0];
+    return result;
+  }
 
  private:
   struct ComponentTemperatureState {
@@ -141,13 +214,11 @@ struct MaterialMixtureDevice {
   };
 
   struct MixedDensityCache {
-    SpeciesDensityCache material0;
-    SpeciesDensityCache material1;
+    SpeciesDensityCache material[kMaxMaterials];
   };
 
   struct MixedEnergyIntervalCache {
-    IonmixEnergyIntervalCache material0;
-    IonmixEnergyIntervalCache material1;
+    IonmixEnergyIntervalCache material[kMaxMaterials];
   };
 
   struct ComponentPairAtTemperature {
@@ -157,7 +228,7 @@ struct MaterialMixtureDevice {
 
   struct NativeMinimumTemperatureState {
     Real temperature = 0.0;
-    // Bit 0 marks material 0 and bit 1 marks material 1.
+    // Bit n marks material n.
     int material_mask = 0;
   };
 
@@ -186,23 +257,44 @@ struct MaterialMixtureDevice {
     return result;
   }
 
+  //! Additive partial-density mixing rule for any component count.  Accumulating left to
+  //! right reproduces the original two-material association exactly when count==2.
+  KOKKOS_INLINE_FUNCTION
+  ComponentAtTemperature MixtureComponentFromRhoTemperature(
+      const IonmixComponent component, const Real density,
+      const Real temperature, const MaterialComposition &mix) const {
+    ComponentAtTemperature result;
+    Real pressure = 0.0;
+    Real specific_internal_energy = 0.0;
+    int query_flags = ionmix_query_in_bounds;
+    Real representative_temperature = 0.0;
+    bool have_representative = false;
+    for (int n = 0; n < mix.count; ++n) {
+      const ComponentAtTemperature state = SpeciesComponent(
+          SpeciesTable(n), component, density*mix.y[n], temperature);
+      pressure += state.pressure;
+      specific_internal_energy += mix.y[n]*state.specific_internal_energy;
+      query_flags |= state.query_flags;
+      // The canonical temperature is that of the first present component; a component
+      // with zero mass fraction reports the requested temperature unchanged.
+      if (!have_representative && (mix.y[n] > 0.0 || n == mix.count-1)) {
+        representative_temperature = state.temperature;
+        have_representative = true;
+      }
+    }
+    result.temperature = representative_temperature;
+    result.pressure = pressure;
+    result.specific_internal_energy = specific_internal_energy;
+    result.query_flags = query_flags;
+    return result;
+  }
+
   KOKKOS_INLINE_FUNCTION
   ComponentAtTemperature MixtureComponentFromRhoTemperature(
       const IonmixComponent component, const Real density,
       const Real temperature, const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    const ComponentAtTemperature state0 = SpeciesComponent(
-        material0_table, component, density*y0, temperature);
-    const ComponentAtTemperature state1 = SpeciesComponent(
-        material1_table, component, density*y1, temperature);
-    ComponentAtTemperature result;
-    result.temperature = (y0 > 0.0) ? state0.temperature : state1.temperature;
-    result.pressure = state0.pressure+state1.pressure;
-    result.specific_internal_energy =
-        y0*state0.specific_internal_energy+y1*state1.specific_internal_energy;
-    result.query_flags = state0.query_flags | state1.query_flags;
-    return result;
+    return MixtureComponentFromRhoTemperature(
+        component, density, temperature, CompositionFromY0(y0_in));
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -248,20 +340,39 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   ComponentAtTemperature MixtureComponentFromCachedDensity(
       const IonmixComponent component, const Real density,
-      const Real temperature, const Real y0_in, MixedDensityCache &cache) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    const ComponentAtTemperature state0 = SpeciesComponentFromCachedDensity(
-        material0_table, component, density*y0, temperature, cache.material0);
-    const ComponentAtTemperature state1 = SpeciesComponentFromCachedDensity(
-        material1_table, component, density*y1, temperature, cache.material1);
+      const Real temperature, const MaterialComposition &mix,
+      MixedDensityCache &cache) const {
     ComponentAtTemperature result;
-    result.temperature = (y0 > 0.0) ? state0.temperature : state1.temperature;
-    result.pressure = state0.pressure+state1.pressure;
-    result.specific_internal_energy =
-        y0*state0.specific_internal_energy+y1*state1.specific_internal_energy;
-    result.query_flags = state0.query_flags | state1.query_flags;
+    Real pressure = 0.0;
+    Real specific_internal_energy = 0.0;
+    int query_flags = ionmix_query_in_bounds;
+    Real representative_temperature = 0.0;
+    bool have_representative = false;
+    for (int n = 0; n < mix.count; ++n) {
+      const ComponentAtTemperature state = SpeciesComponentFromCachedDensity(
+          SpeciesTable(n), component, density*mix.y[n], temperature,
+          cache.material[n]);
+      pressure += state.pressure;
+      specific_internal_energy += mix.y[n]*state.specific_internal_energy;
+      query_flags |= state.query_flags;
+      if (!have_representative && (mix.y[n] > 0.0 || n == mix.count-1)) {
+        representative_temperature = state.temperature;
+        have_representative = true;
+      }
+    }
+    result.temperature = representative_temperature;
+    result.pressure = pressure;
+    result.specific_internal_energy = specific_internal_energy;
+    result.query_flags = query_flags;
     return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ComponentAtTemperature MixtureComponentFromCachedDensity(
+      const IonmixComponent component, const Real density,
+      const Real temperature, const Real y0_in, MixedDensityCache &cache) const {
+    return MixtureComponentFromCachedDensity(
+        component, density, temperature, CompositionFromY0(y0_in), cache);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -280,20 +391,18 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   Real MixtureComponentEnergyFromCachedDensity(
       const IonmixComponent component, const Real temperature,
-      const Real y0_in, const MixedDensityCache &density_cache,
+      const MaterialComposition &mix, const MixedDensityCache &density_cache,
       MixedEnergyIntervalCache &energy_cache) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    // Both material tables receive the same rounded exp(log_trial).  Evaluate its
+    // Every material table receives the same rounded exp(log_trial).  Evaluate its
     // logarithm once while preserving the legacy exp-then-log inverse trajectory.
     const Real log_temperature = log(temperature);
-    const Real energy0 = SpeciesComponentEnergyFromCachedDensity(
-        material0_table, component, temperature, log_temperature,
-        density_cache.material0, energy_cache.material0);
-    const Real energy1 = SpeciesComponentEnergyFromCachedDensity(
-        material1_table, component, temperature, log_temperature,
-        density_cache.material1, energy_cache.material1);
-    return y0*energy0+y1*energy1;
+    Real energy = 0.0;
+    for (int n = 0; n < mix.count; ++n) {
+      energy += mix.y[n]*SpeciesComponentEnergyFromCachedDensity(
+          SpeciesTable(n), component, temperature, log_temperature,
+          density_cache.material[n], energy_cache.material[n]);
+    }
+    return energy;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -319,19 +428,32 @@ struct MaterialMixtureDevice {
 
   KOKKOS_INLINE_FUNCTION
   ComponentTemperatureState MixtureTemperatureFromRhoTemperature(
-      const Real density, const Real temperature, const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    const ComponentTemperatureState state0 =
-        SpeciesTemperatureFromRhoTemperature(
-            material0_table, density*y0, temperature);
-    const ComponentTemperatureState state1 =
-        SpeciesTemperatureFromRhoTemperature(
-            material1_table, density*y1, temperature);
+      const Real density, const Real temperature,
+      const MaterialComposition &mix) const {
     ComponentTemperatureState result;
-    result.temperature = (y0 > 0.0) ? state0.temperature : state1.temperature;
-    result.query_flags = state0.query_flags | state1.query_flags;
+    int query_flags = ionmix_query_in_bounds;
+    Real representative_temperature = 0.0;
+    bool have_representative = false;
+    for (int n = 0; n < mix.count; ++n) {
+      const ComponentTemperatureState state =
+          SpeciesTemperatureFromRhoTemperature(
+              SpeciesTable(n), density*mix.y[n], temperature);
+      query_flags |= state.query_flags;
+      if (!have_representative && (mix.y[n] > 0.0 || n == mix.count-1)) {
+        representative_temperature = state.temperature;
+        have_representative = true;
+      }
+    }
+    result.temperature = representative_temperature;
+    result.query_flags = query_flags;
     return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ComponentTemperatureState MixtureTemperatureFromRhoTemperature(
+      const Real density, const Real temperature, const Real y0_in) const {
+    return MixtureTemperatureFromRhoTemperature(
+        density, temperature, CompositionFromY0(y0_in));
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -363,26 +485,29 @@ struct MaterialMixtureDevice {
 
   KOKKOS_INLINE_FUNCTION
   MaterialPressureEnergyState TabularPressureEnergyFromRhoTemperature(
-      const Real density, const Real temperature, const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    const MaterialPressureEnergyState state0 =
-        SpeciesPressureEnergyFromRhoTemperature(
-            material0_table, density*y0, temperature);
-    const MaterialPressureEnergyState state1 =
-        SpeciesPressureEnergyFromRhoTemperature(
-            material1_table, density*y1, temperature);
+      const Real density, const Real temperature,
+      const MaterialComposition &mix) const {
     MaterialPressureEnergyState result;
-    result.ion_pressure = state0.ion_pressure+state1.ion_pressure;
-    result.electron_pressure = state0.electron_pressure+state1.electron_pressure;
-    result.ion_specific_internal_energy =
-        y0*state0.ion_specific_internal_energy+
-        y1*state1.ion_specific_internal_energy;
-    result.electron_specific_internal_energy =
-        y0*state0.electron_specific_internal_energy+
-        y1*state1.electron_specific_internal_energy;
-    result.query_flags = state0.query_flags | state1.query_flags;
+    for (int n = 0; n < mix.count; ++n) {
+      const MaterialPressureEnergyState state =
+          SpeciesPressureEnergyFromRhoTemperature(
+              SpeciesTable(n), density*mix.y[n], temperature);
+      result.ion_pressure += state.ion_pressure;
+      result.electron_pressure += state.electron_pressure;
+      result.ion_specific_internal_energy +=
+          mix.y[n]*state.ion_specific_internal_energy;
+      result.electron_specific_internal_energy +=
+          mix.y[n]*state.electron_specific_internal_energy;
+      result.query_flags |= state.query_flags;
+    }
     return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialPressureEnergyState TabularPressureEnergyFromRhoTemperature(
+      const Real density, const Real temperature, const Real y0_in) const {
+    return TabularPressureEnergyFromRhoTemperature(
+        density, temperature, CompositionFromY0(y0_in));
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -431,32 +556,64 @@ struct MaterialMixtureDevice {
 
   KOKKOS_INLINE_FUNCTION
   MaterialPressureEnergyState TabularPressureEnergyFromRhoNativeMinimum(
+      const Real density, const Real temperature, const MaterialComposition &mix,
+      const int native_material_mask) const {
+    MaterialPressureEnergyState result;
+    for (int n = 0; n < mix.count; ++n) {
+      const MaterialPressureEnergyState state =
+          ((native_material_mask & (1 << n)) != 0)
+          ? SpeciesPressureEnergyFromRhoMinimumTemperature(
+                SpeciesTable(n), density*mix.y[n])
+          : SpeciesPressureEnergyFromRhoTemperature(
+                SpeciesTable(n), density*mix.y[n], temperature);
+      result.ion_pressure += state.ion_pressure;
+      result.electron_pressure += state.electron_pressure;
+      result.ion_specific_internal_energy +=
+          mix.y[n]*state.ion_specific_internal_energy;
+      result.electron_specific_internal_energy +=
+          mix.y[n]*state.electron_specific_internal_energy;
+      result.query_flags |= state.query_flags;
+    }
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialPressureEnergyState TabularPressureEnergyFromRhoNativeMinimum(
       const Real density, const Real temperature, const Real y0_in,
       const int native_material_mask) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    const MaterialPressureEnergyState state0 =
-        ((native_material_mask & 1) != 0)
-        ? SpeciesPressureEnergyFromRhoMinimumTemperature(
-              material0_table, density*y0)
-        : SpeciesPressureEnergyFromRhoTemperature(
-              material0_table, density*y0, temperature);
-    const MaterialPressureEnergyState state1 =
-        ((native_material_mask & 2) != 0)
-        ? SpeciesPressureEnergyFromRhoMinimumTemperature(
-              material1_table, density*y1)
-        : SpeciesPressureEnergyFromRhoTemperature(
-              material1_table, density*y1, temperature);
+    return TabularPressureEnergyFromRhoNativeMinimum(
+        density, temperature, CompositionFromY0(y0_in), native_material_mask);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialPressureEnergyState IdealPressureEnergyFromRhoTemperatures(
+      const Real density, const Real ion_temperature,
+      const Real electron_temperature, const MaterialComposition &mix) const {
+    const Real fe = ElectronHeatCapacityFraction(mix);
+    const Real fi = 1.0-fe;
     MaterialPressureEnergyState result;
-    result.ion_pressure = state0.ion_pressure+state1.ion_pressure;
-    result.electron_pressure = state0.electron_pressure+state1.electron_pressure;
-    result.ion_specific_internal_energy =
-        y0*state0.ion_specific_internal_energy+
-        y1*state1.ion_specific_internal_energy;
+    result.ion_specific_internal_energy = fi*ion_temperature/gamma_minus_one;
     result.electron_specific_internal_energy =
-        y0*state0.electron_specific_internal_energy+
-        y1*state1.electron_specific_internal_energy;
-    result.query_flags = state0.query_flags | state1.query_flags;
+        fe*electron_temperature/gamma_minus_one;
+    result.ion_pressure = density*fi*ion_temperature;
+    result.electron_pressure = density*fe*electron_temperature;
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialPressureEnergyState TabularPressureEnergyFromRhoTemperatures(
+      const Real density, const Real ion_temperature,
+      const Real electron_temperature, const MaterialComposition &mix) const {
+    const ComponentAtTemperature ion = MixtureComponentFromRhoTemperature(
+        IonmixComponent::ion, density, ion_temperature, mix);
+    const ComponentAtTemperature electron = MixtureComponentFromRhoTemperature(
+        IonmixComponent::electron, density, electron_temperature, mix);
+    MaterialPressureEnergyState result;
+    result.ion_pressure = ion.pressure;
+    result.electron_pressure = electron.pressure;
+    result.ion_specific_internal_energy = ion.specific_internal_energy;
+    result.electron_specific_internal_energy = electron.specific_internal_energy;
+    result.query_flags = ion.query_flags | electron.query_flags;
     return result;
   }
 
@@ -478,68 +635,123 @@ struct MaterialMixtureDevice {
 
   KOKKOS_INLINE_FUNCTION
   Real CommonMinimumTemperature() const {
-    return fmax(material0_table.MinimumTemperatureCode(),
-                material1_table.MinimumTemperatureCode());
+    Real result = SpeciesTable(0).MinimumTemperatureCode();
+    for (int n = 1; n < nmaterials; ++n) {
+      result = fmax(result, SpeciesTable(n).MinimumTemperatureCode());
+    }
+    return result;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real CommonMaximumTemperature() const {
-    return fmin(material0_table.MaximumTemperatureCode(),
-                material1_table.MaximumTemperatureCode());
+    Real result = SpeciesTable(0).MaximumTemperatureCode();
+    for (int n = 1; n < nmaterials; ++n) {
+      result = fmin(result, SpeciesTable(n).MaximumTemperatureCode());
+    }
+    return result;
+  }
+
+  //! The valid shared-temperature window is set only by the components actually present,
+  //! so a pure cell keeps its own table's full range.
+  KOKKOS_INLINE_FUNCTION
+  Real MinimumTemperatureForComposition(const MaterialComposition &mix) const {
+    Real result = 0.0;
+    bool have_any = false;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
+      const Real value = SpeciesTable(n).MinimumTemperatureCode();
+      result = have_any ? fmax(result, value) : value;
+      have_any = true;
+    }
+    return have_any ? result : CommonMinimumTemperature();
   }
 
   KOKKOS_INLINE_FUNCTION
   Real MinimumTemperatureForComposition(const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    if (y0 >= 1.0) return material0_table.MinimumTemperatureCode();
-    if (y0 <= 0.0) return material1_table.MinimumTemperatureCode();
-    return CommonMinimumTemperature();
+    return MinimumTemperatureForComposition(CompositionFromY0(y0_in));
+  }
+
+  //! Mark every present component whose own table minimum equals the shared minimum, so
+  //! the caller can evaluate those on their native minimum-temperature surface.
+  KOKKOS_INLINE_FUNCTION
+  NativeMinimumTemperatureState NativeMinimumTemperatureForComposition(
+      const MaterialComposition &mix) const {
+    NativeMinimumTemperatureState result;
+    result.temperature = MinimumTemperatureForComposition(mix);
+    bool any_present = false;
+    for (int n = 0; n < mix.count; ++n) {
+      if (mix.y[n] > 0.0) any_present = true;
+    }
+    for (int n = 0; n < mix.count; ++n) {
+      if (any_present && !(mix.y[n] > 0.0)) continue;
+      if (SpeciesTable(n).MinimumTemperatureCode() == result.temperature) {
+        result.material_mask |= (1 << n);
+      }
+    }
+    return result;
   }
 
   KOKKOS_INLINE_FUNCTION
   NativeMinimumTemperatureState NativeMinimumTemperatureForComposition(
       const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    NativeMinimumTemperatureState result;
-    if (y0 >= 1.0) {
-      result.temperature = material0_table.MinimumTemperatureCode();
-      result.material_mask = 1;
-      return result;
+    return NativeMinimumTemperatureForComposition(CompositionFromY0(y0_in));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MaximumTemperatureForComposition(const MaterialComposition &mix) const {
+    Real result = 0.0;
+    bool have_any = false;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
+      const Real value = SpeciesTable(n).MaximumTemperatureCode();
+      result = have_any ? fmin(result, value) : value;
+      have_any = true;
     }
-    if (y0 <= 0.0) {
-      result.temperature = material1_table.MinimumTemperatureCode();
-      result.material_mask = 2;
-      return result;
-    }
-    const Real material0_minimum = material0_table.MinimumTemperatureCode();
-    const Real material1_minimum = material1_table.MinimumTemperatureCode();
-    result.temperature = fmax(material0_minimum, material1_minimum);
-    if (result.temperature == material0_minimum) result.material_mask |= 1;
-    if (result.temperature == material1_minimum) result.material_mask |= 2;
-    return result;
+    return have_any ? result : CommonMaximumTemperature();
   }
 
   KOKKOS_INLINE_FUNCTION
   Real MaximumTemperatureForComposition(const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    if (y0 >= 1.0) return material0_table.MaximumTemperatureCode();
-    if (y0 <= 0.0) return material1_table.MaximumTemperatureCode();
-    return CommonMaximumTemperature();
+    return MaximumTemperatureForComposition(CompositionFromY0(y0_in));
+  }
+
+  //! Index of the single present component, or -1 when the cell is genuinely mixed.
+  KOKKOS_INLINE_FUNCTION
+  int PureComponentIndex(const MaterialComposition &mix) const {
+    int found = -1;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
+      if (found >= 0) return -1;
+      found = n;
+    }
+    // All fractions zero cannot happen for a normalized composition, but treat it as the
+    // last component so callers still have a well-defined pure table.
+    return (found >= 0) ? found : mix.count-1;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  bool AnyTableUsesErrorBounds(const MaterialComposition &mix) const {
+    for (int n = 0; n < mix.count; ++n) {
+      if (SpeciesTable(n).bounds_error != 0) return true;
+    }
+    return false;
   }
 
   KOKKOS_INLINE_FUNCTION
   ComponentAtTemperature MixtureComponentFromRhoSpecificEnergyCached(
       const IonmixComponent component, const Real density,
-      const Real target_energy, const Real y0, MixedDensityCache &cache) const {
+      const Real target_energy, const MaterialComposition &mix,
+      MixedDensityCache &cache) const {
     if (!Kokkos::isfinite(target_energy)) {
       Kokkos::abort("Mixed IONMIX inverse energy must be finite.");
     }
     const int energy_low_flag = ionmix_energy_below_table;
     const int energy_high_flag = ionmix_energy_above_table;
-    const Real fraction0 = ClampMassFraction(y0);
-    if (fraction0 >= 1.0) {
+    // A cell of one pure material uses that table's own logarithmic inverse directly.
+    const int pure_index = PureComponentIndex(mix);
+    if (pure_index >= 0) {
       const IonmixComponentState state =
-          material0_table.ComponentFromRhoSpecificEnergy(
+          SpeciesTable(pure_index).ComponentFromRhoSpecificEnergy(
               component, density, target_energy);
       ComponentAtTemperature result;
       result.temperature = state.temperature;
@@ -548,25 +760,13 @@ struct MaterialMixtureDevice {
       result.query_flags = state.query_flags;
       return result;
     }
-    if (fraction0 <= 0.0) {
-      const IonmixComponentState state =
-          material1_table.ComponentFromRhoSpecificEnergy(
-              component, density, target_energy);
-      ComponentAtTemperature result;
-      result.temperature = state.temperature;
-      result.pressure = state.pressure;
-      result.specific_internal_energy = state.specific_internal_energy;
-      result.query_flags = state.query_flags;
-      return result;
-    }
-    const bool error_bounds = material0_table.bounds_error != 0 ||
-                              material1_table.bounds_error != 0;
-    const Real minimum_temperature = MinimumTemperatureForComposition(y0);
-    const Real maximum_temperature = MaximumTemperatureForComposition(y0);
+    const bool error_bounds = AnyTableUsesErrorBounds(mix);
+    const Real minimum_temperature = MinimumTemperatureForComposition(mix);
+    const Real maximum_temperature = MaximumTemperatureForComposition(mix);
     ComponentAtTemperature minimum = MixtureComponentFromCachedDensity(
-        component, density, minimum_temperature, y0, cache);
+        component, density, minimum_temperature, mix, cache);
     ComponentAtTemperature maximum = MixtureComponentFromCachedDensity(
-        component, density, maximum_temperature, y0, cache);
+        component, density, maximum_temperature, mix, cache);
     if (target_energy < minimum.specific_internal_energy) {
       if (error_bounds) {
         Kokkos::abort("Mixed IONMIX inverse energy is below the table range.");
@@ -582,9 +782,9 @@ struct MaterialMixtureDevice {
       return maximum;
     }
 
-    // A mass-weighted sum of two geometric surfaces is not itself geometric.  A short
+    // A mass-weighted sum of geometric surfaces is not itself geometric.  A short
     // safeguarded log-temperature bisection preserves the exact forward rule and also
-    // supports CH/He tables with different native temperature grids.
+    // supports component tables with different native temperature grids.
     //
     // The fixed iteration count with no convergence test looks wasteful and was the
     // target of card A1.  It was replaced with a bracketed false-position solver, gated,
@@ -598,7 +798,7 @@ struct MaterialMixtureDevice {
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real log_trial = 0.5*(log_low+log_high);
       const Real trial_energy = MixtureComponentEnergyFromCachedDensity(
-          component, exp(log_trial), y0, cache, energy_cache);
+          component, exp(log_trial), mix, cache, energy_cache);
       if (trial_energy < target_energy) {
         log_low = log_trial;
       } else {
@@ -606,7 +806,24 @@ struct MaterialMixtureDevice {
       }
     }
     return MixtureComponentFromCachedDensity(
-        component, density, exp(0.5*(log_low+log_high)), y0, cache);
+        component, density, exp(0.5*(log_low+log_high)), mix, cache);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ComponentAtTemperature MixtureComponentFromRhoSpecificEnergyCached(
+      const IonmixComponent component, const Real density,
+      const Real target_energy, const Real y0, MixedDensityCache &cache) const {
+    return MixtureComponentFromRhoSpecificEnergyCached(
+        component, density, target_energy, CompositionFromY0(y0), cache);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ComponentAtTemperature MixtureComponentFromRhoSpecificEnergy(
+      const IonmixComponent component, const Real density,
+      const Real target_energy, const MaterialComposition &mix) const {
+    MixedDensityCache cache;
+    return MixtureComponentFromRhoSpecificEnergyCached(
+        component, density, target_energy, mix, cache);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -615,7 +832,7 @@ struct MaterialMixtureDevice {
       const Real target_energy, const Real y0) const {
     MixedDensityCache cache;
     return MixtureComponentFromRhoSpecificEnergyCached(
-        component, density, target_energy, y0, cache);
+        component, density, target_energy, CompositionFromY0(y0), cache);
   }
 
   // Recover the bounds flags of an inverse query without solving for its in-range
@@ -624,40 +841,32 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   int MixtureComponentSpecificEnergyQueryFlagsCached(
       const IonmixComponent component, const Real density,
-      const Real target_energy, const Real y0, MixedDensityCache &cache) const {
+      const Real target_energy, const MaterialComposition &mix,
+      MixedDensityCache &cache) const {
     if (!Kokkos::isfinite(target_energy)) {
       Kokkos::abort("Mixed IONMIX inverse energy must be finite.");
     }
-    const Real fraction0 = ClampMassFraction(y0);
-    if (fraction0 >= 1.0) {
+    const int pure_index = PureComponentIndex(mix);
+    if (pure_index >= 0) {
       const IonmixComponentState inverse =
-          material0_table.ComponentFromRhoSpecificEnergy(
+          SpeciesTable(pure_index).ComponentFromRhoSpecificEnergy(
               component, density, target_energy);
       const ComponentAtTemperature forward = MixtureComponentFromRhoTemperature(
-          component, density, inverse.temperature, y0);
-      return inverse.query_flags | forward.query_flags;
-    }
-    if (fraction0 <= 0.0) {
-      const IonmixComponentState inverse =
-          material1_table.ComponentFromRhoSpecificEnergy(
-              component, density, target_energy);
-      const ComponentAtTemperature forward = MixtureComponentFromRhoTemperature(
-          component, density, inverse.temperature, y0);
+          component, density, inverse.temperature, mix);
       return inverse.query_flags | forward.query_flags;
     }
     const ComponentAtTemperature minimum = MixtureComponentFromCachedDensity(
-        component, density, MinimumTemperatureForComposition(y0), y0, cache);
+        component, density, MinimumTemperatureForComposition(mix), mix, cache);
     const ComponentAtTemperature maximum = MixtureComponentFromCachedDensity(
-        component, density, MaximumTemperatureForComposition(y0), y0, cache);
+        component, density, MaximumTemperatureForComposition(mix), mix, cache);
     const int query_flags = minimum.query_flags | maximum.query_flags;
-    const bool error_bounds = material0_table.bounds_error != 0 ||
-                              material1_table.bounds_error != 0;
+    const bool error_bounds = AnyTableUsesErrorBounds(mix);
     if (target_energy < minimum.specific_internal_energy) {
       if (error_bounds) {
         Kokkos::abort("Mixed IONMIX inverse energy is below the table range.");
       }
       const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
-          density, minimum.temperature, y0).query_flags;
+          density, minimum.temperature, mix).query_flags;
       return minimum.query_flags | forward_query_flags |
              ionmix_energy_below_table;
     } else if (target_energy > maximum.specific_internal_energy) {
@@ -665,18 +874,18 @@ struct MaterialMixtureDevice {
         Kokkos::abort("Mixed IONMIX inverse energy is above the table range.");
       }
       const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
-          density, maximum.temperature, y0).query_flags;
+          density, maximum.temperature, mix).query_flags;
       return maximum.query_flags | forward_query_flags |
              ionmix_energy_above_table;
     }
     if (target_energy == minimum.specific_internal_energy) {
       const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
-          density, minimum.temperature, y0).query_flags;
+          density, minimum.temperature, mix).query_flags;
       return minimum.query_flags | forward_query_flags;
     }
     if (target_energy == maximum.specific_internal_energy) {
       const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
-          density, maximum.temperature, y0).query_flags;
+          density, maximum.temperature, mix).query_flags;
       return maximum.query_flags | forward_query_flags;
     }
     constexpr int density_query_flags =
@@ -685,24 +894,66 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  int MixtureComponentSpecificEnergyQueryFlagsCached(
+      const IonmixComponent component, const Real density,
+      const Real target_energy, const Real y0, MixedDensityCache &cache) const {
+    return MixtureComponentSpecificEnergyQueryFlagsCached(
+        component, density, target_energy, CompositionFromY0(y0), cache);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  int MixtureComponentSpecificEnergyQueryFlags(
+      const IonmixComponent component, const Real density,
+      const Real target_energy, const MaterialComposition &mix) const {
+    MixedDensityCache cache;
+    return MixtureComponentSpecificEnergyQueryFlagsCached(
+        component, density, target_energy, mix, cache);
+  }
+
+  KOKKOS_INLINE_FUNCTION
   int MixtureComponentSpecificEnergyQueryFlags(
       const IonmixComponent component, const Real density,
       const Real target_energy, const Real y0) const {
     MixedDensityCache cache;
     return MixtureComponentSpecificEnergyQueryFlagsCached(
-        component, density, target_energy, y0, cache);
+        component, density, target_energy, CompositionFromY0(y0), cache);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  ComponentPairAtTemperature MixtureComponentsFromRhoSpecificEnergies(
+      const Real density, const Real ion_specific_energy,
+      const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    MixedDensityCache cache;
+    ComponentPairAtTemperature result;
+    result.ion = MixtureComponentFromRhoSpecificEnergyCached(
+        IonmixComponent::ion, density, ion_specific_energy, mix, cache);
+    result.electron = MixtureComponentFromRhoSpecificEnergyCached(
+        IonmixComponent::electron, density, electron_specific_energy, mix, cache);
+    return result;
   }
 
   KOKKOS_INLINE_FUNCTION
   ComponentPairAtTemperature MixtureComponentsFromRhoSpecificEnergies(
       const Real density, const Real ion_specific_energy,
       const Real electron_specific_energy, const Real y0) const {
-    MixedDensityCache cache;
-    ComponentPairAtTemperature result;
-    result.ion = MixtureComponentFromRhoSpecificEnergyCached(
-        IonmixComponent::ion, density, ion_specific_energy, y0, cache);
-    result.electron = MixtureComponentFromRhoSpecificEnergyCached(
-        IonmixComponent::electron, density, electron_specific_energy, y0, cache);
+    return MixtureComponentsFromRhoSpecificEnergies(
+        density, ion_specific_energy, electron_specific_energy,
+        CompositionFromY0(y0));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real TabularElectronNumberPerAtomicMass(
+      const Real density, const Real electron_temperature,
+      const MaterialComposition &mix) const {
+    Real result = 0.0;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
+      const IonmixTwoTemperatureTableDevice &table = SpeciesTable(n);
+      const Real rho = fmax(density*mix.y[n], table.MinimumDensityCode());
+      result += mix.y[n]*table.MeanIonizationFromRhoTemperature(
+                    rho, electron_temperature)/Species(n).abar;
+    }
     return result;
   }
 
@@ -710,56 +961,45 @@ struct MaterialMixtureDevice {
   Real TabularElectronNumberPerAtomicMass(
       const Real density, const Real electron_temperature,
       const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    Real result = 0.0;
-    if (y0 > 0.0) {
-      const Real rho0 = fmax(density*y0, material0_table.MinimumDensityCode());
-      result += y0*material0_table.MeanIonizationFromRhoTemperature(
-                       rho0, electron_temperature)/material0.abar;
+    return TabularElectronNumberPerAtomicMass(
+        density, electron_temperature, CompositionFromY0(y0_in));
+  }
+
+  //! Electron-density-weighted mean of each component's ionization-scaled Zeff.
+  KOKKOS_INLINE_FUNCTION
+  Real TabularEffectiveCharge(const Real density, const Real electron_temperature,
+                              const MaterialComposition &mix) const {
+    Real electron_weight = 0.0;
+    Real charge_weight = 0.0;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
+      const IonmixTwoTemperatureTableDevice &table = SpeciesTable(n);
+      const SpeciesProperties &species = Species(n);
+      const Real rho = fmax(density*mix.y[n], table.MinimumDensityCode());
+      const Real zbar = table.MeanIonizationFromRhoTemperature(
+          rho, electron_temperature);
+      const Real ne = mix.y[n]*zbar/species.abar;
+      electron_weight += ne;
+      charge_weight += ne*(species.zeff/species.zbar)*zbar;
     }
-    if (y1 > 0.0) {
-      const Real rho1 = fmax(density*y1, material1_table.MinimumDensityCode());
-      result += y1*material1_table.MeanIonizationFromRhoTemperature(
-                       rho1, electron_temperature)/material1.abar;
-    }
-    return result;
+    return (electron_weight > 0.0) ? charge_weight/electron_weight : 0.0;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real TabularEffectiveCharge(const Real density, const Real electron_temperature,
                               const Real y0_in) const {
-    const Real y0 = ClampMassFraction(y0_in);
-    const Real y1 = 1.0-y0;
-    Real ne0 = 0.0, ne1 = 0.0;
-    Real zeff0 = 0.0, zeff1 = 0.0;
-    if (y0 > 0.0) {
-      const Real rho0 = fmax(density*y0, material0_table.MinimumDensityCode());
-      const Real zbar0 = material0_table.MeanIonizationFromRhoTemperature(
-          rho0, electron_temperature);
-      ne0 = y0*zbar0/material0.abar;
-      zeff0 = (material0.zeff/material0.zbar)*zbar0;
-    }
-    if (y1 > 0.0) {
-      const Real rho1 = fmax(density*y1, material1_table.MinimumDensityCode());
-      const Real zbar1 = material1_table.MeanIonizationFromRhoTemperature(
-          rho1, electron_temperature);
-      ne1 = y1*zbar1/material1.abar;
-      zeff1 = (material1.zeff/material1.zbar)*zbar1;
-    }
-    return (ne0+ne1 > 0.0)
-               ? (ne0*zeff0+ne1*zeff1)/(ne0+ne1)
-               : 0.0;
+    return TabularEffectiveCharge(
+        density, electron_temperature, CompositionFromY0(y0_in));
   }
 
   KOKKOS_INLINE_FUNCTION
   MaterialThermodynamicState TabularStateNoSound(
       const Real density, const Real ion_temperature,
-      const Real electron_temperature, const Real y0) const {
+      const Real electron_temperature, const MaterialComposition &mix) const {
     const ComponentAtTemperature ion = MixtureComponentFromRhoTemperature(
-        IonmixComponent::ion, density, ion_temperature, y0);
+        IonmixComponent::ion, density, ion_temperature, mix);
     const ComponentAtTemperature electron = MixtureComponentFromRhoTemperature(
-        IonmixComponent::electron, density, electron_temperature, y0);
+        IonmixComponent::electron, density, electron_temperature, mix);
     MaterialThermodynamicState result;
     result.ion_temperature = ion.temperature;
     result.electron_temperature = electron.temperature;
@@ -767,34 +1007,21 @@ struct MaterialMixtureDevice {
     result.electron_pressure = electron.pressure;
     result.ion_specific_internal_energy = ion.specific_internal_energy;
     result.electron_specific_internal_energy = electron.specific_internal_energy;
-    const Real fraction0 = ClampMassFraction(y0);
-    const Real fraction1 = 1.0-fraction0;
     Real electron_weight = 0.0;
     Real ion_weight = 0.0;
     Real effective_charge_weight = 0.0;
-    if (fraction0 > 0.0) {
-      const Real rho0 = fmax(
-          density*fraction0, material0_table.MinimumDensityCode());
-      const Real zbar0 = material0_table.MeanIonizationFromRhoTemperature(
-          rho0, electron.temperature);
-      const Real electron_weight0 = fraction0*zbar0/material0.abar;
-      const Real effective_charge0 =
-          (material0.zeff/material0.zbar)*zbar0;
-      electron_weight += electron_weight0;
-      ion_weight += fraction0/material0.abar;
-      effective_charge_weight += electron_weight0*effective_charge0;
-    }
-    if (fraction1 > 0.0) {
-      const Real rho1 = fmax(
-          density*fraction1, material1_table.MinimumDensityCode());
-      const Real zbar1 = material1_table.MeanIonizationFromRhoTemperature(
-          rho1, electron.temperature);
-      const Real electron_weight1 = fraction1*zbar1/material1.abar;
-      const Real effective_charge1 =
-          (material1.zeff/material1.zbar)*zbar1;
-      electron_weight += electron_weight1;
-      ion_weight += fraction1/material1.abar;
-      effective_charge_weight += electron_weight1*effective_charge1;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
+      const IonmixTwoTemperatureTableDevice &table = SpeciesTable(n);
+      const SpeciesProperties &species = Species(n);
+      const Real rho = fmax(density*mix.y[n], table.MinimumDensityCode());
+      const Real zbar = table.MeanIonizationFromRhoTemperature(
+          rho, electron.temperature);
+      const Real component_electron_weight = mix.y[n]*zbar/species.abar;
+      electron_weight += component_electron_weight;
+      ion_weight += mix.y[n]/species.abar;
+      effective_charge_weight += component_electron_weight*
+          (species.zeff/species.zbar)*zbar;
     }
     result.mean_ionization = (ion_weight > 0.0)
         ? electron_weight/ion_weight : 0.0;
@@ -807,24 +1034,27 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  MaterialThermodynamicState TabularStateNoSound(
+      const Real density, const Real ion_temperature,
+      const Real electron_temperature, const Real y0) const {
+    return TabularStateNoSound(density, ion_temperature, electron_temperature,
+                               CompositionFromY0(y0));
+  }
+
+  KOKKOS_INLINE_FUNCTION
   Real TabularSoundSpeedSquared(const Real density, const Real ion_temperature,
                                 const Real electron_temperature,
                                 const Real ion_pressure,
                                 const Real electron_pressure,
-                                const Real y0) const {
+                                const MaterialComposition &mix) const {
     constexpr Real log_step = 1.0e-3;
     const Real density_low = density*exp(-log_step);
     Real density_high = density*exp(log_step);
-    const Real fraction0 = ClampMassFraction(y0);
-    const Real fraction1 = 1.0-fraction0;
     Real maximum_density = Kokkos::Experimental::infinity<Real>::value;
-    if (fraction0 > 0.0) {
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix.y[n] > 0.0)) continue;
       maximum_density = fmin(
-          maximum_density, material0_table.MaximumDensityCode()/fraction0);
-    }
-    if (fraction1 > 0.0) {
-      maximum_density = fmin(
-          maximum_density, material1_table.MaximumDensityCode()/fraction1);
+          maximum_density, SpeciesTable(n).MaximumDensityCode()/mix.y[n]);
     }
     density_high = fmin(density_high, maximum_density);
 
@@ -842,17 +1072,17 @@ struct MaterialMixtureDevice {
       const Real center_pressure = (component_index == 0)
           ? ion_pressure : electron_pressure;
       const Real temperature_low = fmax(
-          temperature*exp(-log_step), MinimumTemperatureForComposition(y0));
+          temperature*exp(-log_step), MinimumTemperatureForComposition(mix));
       const Real temperature_high = fmin(
-          temperature*exp(log_step), MaximumTemperatureForComposition(y0));
+          temperature*exp(log_step), MaximumTemperatureForComposition(mix));
       const ComponentAtTemperature rho_low = MixtureComponentFromRhoTemperature(
-          component, density_low, temperature, y0);
+          component, density_low, temperature, mix);
       const ComponentAtTemperature rho_high = MixtureComponentFromRhoTemperature(
-          component, density_high, temperature, y0);
+          component, density_high, temperature, mix);
       const ComponentAtTemperature temp_low = MixtureComponentFromRhoTemperature(
-          component, density, temperature_low, y0);
+          component, density, temperature_low, mix);
       const ComponentAtTemperature temp_high = MixtureComponentFromRhoTemperature(
-          component, density, temperature_high, y0);
+          component, density, temperature_high, mix);
       const Real density_span = density_high-density_low;
       const Real temperature_span = temperature_high-temperature_low;
       if (!(density_span > 0.0) || !(temperature_span > 0.0)) continue;
@@ -876,6 +1106,17 @@ struct MaterialMixtureDevice {
     return SQR(wave_speed_safety)*sound_speed_squared;
   }
 
+  KOKKOS_INLINE_FUNCTION
+  Real TabularSoundSpeedSquared(const Real density, const Real ion_temperature,
+                                const Real electron_temperature,
+                                const Real ion_pressure,
+                                const Real electron_pressure,
+                                const Real y0) const {
+    return TabularSoundSpeedSquared(density, ion_temperature, electron_temperature,
+                                    ion_pressure, electron_pressure,
+                                    CompositionFromY0(y0));
+  }
+
  public:
   KOKKOS_INLINE_FUNCTION
   bool UsesTabularEOS() const { return use_tabular_eos; }
@@ -893,20 +1134,33 @@ struct MaterialMixtureDevice {
     return MaximumTemperatureForComposition(y0);
   }
 
-  // Each table loader reserves enough exponent headroom for four interpolated
-  // non-negative pressure contributions (two materials times ion/electron).  This
+  // Each table loader reserves enough exponent headroom for all interpolated
+  // non-negative pressure contributions (up to three materials times ion/electron). This
   // capability permits exact zero-residual shortcuts that would otherwise have to
   // preserve a legacy inf/inf pressure ratio.
   KOKKOS_INLINE_FUNCTION
   bool TabularPressureSumsAreSafelyFinite() const {
-    return use_tabular_eos &&
-           material0_table.pressure_interpolation_is_safely_finite &&
-           material1_table.pressure_interpolation_is_safely_finite;
+    if (!use_tabular_eos) return false;
+    for (int n = 0; n < nmaterials; ++n) {
+      if (!SpeciesTable(n).pressure_interpolation_is_safely_finite) return false;
+    }
+    return true;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real ClampMassFraction(const Real y0) const {
     return fmin(fmax(y0, 0.0), 1.0);
+  }
+
+  //! True when more than one component is present, i.e. the cell is genuinely mixed and
+  //! no pure-material table inverse applies.  Replaces the two-material `0<y0<1` test.
+  KOKKOS_INLINE_FUNCTION
+  bool IsMixed(const MaterialComposition &mix) const {
+    int present = 0;
+    for (int n = 0; n < mix.count; ++n) {
+      if (mix.y[n] > 0.0) ++present;
+    }
+    return present > 1;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -926,10 +1180,53 @@ struct MaterialMixtureDevice {
     return ClampMassFraction(cons(m, scalar_index, k, j, i)/density);
   }
 
+  //! Full composition from the advected mass fractions.  With nmaterials=2 this is
+  //! exactly CompositionFromY0 of the single scalar.
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromPrimitive(const DvceArray5D<Real> &prim,
+                                               const int m, const int k,
+                                               const int j, const int i) const {
+    Real fractions[kMaxMaterials-1];
+    for (int n = 0; n < nmaterials-1; ++n) {
+      fractions[n] = prim(m, scalar_indices[n], k, j, i);
+    }
+    return CompositionFromFractions(fractions);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromConserved(const DvceArray5D<Real> &cons,
+                                               const int m, const int k,
+                                               const int j, const int i,
+                                               const Real density_floor = 0.0) const {
+    const Real density = fmax(cons(m, IDN, k, j, i), density_floor);
+    Real fractions[kMaxMaterials-1];
+    for (int n = 0; n < nmaterials-1; ++n) {
+      fractions[n] = (density > 0.0)
+          ? cons(m, scalar_indices[n], k, j, i)/density : 0.0;
+    }
+    return CompositionFromFractions(fractions);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real IonNumberPerAtomicMass(const MaterialComposition &mix) const {
+    Real result = 0.0;
+    for (int n = 0; n < mix.count; ++n) result += mix.y[n]/Species(n).abar;
+    return result;
+  }
+
   KOKKOS_INLINE_FUNCTION
   Real IonNumberPerAtomicMass(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
     return y0/material0.abar+(1.0-y0)/material1.abar;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronNumberPerAtomicMass(const MaterialComposition &mix) const {
+    Real result = 0.0;
+    for (int n = 0; n < mix.count; ++n) {
+      result += mix.y[n]*Species(n).zbar/Species(n).abar;
+    }
+    return result;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1041,6 +1338,21 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  Real EffectiveCharge(const MaterialComposition &mix) const {
+    Real electron_weight = 0.0;
+    Real charge_weight = 0.0;
+    Real largest_zeff = 0.0;
+    for (int n = 0; n < mix.count; ++n) {
+      const SpeciesProperties &species = Species(n);
+      const Real ne = mix.y[n]*species.zbar/species.abar;
+      electron_weight += ne;
+      charge_weight += ne*species.zeff;
+      largest_zeff = fmax(largest_zeff, species.zeff);
+    }
+    return (electron_weight > 0.0) ? charge_weight/electron_weight : largest_zeff;
+  }
+
+  KOKKOS_INLINE_FUNCTION
   Real EffectiveCharge(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
     const Real ne0 = y0*material0.zbar/material0.abar;
@@ -1070,6 +1382,99 @@ struct MaterialMixtureDevice {
     const Real fi = 1.0-fe;
     return fe*electron_to_ion_temperature/
            (fi+fe*electron_to_ion_temperature);
+  }
+
+  //! Composition-aware entry points.  These are what an N-material problem generator and
+  //! its physics operators call; the scalar y0 forms below remain for two-material code.
+  KOKKOS_INLINE_FUNCTION
+  MaterialThermodynamicState StateFromRhoTemperaturesNoSound(
+      const Real density, const Real ion_temperature,
+      const Real electron_temperature, const MaterialComposition &mix) const {
+    if (use_tabular_eos) return TabularStateNoSound(
+        density, ion_temperature, electron_temperature, mix);
+    const Real fe = ElectronHeatCapacityFraction(mix);
+    const Real fi = 1.0-fe;
+    MaterialThermodynamicState result;
+    result.ion_temperature = ion_temperature;
+    result.electron_temperature = electron_temperature;
+    result.ion_specific_internal_energy = fi*ion_temperature/gamma_minus_one;
+    result.electron_specific_internal_energy =
+        fe*electron_temperature/gamma_minus_one;
+    result.ion_pressure = density*fi*ion_temperature;
+    result.electron_pressure = density*fe*electron_temperature;
+    result.mean_ionization =
+        ElectronNumberPerAtomicMass(mix)/IonNumberPerAtomicMass(mix);
+    result.electron_number_density_cgs = density*density_to_cgs*
+        ElectronNumberPerAtomicMass(mix)/atomic_mass_unit_cgs;
+    result.effective_charge = EffectiveCharge(mix);
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialThermodynamicState StateFromRhoTemperatures(
+      const Real density, const Real ion_temperature,
+      const Real electron_temperature, const MaterialComposition &mix) const {
+    MaterialThermodynamicState result = StateFromRhoTemperaturesNoSound(
+        density, ion_temperature, electron_temperature, mix);
+    if (use_tabular_eos) {
+      result.sound_speed_squared = TabularSoundSpeedSquared(
+          density, result.ion_temperature, result.electron_temperature,
+          result.ion_pressure, result.electron_pressure, mix);
+      return result;
+    }
+    result.sound_speed_squared = (1.0+gamma_minus_one)*
+        (result.ion_pressure+result.electron_pressure)/density;
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronHeatCapacityFraction(const MaterialComposition &mix) const {
+    const Real ni = IonNumberPerAtomicMass(mix);
+    const Real ne = ElectronNumberPerAtomicMass(mix);
+    return ne/(ni+ne);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronTemperature(const Real density,
+                           const Real electron_specific_energy,
+                           const MaterialComposition &mix) const {
+    if (use_tabular_eos) {
+      return MixtureComponentFromRhoSpecificEnergy(
+          IonmixComponent::electron, density, electron_specific_energy,
+          mix).temperature;
+    }
+    return gamma_minus_one*electron_specific_energy/
+           ElectronHeatCapacityFraction(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronNumberDensity(const Real density,
+                             const MaterialComposition &mix) const {
+    return density*ElectronNumberPerAtomicMass(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronNumberDensity(const Real density, const MaterialComposition &mix,
+                             const Real electron_temperature) const {
+    if (!use_tabular_eos) return ElectronNumberDensity(density, mix);
+    return density*TabularElectronNumberPerAtomicMass(
+        density, electron_temperature, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronNumberDensityCgs(const Real code_density,
+                                const Real density_scale_cgs,
+                                const MaterialComposition &mix) const {
+    return code_density*density_scale_cgs*
+           ElectronNumberPerAtomicMass(mix)/atomic_mass_unit_cgs;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real EffectiveCharge(const Real density, const MaterialComposition &mix,
+                       const Real electron_temperature) const {
+    return use_tabular_eos
+               ? TabularEffectiveCharge(density, electron_temperature, mix)
+               : EffectiveCharge(mix);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1129,12 +1534,12 @@ struct MaterialMixtureDevice {
       const Real density, const Real old_ion_specific_energy,
       const Real old_electron_specific_energy,
       const Real old_ion_temperature, const Real old_electron_temperature,
-      const Real target_difference, const Real y0) const {
+      const Real target_difference, const MaterialComposition &mix) const {
     ExchangeResult<transient_state> result;
     const Real total_specific_energy =
         old_ion_specific_energy+old_electron_specific_energy;
     if (!use_tabular_eos) {
-      const Real fe = ElectronHeatCapacityFraction(y0);
+      const Real fe = ElectronHeatCapacityFraction(mix);
       const Real ti = gamma_minus_one*total_specific_energy-
                       fe*target_difference;
       if constexpr (transient_state) {
@@ -1145,7 +1550,7 @@ struct MaterialMixtureDevice {
             fi*ti/gamma_minus_one;
       } else {
         result.thermodynamics = StateFromRhoTemperatures(
-            density, ti, ti+target_difference, y0);
+            density, ti, ti+target_difference, mix);
         result.ion_specific_internal_energy =
             result.thermodynamics.ion_specific_internal_energy;
       }
@@ -1163,15 +1568,15 @@ struct MaterialMixtureDevice {
     }
 
     ComponentAtTemperature ion_low = MixtureComponentFromRhoTemperature(
-        IonmixComponent::ion, density, low_temperature, y0);
+        IonmixComponent::ion, density, low_temperature, mix);
     ComponentAtTemperature electron_low = MixtureComponentFromRhoTemperature(
         IonmixComponent::electron, density,
-        low_temperature+target_difference, y0);
+        low_temperature+target_difference, mix);
     ComponentAtTemperature ion_high = MixtureComponentFromRhoTemperature(
-        IonmixComponent::ion, density, high_temperature, y0);
+        IonmixComponent::ion, density, high_temperature, mix);
     ComponentAtTemperature electron_high = MixtureComponentFromRhoTemperature(
         IonmixComponent::electron, density,
-        high_temperature+target_difference, y0);
+        high_temperature+target_difference, mix);
     int exchange_query_flags =
         ion_low.query_flags | electron_low.query_flags |
         ion_high.query_flags | electron_high.query_flags;
@@ -1217,10 +1622,10 @@ struct MaterialMixtureDevice {
         trial_temperature = 0.5*(low_temperature+high_temperature);
       }
       const ComponentAtTemperature ion = MixtureComponentFromRhoTemperature(
-          IonmixComponent::ion, density, trial_temperature, y0);
+          IonmixComponent::ion, density, trial_temperature, mix);
       const ComponentAtTemperature electron = MixtureComponentFromRhoTemperature(
           IonmixComponent::electron, density,
-          trial_temperature+target_difference, y0);
+          trial_temperature+target_difference, mix);
       exchange_query_flags |= ion.query_flags | electron.query_flags;
       const Real residual = ion.specific_internal_energy+
                             electron.specific_internal_energy-
@@ -1246,10 +1651,10 @@ struct MaterialMixtureDevice {
       for (int iteration = 0; iteration < 48 && !converged; ++iteration) {
         const Real trial_temperature = 0.5*(low_temperature+high_temperature);
         const ComponentAtTemperature ion = MixtureComponentFromRhoTemperature(
-            IonmixComponent::ion, density, trial_temperature, y0);
+            IonmixComponent::ion, density, trial_temperature, mix);
         const ComponentAtTemperature electron = MixtureComponentFromRhoTemperature(
             IonmixComponent::electron, density,
-            trial_temperature+target_difference, y0);
+            trial_temperature+target_difference, mix);
         exchange_query_flags |= ion.query_flags | electron.query_flags;
         const Real residual = ion.specific_internal_energy+
                               electron.specific_internal_energy-
@@ -1281,7 +1686,7 @@ struct MaterialMixtureDevice {
         const MaterialThermodynamicState recovered =
             StateFromRhoSpecificEnergiesNoSound(
                 density, old_ion_specific_energy,
-                old_electron_specific_energy, y0);
+                old_electron_specific_energy, mix);
         result.temperatures.ion_temperature = recovered.ion_temperature;
         result.temperatures.electron_temperature = recovered.electron_temperature;
         result.temperatures.query_flags =
@@ -1294,7 +1699,7 @@ struct MaterialMixtureDevice {
             target_difference;
       } else {
         result.thermodynamics = StateFromRhoSpecificEnergiesNoSound(
-            density, old_ion_specific_energy, old_electron_specific_energy, y0);
+            density, old_ion_specific_energy, old_electron_specific_energy, mix);
         result.thermodynamics.query_flags |= exchange_query_flags;
         result.energy_residual =
             result.thermodynamics.ion_specific_internal_energy+
@@ -1308,7 +1713,7 @@ struct MaterialMixtureDevice {
     }
 
     const ComponentAtTemperature ion = MixtureComponentFromRhoTemperature(
-        IonmixComponent::ion, density, best_temperature, y0);
+        IonmixComponent::ion, density, best_temperature, mix);
     result.ion_specific_internal_energy =
         ion.specific_internal_energy;
     // Assign the tolerance-bounded residual to the electron component so the conservative
@@ -1317,17 +1722,17 @@ struct MaterialMixtureDevice {
         total_specific_energy-result.ion_specific_internal_energy;
     const ComponentAtTemperature electron = MixtureComponentFromRhoSpecificEnergy(
         IonmixComponent::electron, density,
-        result.electron_specific_internal_energy, y0);
+        result.electron_specific_internal_energy, mix);
     if constexpr (transient_state) {
       // Retain the same canonical forward round trip and query order as
       // TabularStateNoSound.  Reusing the raw inverse temperature can differ by ulps
       // after its exp/log coordinate round trip, and Te is consumed by radiation.
       const ComponentTemperatureState canonical_ion =
           MixtureTemperatureFromRhoTemperature(
-              density, ion.temperature, y0);
+              density, ion.temperature, mix);
       const ComponentTemperatureState canonical_electron =
           MixtureTemperatureFromRhoTemperature(
-              density, electron.temperature, y0);
+              density, electron.temperature, mix);
       result.temperatures.ion_temperature = canonical_ion.temperature;
       result.temperatures.electron_temperature = canonical_electron.temperature;
       result.temperatures.query_flags =
@@ -1339,7 +1744,7 @@ struct MaterialMixtureDevice {
           result.temperatures.ion_temperature-target_difference;
     } else {
       result.thermodynamics = TabularStateNoSound(
-          density, ion.temperature, electron.temperature, y0);
+          density, ion.temperature, electron.temperature, mix);
       result.thermodynamics.query_flags |=
           exchange_query_flags | ion.query_flags | electron.query_flags;
       result.temperature_difference_residual =
@@ -1359,7 +1764,8 @@ struct MaterialMixtureDevice {
       const Real target_difference, const Real y0) const {
     return ExchangeStateFromRhoTotalEnergyTemperatureDifference<false>(
         density, old_ion_specific_energy, old_electron_specific_energy,
-        old_ion_temperature, old_electron_temperature, target_difference, y0);
+        old_ion_temperature, old_electron_temperature, target_difference,
+        CompositionFromY0(y0));
   }
 
   // Reduced exchange result for a transient cache. Canonical temperatures and query
@@ -1375,7 +1781,8 @@ struct MaterialMixtureDevice {
       const Real target_difference, const Real y0) const {
     return ExchangeStateFromRhoTotalEnergyTemperatureDifference<true>(
         density, old_ion_specific_energy, old_electron_specific_energy,
-        old_ion_temperature, old_electron_temperature, target_difference, y0);
+        old_ion_temperature, old_electron_temperature, target_difference,
+        CompositionFromY0(y0));
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1754,6 +2161,21 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  Real ExchangeTime(const MaterialComposition &mix) const {
+    Real electron_weight = 0.0;
+    Real rate = 0.0;
+    for (int n = 0; n < mix.count; ++n) {
+      const SpeciesProperties &species = Species(n);
+      const Real ne = mix.y[n]*species.zbar/species.abar;
+      // A present component asking for instantaneous exchange wins outright.
+      if (ne > 0.0 && species.t_ei == 0.0) return 0.0;
+      electron_weight += ne;
+      if (species.t_ei > 0.0) rate += ne/species.t_ei;
+    }
+    return (rate > 0.0) ? electron_weight/rate : -1.0;
+  }
+
+  KOKKOS_INLINE_FUNCTION
   Real ExchangeTime(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
     const Real ne0 = y0*material0.zbar/material0.abar;
@@ -1764,6 +2186,353 @@ struct MaterialMixtureDevice {
     if (material0.t_ei > 0.0) rate += ne0/material0.t_ei;
     if (material1.t_ei > 0.0) rate += ne1/material1.t_ei;
     return (rate > 0.0) ? (ne0+ne1)/rate : -1.0;
+  }
+
+  //--------------------------------------------------------------------------------------
+  // Composition forms of the remaining public API.  Each one forwards to the same
+  // generalized private helper the scalar version uses, so a two-material deck that
+  // passes a composition gets bit-identical results to one passing y0.
+
+  KOKKOS_INLINE_FUNCTION
+  Real MeanAtomicMass(const MaterialComposition &mix) const {
+    return 1.0/IonNumberPerAtomicMass(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MeanParticleMass(const MaterialComposition &mix) const {
+    return 1.0/(IonNumberPerAtomicMass(mix)+ElectronNumberPerAtomicMass(mix));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronNumberPerGram(const MaterialComposition &mix) const {
+    return ElectronNumberPerAtomicMass(mix)/atomic_mass_unit_cgs;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronNumberDensityCgsFromTemperature(
+      const Real code_density, const MaterialComposition &mix,
+      const Real electron_temperature) const {
+    if (!use_tabular_eos) {
+      return ElectronNumberDensityCgs(code_density, density_to_cgs, mix);
+    }
+    return code_density*density_to_cgs*TabularElectronNumberPerAtomicMass(
+        code_density, electron_temperature, mix)/atomic_mass_unit_cgs;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronHeatCapacityFraction(const Real density,
+                                    const Real ion_temperature,
+                                    const Real electron_temperature,
+                                    const MaterialComposition &mix) const {
+    if (!use_tabular_eos) return ElectronHeatCapacityFraction(mix);
+    constexpr Real log_step = 1.0e-3;
+    const Real minimum = MinimumTemperatureForComposition(mix);
+    const Real maximum = MaximumTemperatureForComposition(mix);
+    const Real ti_low = fmax(ion_temperature*exp(-log_step), minimum);
+    const Real ti_high = fmin(ion_temperature*exp(log_step), maximum);
+    const Real te_low = fmax(electron_temperature*exp(-log_step), minimum);
+    const Real te_high = fmin(electron_temperature*exp(log_step), maximum);
+    const Real cvi = (MixtureComponentFromRhoTemperature(
+        IonmixComponent::ion, density, ti_high, mix).specific_internal_energy-
+        MixtureComponentFromRhoTemperature(
+        IonmixComponent::ion, density, ti_low, mix).specific_internal_energy)/
+        fmax(ti_high-ti_low, 1.0e-30);
+    const Real cve = (MixtureComponentFromRhoTemperature(
+        IonmixComponent::electron, density, te_high, mix).specific_internal_energy-
+        MixtureComponentFromRhoTemperature(
+        IonmixComponent::electron, density, te_low, mix).specific_internal_energy)/
+        fmax(te_high-te_low, 1.0e-30);
+    return (cvi+cve > 0.0) ? cve/(cvi+cve) : ElectronHeatCapacityFraction(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MinimumTransportTemperature(const MaterialComposition &mix) const {
+    return MinimumTemperatureForComposition(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real MaximumTransportTemperature(const MaterialComposition &mix) const {
+    return MaximumTemperatureForComposition(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real InitialElectronEnergyFraction(
+      const MaterialComposition &mix,
+      const Real electron_to_ion_temperature) const {
+    const Real fe = ElectronHeatCapacityFraction(mix);
+    const Real fi = 1.0-fe;
+    return fe*electron_to_ion_temperature/
+           (fi+fe*electron_to_ion_temperature);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialThermodynamicState StateFromRhoSpecificEnergiesNoSound(
+      const Real density, const Real ion_specific_energy,
+      const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    if (use_tabular_eos) {
+      const ComponentPairAtTemperature components =
+          MixtureComponentsFromRhoSpecificEnergies(
+              density, ion_specific_energy, electron_specific_energy, mix);
+      MaterialThermodynamicState result = TabularStateNoSound(
+          density, components.ion.temperature,
+          components.electron.temperature, mix);
+      result.query_flags |=
+          components.ion.query_flags | components.electron.query_flags;
+      return result;
+    }
+    const Real fe = ElectronHeatCapacityFraction(mix);
+    const Real fi = 1.0-fe;
+    return StateFromRhoTemperaturesNoSound(
+        density, gamma_minus_one*ion_specific_energy/fi,
+        gamma_minus_one*electron_specific_energy/fe, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialThermodynamicState StateFromRhoSpecificEnergies(
+      const Real density, const Real ion_specific_energy,
+      const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    MaterialThermodynamicState result = StateFromRhoSpecificEnergiesNoSound(
+        density, ion_specific_energy, electron_specific_energy, mix);
+    if (use_tabular_eos) {
+      result.sound_speed_squared = TabularSoundSpeedSquared(
+          density, result.ion_temperature, result.electron_temperature,
+          result.ion_pressure, result.electron_pressure, mix);
+    } else {
+      result.sound_speed_squared = (1.0+gamma_minus_one)*
+          (result.ion_pressure+result.electron_pressure)/density;
+    }
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialPressureEnergyState PressureEnergyFromRhoSpecificEnergies(
+      const Real density, const Real ion_specific_energy,
+      const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    if (use_tabular_eos) {
+      const ComponentPairAtTemperature components =
+          MixtureComponentsFromRhoSpecificEnergies(
+              density, ion_specific_energy, electron_specific_energy, mix);
+      MaterialPressureEnergyState result =
+          TabularPressureEnergyFromRhoTemperatures(
+              density, components.ion.temperature,
+              components.electron.temperature, mix);
+      result.query_flags |=
+          components.ion.query_flags | components.electron.query_flags;
+      return result;
+    }
+    const Real fe = ElectronHeatCapacityFraction(mix);
+    const Real fi = 1.0-fe;
+    return IdealPressureEnergyFromRhoTemperatures(
+        density, gamma_minus_one*ion_specific_energy/fi,
+        gamma_minus_one*electron_specific_energy/fe, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialElectronState ElectronStateFromRhoSpecificEnergy(
+      const Real density, const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    MaterialElectronState result;
+    if (use_tabular_eos) {
+      MixedDensityCache cache;
+      const ComponentAtTemperature inverse =
+          MixtureComponentFromRhoSpecificEnergyCached(
+              IonmixComponent::electron, density, electron_specific_energy,
+              mix, cache);
+      const ComponentAtTemperature electron = MixtureComponentFromCachedDensity(
+          IonmixComponent::electron, density, inverse.temperature, mix, cache);
+      result.electron_temperature = electron.temperature;
+      result.electron_pressure = electron.pressure;
+      result.electron_number_density_cgs = ElectronNumberDensityCgsFromTemperature(
+          density, mix, electron.temperature);
+      result.query_flags = inverse.query_flags | electron.query_flags;
+      return result;
+    }
+    const Real fe = ElectronHeatCapacityFraction(mix);
+    result.electron_temperature = gamma_minus_one*electron_specific_energy/fe;
+    result.electron_pressure = density*fe*result.electron_temperature;
+    result.electron_number_density_cgs =
+        ElectronNumberDensityCgs(density, density_to_cgs, mix);
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  int IonSpecificEnergyQueryFlags(
+      const Real density, const Real ion_specific_energy,
+      const MaterialComposition &mix) const {
+    if (!use_tabular_eos) return ionmix_query_in_bounds;
+    return MixtureComponentSpecificEnergyQueryFlags(
+        IonmixComponent::ion, density, ion_specific_energy, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  int ElectronSpecificEnergyQueryFlags(
+      const Real density, const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    if (!use_tabular_eos) return ionmix_query_in_bounds;
+    return MixtureComponentSpecificEnergyQueryFlags(
+        IonmixComponent::electron, density, electron_specific_energy, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  int SpecificEnergiesQueryFlags(
+      const Real density, const Real ion_specific_energy,
+      const Real electron_specific_energy,
+      const MaterialComposition &mix) const {
+    if (!use_tabular_eos) return ionmix_query_in_bounds;
+    MixedDensityCache cache;
+    int query_flags = MixtureComponentSpecificEnergyQueryFlagsCached(
+        IonmixComponent::ion, density, ion_specific_energy, mix, cache);
+    query_flags |= MixtureComponentSpecificEnergyQueryFlagsCached(
+        IonmixComponent::electron, density, electron_specific_energy, mix, cache);
+    return query_flags;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialThermodynamicState InitialStateFromTotalSpecificEnergy(
+      const Real density, const Real total_specific_energy,
+      const MaterialComposition &mix,
+      const Real electron_to_ion_temperature) const {
+    if (!use_tabular_eos) {
+      const Real electron_fraction = InitialElectronEnergyFraction(
+          mix, electron_to_ion_temperature);
+      return StateFromRhoSpecificEnergies(
+          density, (1.0-electron_fraction)*total_specific_energy,
+          electron_fraction*total_specific_energy, mix);
+    }
+    const bool error_bounds = AnyTableUsesErrorBounds(mix);
+    const Real minimum_temperature = MinimumTemperatureForComposition(mix);
+    const Real maximum_temperature = MaximumTemperatureForComposition(mix);
+    const Real low_electron_temperature = fmin(fmax(
+        electron_to_ion_temperature*minimum_temperature, minimum_temperature),
+        maximum_temperature);
+    const Real high_electron_temperature = fmin(fmax(
+        electron_to_ion_temperature*maximum_temperature, minimum_temperature),
+        maximum_temperature);
+    MaterialThermodynamicState low = TabularStateNoSound(
+        density, minimum_temperature, low_electron_temperature, mix);
+    MaterialThermodynamicState high = TabularStateNoSound(
+        density, maximum_temperature, high_electron_temperature, mix);
+    const Real low_energy = low.ion_specific_internal_energy+
+                            low.electron_specific_internal_energy;
+    const Real high_energy = high.ion_specific_internal_energy+
+                             high.electron_specific_internal_energy;
+    if (total_specific_energy < low_energy) {
+      if (error_bounds) Kokkos::abort("Initial mixed IONMIX energy is below range.");
+      low.query_flags |= ionmix_energy_below_table;
+      low.sound_speed_squared = TabularSoundSpeedSquared(
+          density, low.ion_temperature, low.electron_temperature,
+          low.ion_pressure, low.electron_pressure, mix);
+      return low;
+    }
+    if (total_specific_energy > high_energy) {
+      if (error_bounds) Kokkos::abort("Initial mixed IONMIX energy is above range.");
+      high.query_flags |= ionmix_energy_above_table;
+      high.sound_speed_squared = TabularSoundSpeedSquared(
+          density, high.ion_temperature, high.electron_temperature,
+          high.ion_pressure, high.electron_pressure, mix);
+      return high;
+    }
+    Real log_low = log(minimum_temperature);
+    Real log_high = log(maximum_temperature);
+    for (int iteration = 0; iteration < 48; ++iteration) {
+      const Real ti = exp(0.5*(log_low+log_high));
+      const Real te = fmin(fmax(
+          electron_to_ion_temperature*ti, minimum_temperature),
+          maximum_temperature);
+      const MaterialThermodynamicState trial = TabularStateNoSound(
+          density, ti, te, mix);
+      const Real energy = trial.ion_specific_internal_energy+
+                          trial.electron_specific_internal_energy;
+      if (energy < total_specific_energy) {
+        log_low = log(ti);
+      } else {
+        log_high = log(ti);
+      }
+    }
+    const Real ti = exp(0.5*(log_low+log_high));
+    const Real te = fmin(fmax(
+        electron_to_ion_temperature*ti, minimum_temperature),
+        maximum_temperature);
+    return StateFromRhoTemperatures(density, ti, te, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialPressureEnergyState MinimumPressureEnergyState(
+      const Real density, const MaterialComposition &mix,
+      const Real pressure_floor = 0.0,
+      const Real temperature_floor = 0.0) const {
+    if (!use_tabular_eos) {
+      Real temperature = fmax(temperature_floor, 0.0);
+      MaterialPressureEnergyState state =
+          IdealPressureEnergyFromRhoTemperatures(
+              density, temperature, temperature, mix);
+      if (state.ion_pressure+state.electron_pressure < pressure_floor) {
+        temperature = pressure_floor/density;
+        state = IdealPressureEnergyFromRhoTemperatures(
+            density, temperature, temperature, mix);
+      }
+      return state;
+    }
+    const NativeMinimumTemperatureState native_minimum =
+        NativeMinimumTemperatureForComposition(mix);
+    const Real minimum_temperature =
+        fmax(native_minimum.temperature, temperature_floor);
+    const int native_material_mask =
+        (minimum_temperature == native_minimum.temperature)
+        ? native_minimum.material_mask : 0;
+    const Real maximum_temperature = MaximumTemperatureForComposition(mix);
+    MaterialPressureEnergyState state = TabularPressureEnergyFromRhoNativeMinimum(
+        density, minimum_temperature, mix, native_material_mask);
+    if (state.ion_pressure+state.electron_pressure >= pressure_floor) return state;
+    MaterialPressureEnergyState maximum = TabularPressureEnergyFromRhoTemperature(
+        density, maximum_temperature, mix);
+    if (maximum.ion_pressure+maximum.electron_pressure < pressure_floor) {
+      if (AnyTableUsesErrorBounds(mix)) {
+        Kokkos::abort("Mixed IONMIX pressure floor is above the table range.");
+      }
+      maximum.query_flags |= ionmix_temperature_above_table;
+      return maximum;
+    }
+    Real log_low = log(minimum_temperature);
+    Real log_high = log(maximum_temperature);
+    for (int iteration = 0; iteration < 48; ++iteration) {
+      const Real temperature = exp(0.5*(log_low+log_high));
+      const MaterialPressureEnergyState trial =
+          TabularPressureEnergyFromRhoTemperature(density, temperature, mix);
+      if (trial.ion_pressure+trial.electron_pressure < pressure_floor) {
+        log_low = log(temperature);
+      } else {
+        log_high = log(temperature);
+      }
+    }
+    const Real temperature = exp(0.5*(log_low+log_high));
+    return TabularPressureEnergyFromRhoTemperature(density, temperature, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialTransientExchangeState
+  StateTemperaturesFromRhoTotalEnergyTemperatureDifference(
+      const Real density, const Real old_ion_specific_energy,
+      const Real old_electron_specific_energy,
+      const Real old_ion_temperature, const Real old_electron_temperature,
+      const Real target_difference, const MaterialComposition &mix) const {
+    return ExchangeStateFromRhoTotalEnergyTemperatureDifference<true>(
+        density, old_ion_specific_energy, old_electron_specific_energy,
+        old_ion_temperature, old_electron_temperature, target_difference, mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MaterialExchangeState StateFromRhoTotalEnergyTemperatureDifference(
+      const Real density, const Real old_ion_specific_energy,
+      const Real old_electron_specific_energy,
+      const Real old_ion_temperature, const Real old_electron_temperature,
+      const Real target_difference, const MaterialComposition &mix) const {
+    return ExchangeStateFromRhoTotalEnergyTemperatureDifference<false>(
+        density, old_ion_specific_energy, old_electron_specific_energy,
+        old_ion_temperature, old_electron_temperature, target_difference, mix);
   }
 };
 
@@ -1778,12 +2547,12 @@ class MaterialMixture {
 
   MaterialMixtureDevice DeviceData() const { return data_; }
   int ScalarIndex() const { return data_.scalar_index; }
+  int NumberOfMaterials() const { return data_.nmaterials; }
   bool UsesTabularEOS() const { return data_.use_tabular_eos; }
 
  private:
   MaterialMixtureDevice data_;
-  std::unique_ptr<IonmixTwoTemperatureTable> material0_table_;
-  std::unique_ptr<IonmixTwoTemperatureTable> material1_table_;
+  std::unique_ptr<IonmixTwoTemperatureTable> tables_[kMaxMaterials];
 };
 
 } // namespace materials

@@ -1,6 +1,6 @@
 # Full-allocation GPU-memory calibration deck.  Physics and MeshBlock sizes match the
-# production case; every output is disabled by default.  DCI_3D/run_case.py applies a
-# 2x2x2-block compact mesh for validation without changing MeshBlock dimensions.
+# production case; every output is disabled by default.  DCI_3D/run_case.py applies the
+# established 100x64x64, 2x2x2-block compact geometry for validation.
 
 <job>
 basename = dci_3d_calibration
@@ -11,28 +11,30 @@ mass_cgs = 1.1e-3
 time_cgs = 1.0e-9
 mu = 1.4444444444444444
 
+# Archived FLASH domain and the production MeshBlock size, at the full production cell
+# count so this deck measures the real seven-GPU allocation.
 <mesh>
 nghost = 2
-nx1 = 500
-x1min = -1.5
-x1max = 2.0
+nx1 = 315
+x1min = -0.45
+x1max = 0.75
 ix1_bc = outflow
 ox1_bc = outflow
-nx2 = 256
-x2min = -1.0
-x2max = 1.0
+nx2 = 315
+x2min = -0.6
+x2max = 0.6
 ix2_bc = outflow
 ox2_bc = outflow
-nx3 = 256
-x3min = -1.0
-x3max = 1.0
+nx3 = 315
+x3min = -0.6
+x3max = 0.6
 ix3_bc = outflow
 ox3_bc = outflow
 
 <meshblock>
-nx1 = 50
-nx2 = 32
-nx3 = 32
+nx1 = 45
+nx2 = 45
+nx3 = 45
 
 <time>
 evolution = dynamic
@@ -53,7 +55,7 @@ gamma = 1.6666666666666667
 dfloor = 1.0e-8
 pfloor = 1.0e-14
 tfloor = 1.0e-12
-nscalars = 1
+nscalars = 2
 two_temperature = true
 dual_energy = true
 dual_energy_eta1 = 1.0e-3
@@ -71,39 +73,53 @@ biermann_shock_suppression = true
 biermann_shock_threshold = 8.0e-1
 
 <materials>
-nmaterials = 2
+nmaterials = 3
 scalar_index = 0
 material0_name = CH
 material0_abar = 6.5
 material0_zbar = 3.5
 material0_zeff = 5.285714285714286
-material1_name = He
-material1_abar = 4.002602
-material1_zbar = 2.0
-material1_zeff = 2.0
+material1_name = Au
+material1_abar = 196.96655
+material1_zbar = 79.0
+material1_zeff = 79.0
+material2_name = He
+material2_abar = 4.002602
+material2_zbar = 2.0
+material2_zeff = 2.0
 material0_eos_table_file = DCI_3D/material_tables/ch.2t_eos
-material1_eos_table_file = DCI_3D/material_tables/he.2t_eos
+material1_eos_table_file = DCI_3D/material_tables/au.2t_eos
+material2_eos_table_file = DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
 eos_table_bounds = clamp
 eos_table_interpolation = geometric
 material0_opacity_table_file = DCI_3D/material_tables/ch_20g.opacity
-material1_opacity_table_file = DCI_3D/material_tables/he_20g.opacity
+material1_opacity_table_file = DCI_3D/material_tables/au_20g.opacity
+material2_opacity_table_file = DCI_3D/material_tables/he_20g.opacity
 material0_opacity_interpolation = geometric
 material1_opacity_interpolation = geometric
+material2_opacity_interpolation = geometric
 material0_opacity_coordinate_interpolation = log
 material1_opacity_coordinate_interpolation = log
+material2_opacity_coordinate_interpolation = log
 material0_opacity_density_scale = 1.1
 material1_opacity_density_scale = 1.1
+material2_opacity_density_scale = 1.1
 material0_opacity_temperature_scale = 1.7372674493486121e8
 material1_opacity_temperature_scale = 1.7372674493486121e8
+material2_opacity_temperature_scale = 1.7372674493486121e8
 material0_opacity_group_bound_scale = 5.756166100820859e-9
 material1_opacity_group_bound_scale = 5.756166100820859e-9
+material2_opacity_group_bound_scale = 5.756166100820859e-9
 material0_opacity_transport_scale = 1.1e-1
 material1_opacity_transport_scale = 1.1e-1
+material2_opacity_transport_scale = 1.1e-1
 material0_opacity_absorption_scale = 1.1e-1
 material1_opacity_absorption_scale = 1.1e-1
+material2_opacity_absorption_scale = 1.1e-1
 material0_opacity_emission_scale = 1.1e-1
 material1_opacity_emission_scale = 1.1e-1
+material2_opacity_emission_scale = 1.1e-1
 
 <thermal_radiation>
 enabled = true
@@ -157,7 +173,7 @@ oblique_turning = true
 max_reflections_per_ray = 64
 reflection_offset_fraction = 1.0e-5
 reflection_hysteresis_fraction = 1.0e-2
-nbeams = 1
+nbeams = 4
 max_segments_per_launch = 64
 max_transport_iterations = 256
 max_mpi_waves = 1024
@@ -166,33 +182,119 @@ minimum_power_fraction = 1.0e-14
 conservation_tolerance = 1.0e-10
 periodic_transport = false
 report_diagnostics = true
-beam0_power = 2.0e19
-beam0_wavelength = 1.053e-4
-beam0_nrays = 4096
+
+# Match the production archived FLASH drive exactly: one shared 13-section picket
+# pulse (code ns, erg/s) and four collimated 0.275 mm uniform 3-omega beams whose
+# archive-fixed lenses sit outside this deck's mesh as well.
+npulses = 1
+pulse0_nsections = 13
+pulse0_time_0 = 0.0
+pulse0_time_1 = 0.13
+pulse0_time_2 = 0.26
+pulse0_time_3 = 0.76
+pulse0_time_4 = 0.89
+pulse0_time_5 = 1.02
+pulse0_time_6 = 1.62
+pulse0_time_7 = 1.75
+pulse0_time_8 = 1.88
+pulse0_time_9 = 2.10
+pulse0_time_10 = 2.23
+pulse0_time_11 = 4.58
+pulse0_time_12 = 4.71
+pulse0_power_0 = 0.0
+pulse0_power_1 = 8.75e17
+pulse0_power_2 = 0.0
+pulse0_power_3 = 0.0
+pulse0_power_4 = 1.375e18
+pulse0_power_5 = 0.0
+pulse0_power_6 = 0.0
+pulse0_power_7 = 3.1e18
+pulse0_power_8 = 0.0
+pulse0_power_9 = 0.0
+pulse0_power_10 = 6.875e18
+pulse0_power_11 = 6.875e18
+pulse0_power_12 = 0.0
+
+beam0_wavelength = 3.51e-5
+beam0_nrays = 50000
 beam0_geometry = lens
-beam0_lens_x1 = 2.0
-beam0_lens_x2 = 0.0
-beam0_lens_x3 = 0.0
-beam0_target_x1 = 1.0
+beam0_lens_x1 = 2.037
+beam0_lens_x2 = 1.4142
+beam0_lens_x3 = 1.4142
+beam0_target_x1 = 0.359
 beam0_target_x2 = 0.0
 beam0_target_x3 = 0.0
-beam0_aperture_radius = 0.72
-beam0_target_radius = 0.58
-beam0_profile = gaussian
-beam0_profile_radius = 0.72
+beam0_aperture_radius = 0.275
+beam0_target_radius = 0.275
+beam0_profile = uniform
 beam0_zeff = 5.285714285714286
+beam0_pulse_number = 0
 beam0_start_time = 0.0
 beam0_end_time = 5.0
+
+beam1_wavelength = 3.51e-5
+beam1_nrays = 50000
+beam1_geometry = lens
+beam1_lens_x1 = 2.037
+beam1_lens_x2 = -1.4142
+beam1_lens_x3 = 1.4142
+beam1_target_x1 = 0.359
+beam1_target_x2 = 0.0
+beam1_target_x3 = 0.0
+beam1_aperture_radius = 0.275
+beam1_target_radius = 0.275
+beam1_profile = uniform
+beam1_zeff = 5.285714285714286
+beam1_pulse_number = 0
+beam1_start_time = 0.0
+beam1_end_time = 5.0
+
+beam2_wavelength = 3.51e-5
+beam2_nrays = 50000
+beam2_geometry = lens
+beam2_lens_x1 = 2.037
+beam2_lens_x2 = -1.4142
+beam2_lens_x3 = -1.4142
+beam2_target_x1 = 0.359
+beam2_target_x2 = 0.0
+beam2_target_x3 = 0.0
+beam2_aperture_radius = 0.275
+beam2_target_radius = 0.275
+beam2_profile = uniform
+beam2_zeff = 5.285714285714286
+beam2_pulse_number = 0
+beam2_start_time = 0.0
+beam2_end_time = 5.0
+
+beam3_wavelength = 3.51e-5
+beam3_nrays = 50000
+beam3_geometry = lens
+beam3_lens_x1 = 2.037
+beam3_lens_x2 = 1.4142
+beam3_lens_x3 = -1.4142
+beam3_target_x1 = 0.359
+beam3_target_x2 = 0.0
+beam3_target_x3 = 0.0
+beam3_aperture_radius = 0.275
+beam3_target_radius = 0.275
+beam3_profile = uniform
+beam3_zeff = 5.285714285714286
+beam3_pulse_number = 0
+beam3_start_time = 0.0
+beam3_end_time = 5.0
 
 <problem>
 user_hist = true
 ambient_density = 9.090909090909091e-6
 solid_density = 1.0
+cone_density = 17.454545454545453
 temperature_kelvin = 1.1606e4
-inner_radius = 0.8
-outer_radius = 1.0
+inner_radius = 0.52
+outer_radius = 0.55
 opening_half_angle_deg = 50.0
-transition_width = 2.0e-2
+cone_base_x1 = 0.085
+cone_wall_offset = 0.031
+transition_width = 5.0e-3
 angular_transition = 1.0e-2
 allow_laser_transport_variants = false
 

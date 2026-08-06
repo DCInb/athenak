@@ -1,6 +1,8 @@
-# DCI_3D production deck: tabulated CH/He 3T MHD, 20-group AP-FLD, and a 10 kJ 1-omega
-# Gaussian drive.  DCI_3D/run_case.py keeps production locked until the evidence manifest
-# described in README.md verifies compact/restart/convergence and eight-GPU memory gates.
+# DCI_3D production deck: tabulated CH/Au/He 3T MHD, 20-group AP-FLD, and the archived
+# FLASH 3d_zb drive: four collimated uniform 3-omega beams sharing the 13-section
+# picket pulse (7.0982 kJ total).  DCI_3D/run_case.py keeps production locked until the
+# evidence manifest described in README.md verifies compact/restart/convergence and
+# seven-GPU memory gates.
 
 <job>
 basename = dci_3d
@@ -11,42 +13,53 @@ mass_cgs = 1.1e-3
 time_cgs = 1.0e-9
 mu = 1.4444444444444444
 
+# Archived FLASH 3d_zb/ParDir/1l_4beam_BB.par domain, mapped cone axis +z -> +x1
+# (x -> x2, y -> x3) and converted from cm to the 0.1 cm code length unit:
+#   z [-0.045, 0.075] cm -> x1 [-0.45, 0.75] mm
+#   x [-0.06, 0.06] cm  -> x2 [-0.6, 0.6] mm
+#   y [-0.06, 0.06] cm  -> x3 [-0.6, 0.6] mm
+# Cubic 3.81 um cells put about 8 cells across both the 30 um CH shell and the 31 um
+# Au cone wall.  Measured at 61.4 percent of every one of the seven available V100s.
 <mesh>
 nghost = 2
-nx1 = 512
-x1min = -1.0
-x1max = 3
+nx1 = 315
+x1min = -0.45
+x1max = 0.75
 ix1_bc = outflow
 ox1_bc = outflow
 
-nx2 = 256
-x2min = -1.0
-x2max = 1.0
+nx2 = 315
+x2min = -0.6
+x2max = 0.6
 ix2_bc = outflow
 ox2_bc = outflow
 
-nx3 = 256
-x3min = -1.0
-x3max = 1.0
+nx3 = 315
+x3min = -0.6
+x3max = 0.6
 ix3_bc = outflow
 ox3_bc = outflow
 
-# Keep each rank's 128 MeshBlocks in complete x1-directed tubes.  This symmetric
-# map balances both mixed-material work and ray residence without an x1 MPI cut.
+# Keep each rank's 49 MeshBlocks in complete x1-directed tubes, so no rank boundary cuts
+# a ray's path along the drive axis.  One x3 slab per rank measured fastest over 60
+# cycles on the seven available V100s: 110.2 s versus 120.2 s for plain z_order, despite
+# about twice the cross-rank ray transfers.  A radially interleaved map balances the
+# near-axis work more evenly on paper but was the slowest of the three (3.7x the
+# transfers, 9 waves), so tube locality dominates column-level load balance here.
 meshblock_order = x1_rank_map
-meshblock_rank_map_x3_0 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_1 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_2 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_3 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_4 = 4,5,5,4,6,7,7,6
-meshblock_rank_map_x3_5 = 4,5,5,4,6,7,7,6
-meshblock_rank_map_x3_6 = 4,5,5,4,6,7,7,6
-meshblock_rank_map_x3_7 = 4,5,5,4,6,7,7,6
+meshblock_rank_map_x3_0 = 0,0,0,0,0,0,0
+meshblock_rank_map_x3_1 = 1,1,1,1,1,1,1
+meshblock_rank_map_x3_2 = 2,2,2,2,2,2,2
+meshblock_rank_map_x3_3 = 3,3,3,3,3,3,3
+meshblock_rank_map_x3_4 = 4,4,4,4,4,4,4
+meshblock_rank_map_x3_5 = 5,5,5,5,5,5,5
+meshblock_rank_map_x3_6 = 6,6,6,6,6,6,6
 
+# 7x7x7 = 343 blocks, exactly 49 per rank on the seven available GPUs.
 <meshblock>
-nx1 = 32
-nx2 = 32
-nx3 = 32
+nx1 = 45
+nx2 = 45
+nx3 = 45
 
 <time>
 evolution = dynamic
@@ -67,7 +80,7 @@ gamma = 1.6666666666666667
 dfloor = 1.0e-8
 pfloor = 1.0e-14
 tfloor = 1.0e-12
-nscalars = 1
+nscalars = 2
 two_temperature = true
 dual_energy = true
 dual_energy_eta1 = 1.0e-3
@@ -89,45 +102,63 @@ biermann_subcycle_cfl = 0.15
 biermann_subcycle_max_steps = 100000
 biermann_reduced_closure = true
 
+# Three components: the CH shell, the archived Au cone, and the He ambient.  The closure
+# advects nmaterials-1 = 2 mass fractions (rho*Y_CH and rho*Y_Au) starting at
+# scalar_index; helium is the remainder Y_He = 1-Y_CH-Y_Au.
 <materials>
-nmaterials = 2
+nmaterials = 3
 scalar_index = 0
 material0_name = CH
 material0_abar = 6.5
 material0_zbar = 3.5
 material0_zeff = 5.285714285714286
 
-material1_name = He
-material1_abar = 4.002602
-material1_zbar = 2.0
-material1_zeff = 2.0
+material1_name = Au
+material1_abar = 196.96655
+material1_zbar = 79.0
+material1_zeff = 79.0
+
+material2_name = He
+material2_abar = 4.002602
+material2_zbar = 2.0
+material2_zeff = 2.0
 
 # The tables are generated locally from the audited archive.  The launcher stages
 # byte-identical copies in each run directory and overrides these repo-relative paths.
 material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch.2t_eos
-material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
+material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au.2t_eos
+material2_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
 eos_table_bounds = clamp
 eos_table_interpolation = geometric
 
 material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
-material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
+material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au_20g.opacity
+material2_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
 material0_opacity_interpolation = geometric
 material1_opacity_interpolation = geometric
+material2_opacity_interpolation = geometric
 material0_opacity_coordinate_interpolation = log
 material1_opacity_coordinate_interpolation = log
+material2_opacity_coordinate_interpolation = log
 material0_opacity_density_scale = 1.1
 material1_opacity_density_scale = 1.1
+material2_opacity_density_scale = 1.1
 material0_opacity_temperature_scale = 1.7372674493486121e8
 material1_opacity_temperature_scale = 1.7372674493486121e8
+material2_opacity_temperature_scale = 1.7372674493486121e8
 material0_opacity_group_bound_scale = 5.756166100820859e-9
 material1_opacity_group_bound_scale = 5.756166100820859e-9
+material2_opacity_group_bound_scale = 5.756166100820859e-9
 material0_opacity_transport_scale = 1.1e-1
 material1_opacity_transport_scale = 1.1e-1
+material2_opacity_transport_scale = 1.1e-1
 material0_opacity_absorption_scale = 1.1e-1
 material1_opacity_absorption_scale = 1.1e-1
+material2_opacity_absorption_scale = 1.1e-1
 material0_opacity_emission_scale = 1.1e-1
 material1_opacity_emission_scale = 1.1e-1
+material2_opacity_emission_scale = 1.1e-1
 
 <thermal_radiation>
 enabled = true
@@ -182,7 +213,7 @@ oblique_turning = true
 max_reflections_per_ray = 64
 reflection_offset_fraction = 1.0e-5
 reflection_hysteresis_fraction = 1.0e-2
-nbeams = 1
+nbeams = 4
 max_segments_per_launch = 64
 max_transport_iterations = 256
 max_mpi_waves = 1024
@@ -192,34 +223,126 @@ conservation_tolerance = 1.0e-10
 periodic_transport = false
 report_diagnostics = true
 
-# The right-hand Gaussian lens irradiates the positive-x outer shell surface.
-beam0_power = 2.0e19
-beam0_wavelength = 1.053e-4
-beam0_nrays = 4096
+# Archived FLASH 3d_zb/ParDir/1l_4beam_BB.par pulse 1: three pickets and a flat main
+# drive.  Knot times are code nanoseconds; absolute powers are erg/s (1 W = 1e7 erg/s).
+# Each beam integrates to 1.774550 kJ, so the four beams deliver 7.0982 kJ.
+npulses = 1
+pulse0_nsections = 13
+pulse0_time_0 = 0.0
+pulse0_time_1 = 0.13
+pulse0_time_2 = 0.26
+pulse0_time_3 = 0.76
+pulse0_time_4 = 0.89
+pulse0_time_5 = 1.02
+pulse0_time_6 = 1.62
+pulse0_time_7 = 1.75
+pulse0_time_8 = 1.88
+pulse0_time_9 = 2.10
+pulse0_time_10 = 2.23
+pulse0_time_11 = 4.58
+pulse0_time_12 = 4.71
+pulse0_power_0 = 0.0
+pulse0_power_1 = 8.75e17
+pulse0_power_2 = 0.0
+pulse0_power_3 = 0.0
+pulse0_power_4 = 1.375e18
+pulse0_power_5 = 0.0
+pulse0_power_6 = 0.0
+pulse0_power_7 = 3.1e18
+pulse0_power_8 = 0.0
+pulse0_power_9 = 0.0
+pulse0_power_10 = 6.875e18
+pulse0_power_11 = 6.875e18
+pulse0_power_12 = 0.0
+
+# Archived FLASH beams mapped with the cone axis +z -> +x1 (x -> x2, y -> x3, cm -> mm):
+# four collimated 0.275 mm uniform 3-omega spots inclined 50 degrees from the +x1 axis
+# at the four diagonal azimuths, all aimed at the on-axis point x1 = 0.359 mm.  The
+# lenses sit outside the mesh; lens-geometry rays enter through the domain faces.
+beam0_wavelength = 3.51e-5
+beam0_nrays = 50000
 beam0_geometry = lens
-beam0_lens_x1 = 3.0
-beam0_lens_x2 = 0.0
-beam0_lens_x3 = 0.0
-beam0_target_x1 = 1.0
+beam0_lens_x1 = 2.037
+beam0_lens_x2 = 1.4142
+beam0_lens_x3 = 1.4142
+beam0_target_x1 = 0.359
 beam0_target_x2 = 0.0
 beam0_target_x3 = 0.0
-beam0_aperture_radius = 0.72
-beam0_target_radius = 0.58
-beam0_profile = gaussian
-beam0_profile_radius = 0.72
+beam0_aperture_radius = 0.275
+beam0_target_radius = 0.275
+beam0_profile = uniform
 beam0_zeff = 5.285714285714286
+beam0_pulse_number = 0
 beam0_start_time = 0.0
 beam0_end_time = 5.0
 
+beam1_wavelength = 3.51e-5
+beam1_nrays = 50000
+beam1_geometry = lens
+beam1_lens_x1 = 2.037
+beam1_lens_x2 = -1.4142
+beam1_lens_x3 = 1.4142
+beam1_target_x1 = 0.359
+beam1_target_x2 = 0.0
+beam1_target_x3 = 0.0
+beam1_aperture_radius = 0.275
+beam1_target_radius = 0.275
+beam1_profile = uniform
+beam1_zeff = 5.285714285714286
+beam1_pulse_number = 0
+beam1_start_time = 0.0
+beam1_end_time = 5.0
+
+beam2_wavelength = 3.51e-5
+beam2_nrays = 50000
+beam2_geometry = lens
+beam2_lens_x1 = 2.037
+beam2_lens_x2 = -1.4142
+beam2_lens_x3 = -1.4142
+beam2_target_x1 = 0.359
+beam2_target_x2 = 0.0
+beam2_target_x3 = 0.0
+beam2_aperture_radius = 0.275
+beam2_target_radius = 0.275
+beam2_profile = uniform
+beam2_zeff = 5.285714285714286
+beam2_pulse_number = 0
+beam2_start_time = 0.0
+beam2_end_time = 5.0
+
+beam3_wavelength = 3.51e-5
+beam3_nrays = 50000
+beam3_geometry = lens
+beam3_lens_x1 = 2.037
+beam3_lens_x2 = 1.4142
+beam3_lens_x3 = -1.4142
+beam3_target_x1 = 0.359
+beam3_target_x2 = 0.0
+beam3_target_x3 = 0.0
+beam3_aperture_radius = 0.275
+beam3_target_radius = 0.275
+beam3_profile = uniform
+beam3_zeff = 5.285714285714286
+beam3_pulse_number = 0
+beam3_start_time = 0.0
+beam3_end_time = 5.0
+
+# Archived FLASH 3d_zb/Simulation_initBlock.F90 target, cm -> code mm, cone axis +x1.
+# Densities are in the 1.1 g/cc mass unit: CH 1.1 g/cc -> 1.0, Au 19.2 g/cc -> 17.4545,
+# He 1.0e-5 g/cc -> 9.0909e-6.
 <problem>
 user_hist = true
 ambient_density = 9.090909090909091e-6
 solid_density = 1.0
+cone_density = 17.454545454545453
 temperature_kelvin = 1.1606e4
-inner_radius = 0.8
-outer_radius = 1.0
+inner_radius = 0.52
+outer_radius = 0.55
 opening_half_angle_deg = 50.0
-transition_width = 2.0e-2
+# Au cone: archived hcone=0.0085 cm base and lxa=0.0031 cm wall offset.
+cone_base_x1 = 0.085
+cone_wall_offset = 0.031
+transition_width = 5.0e-3
 angular_transition = 1.0e-2
 allow_laser_transport_variants = false
 

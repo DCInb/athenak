@@ -523,6 +523,62 @@ def test_run():
         assert np.allclose(laser["laser_q"], expected_q,
                            rtol=2.0e-11, atol=2.0e-13)
 
+        # A FLASH-style inline shared pulse table referenced through
+        # beam0_pulse_number carries the same knots as the pulse file above, so both
+        # absolute and relative modes must reproduce the file-driven deposition.
+        inline_pulse = [
+            "laser/npulses=1",
+            "laser/pulse0_nsections=4",
+            "laser/pulse0_time_0=0.0",
+            "laser/pulse0_time_1=0.25e-6",
+            "laser/pulse0_time_2=0.75e-6",
+            "laser/pulse0_time_3=1.0e-6",
+            "laser/pulse0_power_0=0.0",
+            "laser/pulse0_power_1=2.0",
+            "laser/pulse0_power_2=2.0",
+            "laser/pulse0_power_3=0.0",
+            "laser/beam0_pulse_number=0",
+        ]
+        laser, _, _ = run_absorption_case("laser_pulse_inline_absolute", [
+            f"laser/absorption_coefficient={coefficient}",
+            *inline_pulse,
+            "laser/beam0_pulse_mode=absolute",
+            "laser/beam0_power=9.0",
+        ])
+        expected_q = 1.5*constant_absorption_profile(
+            laser["x1v"], coefficient)
+        assert np.allclose(laser["laser_q"], expected_q,
+                           rtol=2.0e-11, atol=2.0e-13)
+
+        laser, _, _ = run_absorption_case("laser_pulse_inline_relative", [
+            f"laser/absorption_coefficient={coefficient}",
+            *inline_pulse,
+            "laser/beam0_pulse_mode=relative",
+        ])
+        assert np.allclose(laser["laser_q"], expected_q,
+                           rtol=2.0e-11, atol=2.0e-13)
+
+        # Time and power scale factors convert archived FLASH SI tables in place.
+        laser, _, _ = run_absorption_case("laser_pulse_inline_scaled", [
+            f"laser/absorption_coefficient={coefficient}",
+            "laser/npulses=1",
+            "laser/pulse0_nsections=4",
+            "laser/pulse0_time_0=0.0",
+            "laser/pulse0_time_1=0.25",
+            "laser/pulse0_time_2=0.75",
+            "laser/pulse0_time_3=1.0",
+            "laser/pulse0_power_0=0.0",
+            "laser/pulse0_power_1=4.0",
+            "laser/pulse0_power_2=4.0",
+            "laser/pulse0_power_3=0.0",
+            "laser/pulse0_time_scale=1.0e-6",
+            "laser/pulse0_power_scale=0.5",
+            "laser/beam0_pulse_number=0",
+            "laser/beam0_pulse_mode=absolute",
+        ])
+        assert np.allclose(laser["laser_q"], expected_q,
+                           rtol=2.0e-11, atol=2.0e-13)
+
         laser, _, _ = run_absorption_case("laser_pulse_step_gate", [
             f"laser/absorption_coefficient={coefficient}",
             f"laser/beam0_pulse_file={pulse_file}",

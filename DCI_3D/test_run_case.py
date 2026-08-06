@@ -318,6 +318,9 @@ def test_laser_transport_cli_overrides_reach_both_smoke_commands(monkeypatch):
     assert expected <= set(initial)
     assert expected <= set(restart)
     assert "problem/allow_laser_transport_variants=true" in initial
+    assert {
+        "meshblock/nx1=50", "meshblock/nx2=32", "meshblock/nx3=32",
+    } <= set(initial)
 
 
 def test_calibration_default_exercises_twenty_two_full_layout_cycles():
@@ -451,8 +454,8 @@ def test_validate_resume_starts_prepared_run_without_checkpoint(tmp_path, monkey
         "state": "prepared",
         "run_dir": str(run_dir),
         "run_id": "a" * 32,
-        "ranks": 8,
-        "gpus": [str(number) for number in range(8)],
+        "ranks": run_case.ACCEPTANCE_RANKS,
+        "gpus": [str(number) for number in range(run_case.ACCEPTANCE_RANKS)],
         "segments": [],
         "current_time": 0.0,
         "current_cycle": 0,
@@ -472,7 +475,7 @@ def test_validate_resume_starts_prepared_run_without_checkpoint(tmp_path, monkey
     monkeypatch.setattr(run_case, "production_output_cadences", lambda *args: {})
     monkeypatch.setattr(run_case, "gpu_preflight", lambda *args: ({}, {}))
     args = argparse.Namespace(
-        ranks=8,
+        ranks=run_case.ACCEPTANCE_RANKS,
         segment_wall_time=None,
         allow_busy_gpus=False,
     )
@@ -481,7 +484,7 @@ def test_validate_resume_starts_prepared_run_without_checkpoint(tmp_path, monkey
         run_case.validate_resumed_production(
             args,
             run_dir,
-            [str(number) for number in range(8)],
+            [str(number) for number in range(run_case.ACCEPTANCE_RANKS)],
             gate_path,
         )
     )
@@ -555,11 +558,11 @@ def test_segment_loop_reaches_exact_five_then_ten_without_gpu_monitor(
         "material_manifest_sha256": "manifest-hash",
         "output_cadences": {f"output{number}": 0.5 for number in range(1, 12)},
     }
-    args = argparse.Namespace(ranks=8, allow_busy_gpus=False)
+    args = argparse.Namespace(ranks=run_case.ACCEPTANCE_RANKS, allow_busy_gpus=False)
     result = run_case.run_production_segments(
         args,
         run_dir,
-        [str(number) for number in range(8)],
+        [str(number) for number in range(run_case.ACCEPTANCE_RANKS)],
         status,
         staged,
         staged_input,
@@ -624,7 +627,7 @@ def test_exact_target_walltime_failure_is_persisted(tmp_path, monkeypatch):
         run_case.run_production_segments(
             argparse.Namespace(allow_busy_gpus=False),
             run_dir,
-            [str(number) for number in range(8)],
+            [str(number) for number in range(run_case.ACCEPTANCE_RANKS)],
             status,
             staged,
             staged_input,
@@ -670,7 +673,7 @@ def test_segment_requires_time_and_cycle_to_both_advance(tmp_path, monkeypatch):
         run_case.run_production_segments(
             argparse.Namespace(allow_busy_gpus=False),
             run_dir,
-            [str(number) for number in range(8)],
+            [str(number) for number in range(run_case.ACCEPTANCE_RANKS)],
             status,
             staged,
             staged_input,

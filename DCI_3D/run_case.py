@@ -32,7 +32,7 @@ TABLE_GENERATOR = CASE_DIR / "generate_reference_tables.py"
 MATERIAL_TABLE_DIR = CASE_DIR / "material_tables"
 MATERIAL_TABLE_MANIFEST = MATERIAL_TABLE_DIR / "manifest.json"
 
-# UCX transport settings for the eight-GPU node.  Deliberately empty: UCX_TLS is exported
+# UCX transport settings for the multi-GPU node.  Deliberately empty: UCX_TLS is exported
 # by bashrc_athenaK, and no explicit UCX_RNDV_THRESH is set.
 #
 # An override was added and then removed.  The large cuMemHostRegister cost that motivated
@@ -57,6 +57,11 @@ EXPECTED_MATERIAL_TABLES = {
         "material": "He",
         "sha256": "aae12f2dde296992ad630094e5755f7f52baa0816c678771e075f4848a9d63d0",
     },
+    "au.2t_eos": {
+        "kind": "two_temperature_eos",
+        "material": "Au",
+        "sha256": "57d75330db3c6363d9cd13406f4614591776eb307a506d44053101faa3c0c27d",
+    },
     "ch_20g.opacity": {
         "kind": "opacity",
         "material": "CH",
@@ -67,12 +72,19 @@ EXPECTED_MATERIAL_TABLES = {
         "material": "He",
         "sha256": "1e0daba15df1a23f5f558663e867dda181886ea53b0dbad119beb6fa1215f420",
     },
+    "au_20g.opacity": {
+        "kind": "opacity",
+        "material": "Au",
+        "sha256": "c233098c4d389f44ed4d7490172f8e0cd40e83b1023ab6132b7dc4b0742057e5",
+    },
 }
 TABLE_INPUT_OVERRIDES = {
     "materials/material0_eos_table_file": "material_tables/ch.2t_eos",
-    "materials/material1_eos_table_file": "material_tables/he.2t_eos",
+    "materials/material1_eos_table_file": "material_tables/au.2t_eos",
+    "materials/material2_eos_table_file": "material_tables/he.2t_eos",
     "materials/material0_opacity_table_file": "material_tables/ch_20g.opacity",
-    "materials/material1_opacity_table_file": "material_tables/he_20g.opacity",
+    "materials/material1_opacity_table_file": "material_tables/au_20g.opacity",
+    "materials/material2_opacity_table_file": "material_tables/he_20g.opacity",
 }
 BUILD_DIR = CASE_DIR / "build"
 BINARY = BUILD_DIR / "src" / "athena"
@@ -81,6 +93,9 @@ HELPER = Path(
 )
 ENV_SCRIPT = Path("/home/mengqi/Research/bashrc_athenaK")
 PROBLEM = "../../DCI_3D/dci_3d"
+# Number of GPUs/MPI ranks the acceptance layout is built for.  The deck's
+# 7x7x7 MeshBlock rank map gives exactly 49 blocks per rank at this count.
+ACCEPTANCE_RANKS = 7
 RUN_SENTINEL = ".athenak_dci_3d_run"
 RUN_LOCK = ".run_case.lock"
 RUN_STATUS = "run_status.json"
@@ -103,11 +118,13 @@ RESTART_PARAMETER_END = b"<par_end>\n"
 RESTART_FIXED_HEADER = struct.Struct("=ii9d19i19iddi")
 RESTART_LOCATION_BYTES = 4 * 4
 RESTART_COST_BYTES = 4
-PRODUCTION_MESH_SHAPE = (500, 256, 256)
-PRODUCTION_BLOCK_SHAPE = (50, 32, 32)
-PRODUCTION_MESHBLOCKS = 640
-PRODUCTION_ROOT_LEVEL = 4
-PRODUCTION_RESTART_DATA_SIZE = 17_397_504
+PRODUCTION_MESH_SHAPE = (315, 315, 315)
+PRODUCTION_BLOCK_SHAPE = (45, 45, 45)
+PRODUCTION_MESHBLOCKS = 343
+PRODUCTION_ROOT_LEVEL = 3
+# Double-precision restart payload for one 45^3 MHD MeshBlock with two user
+# composition scalars, two-temperature energies, and 20 radiation groups.
+PRODUCTION_RESTART_DATA_SIZE = 30_175_768
 REQUIRED_PRODUCTION_CHECKS = (
     "compact_20group_50step",
     "compact_output_and_restart",
@@ -155,7 +172,7 @@ def parse_args() -> argparse.Namespace:
         "--regenerate-material-tables",
         action="store_true",
         help=(
-            "recreate audited CH/He EOS and opacity tables from local 3d_zb.zip"
+            "recreate audited CH/Au/He EOS and opacity tables from local 3d_zb.zip"
         ),
     )
     parser.add_argument("--clean", action="store_true")
@@ -184,10 +201,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--jobs", type=int, default=40)
-    parser.add_argument("--ranks", type=int, default=8)
+    parser.add_argument("--ranks", type=int, default=ACCEPTANCE_RANKS)
     parser.add_argument(
         "--gpus",
-        default=os.environ.get("ATHENAK_TEST_GPUS", "0,1,2,3,4,5,6,7"),
+        default=os.environ.get("ATHENAK_TEST_GPUS", "0,1,2,3,4,5,6"),
         help="comma-separated physical CUDA device indices",
     )
     parser.add_argument("--run-dir", type=Path)
@@ -1048,8 +1065,10 @@ def device_ids(raw: str, ranks: int) -> list[str]:
         raise RuntimeError(
             f"Expected {ranks} unique GPU IDs, received {devices}"
         )
-    if ranks != 8:
-        raise RuntimeError("DCI_3D acceptance requires exactly eight MPI ranks/GPUs")
+    if ranks != ACCEPTANCE_RANKS:
+        raise RuntimeError(
+            f"DCI_3D acceptance requires exactly {ACCEPTANCE_RANKS} MPI ranks/GPUs"
+        )
     if any(not item.isdigit() for item in devices):
         raise RuntimeError(f"GPU IDs must be numeric physical indices: {devices}")
     return devices
@@ -1289,12 +1308,18 @@ def nonproduction_overrides(
     if radiation_c_light is not None:
         overrides.append(f"thermal_radiation/c_light={radiation_c_light:.17g}")
     if mode in ("validate", "smoke"):
-        # Scale 1 is two blocks per direction; scale 2 supplies a matched resolution gate.
+        # Keep the established compact 100x64x64 validation geometry at two blocks per
+        # direction; scale 2 supplies its matched resolution gate at four blocks per
+        # direction.  The compact blocks intentionally differ from the cubic production
+        # blocks.
         overrides.extend(
             (
                 f"mesh/nx1={100*compact_scale}",
                 f"mesh/nx2={64*compact_scale}",
                 f"mesh/nx3={64*compact_scale}",
+                "meshblock/nx1=50",
+                "meshblock/nx2=32",
+                "meshblock/nx3=32",
             )
         )
     overrides.extend(disabled_output_overrides())
@@ -1366,7 +1391,7 @@ def athena_mpi_prefix(
     command = [
         "mpirun",
         "-n",
-        "8",
+        str(ACCEPTANCE_RANKS),
         str(binary_path),
     ]
     if wall_time is not None:
@@ -1469,7 +1494,7 @@ def run_logged(
 def memory_is_accepted(memory: dict[str, object]) -> bool:
     records = memory.get("devices")
     errors = memory.get("errors")
-    if not isinstance(records, dict) or len(records) != 8 or errors:
+    if not isinstance(records, dict) or len(records) != ACCEPTANCE_RANKS or errors:
         return False
     return all(
         isinstance(record, dict) and bool(record.get("within_60_80_percent"))
@@ -1672,7 +1697,9 @@ def validate_resumed_production(
     validate_owned_resume_tree(run_dir)
     status = load_production_status(run_dir)
     if status.get("ranks") != args.ranks or status.get("gpus") != devices:
-        raise RuntimeError("--resume must use the original eight ranks and GPU mapping")
+        raise RuntimeError(
+            "--resume must use the original rank count and GPU mapping"
+        )
     run_id = status.get("run_id")
     if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
         raise RuntimeError("Production status has no valid run identity")

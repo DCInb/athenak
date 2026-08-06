@@ -4,12 +4,14 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file material_mixture.cpp
-//! \brief Input parsing for ideal and tabular two-material plasma closures.
+//! \brief Input parsing for ideal and tabular multi-material plasma closures.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 
 #include "athena.hpp"
@@ -73,19 +75,25 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
                                  units::Units *unit_system) {
   const int number_of_materials =
       pin->GetOrAddInteger("materials", "nmaterials", 2);
-  if (number_of_materials != 2) {
-    MaterialInputError("this closure requires nmaterials=2");
+  if (number_of_materials < 2 || number_of_materials > kMaxMaterials) {
+    MaterialInputError("nmaterials must be between 2 and " +
+                       std::to_string(kMaxMaterials));
   }
+  data_.nmaterials = number_of_materials;
+  // The closure advects nmaterials-1 mass fractions; the last component is the
+  // remainder.  scalar_index names the first of a contiguous run.
   const int relative_scalar =
       pin->GetOrAddInteger("materials", "scalar_index", 0);
-  if (relative_scalar < 0 || relative_scalar >= nuser_scalars) {
-    MaterialInputError("scalar_index must select a user passive scalar in <" +
-                       block + ">");
+  if (relative_scalar < 0 ||
+      relative_scalar+number_of_materials-1 > nuser_scalars) {
+    MaterialInputError("scalar_index must select " +
+                       std::to_string(number_of_materials-1) +
+                       " user passive scalars in <" + block + ">");
   }
   constexpr Real monatomic_gamma = 5.0/3.0;
   if (!std::isfinite(gamma) ||
       std::abs(gamma-monatomic_gamma) > 32.0*std::numeric_limits<Real>::epsilon()) {
-    MaterialInputError("the two-material closure currently requires <" + block +
+    MaterialInputError("the material-mixture closure currently requires <" + block +
                        ">/gamma=5/3");
   }
 
@@ -95,19 +103,26 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
   }
   data_.material0 = ReadMaterial(pin, 0, default_exchange_time);
   data_.material1 = ReadMaterial(pin, 1, default_exchange_time);
+  for (int n = 2; n < number_of_materials; ++n) {
+    data_.extra_material[n-2] = ReadMaterial(pin, n, default_exchange_time);
+  }
   data_.scalar_index = first_user_scalar+relative_scalar;
+  for (int n = 0; n < number_of_materials-1; ++n) {
+    data_.scalar_indices[n] = first_user_scalar+relative_scalar+n;
+  }
   data_.gamma_minus_one = gamma-1.0;
 
-  pin->GetOrAddString("materials", "material0_name", "material0");
-  pin->GetOrAddString("materials", "material1_name", "material1");
+  for (int n = 0; n < number_of_materials; ++n) {
+    pin->GetOrAddString("materials", Key(n, "name"), "material"+std::to_string(n));
+  }
 
   const bool has_table0 = pin->DoesParameterExist(
       "materials", "material0_eos_table_file");
-  const bool has_table1 = pin->DoesParameterExist(
-      "materials", "material1_eos_table_file");
-  if (has_table0 != has_table1) {
-    MaterialInputError(
-        "material0_eos_table_file and material1_eos_table_file must be supplied together");
+  for (int n = 1; n < number_of_materials; ++n) {
+    if (pin->DoesParameterExist("materials", Key(n, "eos_table_file")) !=
+        has_table0) {
+      MaterialInputError("every material*_eos_table_file must be supplied together");
+    }
   }
   if (!has_table0) {
     if (unit_system != nullptr) {
@@ -117,7 +132,7 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     return;
   }
   if (unit_system == nullptr) {
-    MaterialInputError("tabular two-temperature EOS requires a <units> block");
+    MaterialInputError("tabular multi-material two-temperature EOS requires a <units> block");
   }
 
   const std::string mixing_rule = pin->GetOrAddString(
@@ -166,32 +181,28 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     MaterialInputError("eos_wave_speed_safety must be finite and at least one");
   }
 
-  const std::string file0 = pin->GetString(
-      "materials", "material0_eos_table_file");
-  const std::string file1 = pin->GetString(
-      "materials", "material1_eos_table_file");
-  material0_table_ = std::make_unique<IonmixTwoTemperatureTable>(file0, options);
-  material1_table_ = std::make_unique<IonmixTwoTemperatureTable>(file1, options);
-  CheckAbar(0, data_.material0, material0_table_->Metadata());
-  CheckAbar(1, data_.material1, material1_table_->Metadata());
-
-  const std::string fingerprint0 = pin->GetOrAddString(
-      "materials", "material0_eos_table_fingerprint",
-      material0_table_->Metadata().file_fingerprint);
-  const std::string fingerprint1 = pin->GetOrAddString(
-      "materials", "material1_eos_table_fingerprint",
-      material1_table_->Metadata().file_fingerprint);
-  if (fingerprint0 != material0_table_->Metadata().file_fingerprint) {
-    MaterialInputError(
-        "material0_eos_table_fingerprint does not match the loaded file");
+  for (int n = 0; n < number_of_materials; ++n) {
+    const std::string file = pin->GetString("materials", Key(n, "eos_table_file"));
+    tables_[n] = std::make_unique<IonmixTwoTemperatureTable>(file, options);
+    const SpeciesProperties &species =
+        (n == 0) ? data_.material0
+                 : ((n == 1) ? data_.material1 : data_.extra_material[n-2]);
+    CheckAbar(n, species, tables_[n]->Metadata());
+    const std::string fingerprint = pin->GetOrAddString(
+        "materials", Key(n, "eos_table_fingerprint"),
+        tables_[n]->Metadata().file_fingerprint);
+    if (fingerprint != tables_[n]->Metadata().file_fingerprint) {
+      MaterialInputError(
+          Key(n, "eos_table_fingerprint")+" does not match the loaded file");
+    }
+    if (n == 0) {
+      data_.material0_table = tables_[n]->DeviceData();
+    } else if (n == 1) {
+      data_.material1_table = tables_[n]->DeviceData();
+    } else {
+      data_.extra_material_table[n-2] = tables_[n]->DeviceData();
+    }
   }
-  if (fingerprint1 != material1_table_->Metadata().file_fingerprint) {
-    MaterialInputError(
-        "material1_eos_table_fingerprint does not match the loaded file");
-  }
-
-  data_.material0_table = material0_table_->DeviceData();
-  data_.material1_table = material1_table_->DeviceData();
   data_.density_to_cgs = options.density_to_cgs;
   data_.temperature_to_kelvin = options.temperature_to_kelvin;
   data_.use_tabular_eos = true;

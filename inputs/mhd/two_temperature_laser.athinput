@@ -63,6 +63,21 @@ oblique_turning = true
 max_reflections_per_ray = 8
 reflection_offset_fraction = 1.0e-10
 nbeams = 1
+
+# Inline FLASH-style shared pulse tables. Declared but disabled (npulses=0) so the
+# regression suite can enable them from the command line.
+npulses = 0
+pulse0_nsections = 4
+pulse0_time_0 = 0.0
+pulse0_time_1 = 0.0
+pulse0_time_2 = 0.0
+pulse0_time_3 = 0.0
+pulse0_power_0 = 0.0
+pulse0_power_1 = 0.0
+pulse0_power_2 = 0.0
+pulse0_power_3 = 0.0
+pulse0_time_scale = 1.0
+pulse0_power_scale = 1.0
 max_segments_per_launch = 16
 max_transport_iterations = 16
 max_mpi_waves = 1024
@@ -98,6 +113,7 @@ beam0_end_time = 1.0
 beam0_pulse_file =
 beam0_pulse_mode = relative
 beam0_pulse_interpolation = linear
+beam0_pulse_number = -1
 beam0_pulse_time_scale = 1.0
 beam0_pulse_power_scale = 1.0
 

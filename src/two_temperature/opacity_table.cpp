@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -494,16 +495,23 @@ OpacityTableDevice OpacityTable::DeviceData() const {
 
 MixedOpacityTable::MixedOpacityTable(
     ParameterInput *pin, int expected_groups,
-    const DualArray1D<Real> &expected_group_bounds) :
-    material0_(pin, expected_groups, expected_group_bounds,
-               "materials", "material0_opacity"),
-    material1_(pin, expected_groups, expected_group_bounds,
-               "materials", "material1_opacity") {}
+    const DualArray1D<Real> &expected_group_bounds, int nmaterials) :
+    nmaterials_(nmaterials) {
+  for (int n = 0; n < nmaterials_; ++n) {
+    tables_.push_back(std::make_unique<OpacityTable>(
+        pin, expected_groups, expected_group_bounds, "materials",
+        "material"+std::to_string(n)+"_opacity"));
+  }
+}
 
 MixedOpacityTableDevice MixedOpacityTable::DeviceData() const {
   MixedOpacityTableDevice result;
-  result.material0 = material0_.DeviceData();
-  result.material1 = material1_.DeviceData();
+  result.nmaterials = nmaterials_;
+  result.material0 = tables_[0]->DeviceData();
+  result.material1 = tables_[1]->DeviceData();
+  for (int n = 2; n < nmaterials_; ++n) {
+    result.extra_material[n-2] = tables_[n]->DeviceData();
+  }
   return result;
 }
 

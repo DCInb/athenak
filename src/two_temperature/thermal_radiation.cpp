@@ -229,6 +229,9 @@ struct FLDFaceMaterialState {
   Real density;
   Real electron_temperature;
   Real material0_mass_fraction;
+  //! Density-weighted face composition. Valid when the mixture is active; for
+  //! nmaterials=2 its first entry equals material0_mass_fraction exactly.
+  materials::MaterialComposition composition;
 };
 
 struct FLDRadiationFaceState {
@@ -258,6 +261,21 @@ FLDFaceMaterialState X1FaceMaterialState(
     state.material0_mass_fraction = (density_sum > 0.0)
         ? (density_left*y_left+density_right*y_right)/density_sum
         : 0.5*(y_left+y_right);
+    // Average every advected fraction with the same density weighting, then let the
+    // closure normalize; this keeps the nmaterials=2 result bit-identical.
+    {
+      const materials::MaterialComposition left =
+          mixture.CompositionFromPrimitive(w, m, k, j, i-1);
+      const materials::MaterialComposition right =
+          mixture.CompositionFromPrimitive(w, m, k, j, i);
+      Real fractions[materials::kMaxMaterials-1];
+      for (int n = 0; n < mixture.nmaterials-1; ++n) {
+        fractions[n] = (density_sum > 0.0)
+            ? (density_left*left.y[n]+density_right*right.y[n])/density_sum
+            : 0.5*(left.y[n]+right.y[n]);
+      }
+      state.composition = mixture.CompositionFromFractions(fractions);
+    }
     state.electron_temperature = 0.5*(
         temperature(m, 1, k, j, i-1)+temperature(m, 1, k, j, i));
   } else {
@@ -286,6 +304,21 @@ FLDFaceMaterialState X2FaceMaterialState(
     state.material0_mass_fraction = (density_sum > 0.0)
         ? (density_left*y_left+density_right*y_right)/density_sum
         : 0.5*(y_left+y_right);
+    // Average every advected fraction with the same density weighting, then let the
+    // closure normalize; this keeps the nmaterials=2 result bit-identical.
+    {
+      const materials::MaterialComposition left =
+          mixture.CompositionFromPrimitive(w, m, k, j-1, i);
+      const materials::MaterialComposition right =
+          mixture.CompositionFromPrimitive(w, m, k, j, i);
+      Real fractions[materials::kMaxMaterials-1];
+      for (int n = 0; n < mixture.nmaterials-1; ++n) {
+        fractions[n] = (density_sum > 0.0)
+            ? (density_left*left.y[n]+density_right*right.y[n])/density_sum
+            : 0.5*(left.y[n]+right.y[n]);
+      }
+      state.composition = mixture.CompositionFromFractions(fractions);
+    }
     state.electron_temperature = 0.5*(
         temperature(m, 1, k, j-1, i)+temperature(m, 1, k, j, i));
   } else {
@@ -314,6 +347,21 @@ FLDFaceMaterialState X3FaceMaterialState(
     state.material0_mass_fraction = (density_sum > 0.0)
         ? (density_left*y_left+density_right*y_right)/density_sum
         : 0.5*(y_left+y_right);
+    // Average every advected fraction with the same density weighting, then let the
+    // closure normalize; this keeps the nmaterials=2 result bit-identical.
+    {
+      const materials::MaterialComposition left =
+          mixture.CompositionFromPrimitive(w, m, k-1, j, i);
+      const materials::MaterialComposition right =
+          mixture.CompositionFromPrimitive(w, m, k, j, i);
+      Real fractions[materials::kMaxMaterials-1];
+      for (int n = 0; n < mixture.nmaterials-1; ++n) {
+        fractions[n] = (density_sum > 0.0)
+            ? (density_left*left.y[n]+density_right*right.y[n])/density_sum
+            : 0.5*(left.y[n]+right.y[n]);
+      }
+      state.composition = mixture.CompositionFromFractions(fractions);
+    }
     state.electron_temperature = 0.5*(
         temperature(m, 1, k-1, j, i)+temperature(m, 1, k, j, i));
   } else {
@@ -566,16 +614,23 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   } else if (opacity_model == "table" || opacity_model == "tabulated" ||
              opacity_model == "mixed-table" ||
              opacity_model == "mixed_tabulated") {
+    // Every active component needs its own opacity table; the mixture decides how many.
+    const int opacity_materials =
+        use_material_mixture_ ? material_mixture->NumberOfMaterials() : 2;
     const bool material0_table = pin->DoesParameterExist(
         "materials", "material0_opacity_table_file");
-    const bool material1_table = pin->DoesParameterExist(
-        "materials", "material1_opacity_table_file");
-    if (material0_table != material1_table) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Mixed opacity requires both <materials>/"
-                << "material0_opacity_table_file and material1_opacity_table_file"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
+    bool material1_table = material0_table;
+    for (int n = 1; n < opacity_materials; ++n) {
+      const bool present = pin->DoesParameterExist(
+          "materials", "material"+std::to_string(n)+"_opacity_table_file");
+      if (n == 1) material1_table = present;
+      if (present != material0_table) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Mixed opacity requires a "
+                  << "material*_opacity_table_file for all "
+                  << opacity_materials << " materials" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
     const bool explicitly_mixed =
         (opacity_model == "mixed-table" || opacity_model == "mixed_tabulated");
@@ -594,7 +649,8 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
         std::exit(EXIT_FAILURE);
       }
       use_mixed_opacity_table_ = true;
-      mixed_opacity_table_ = new MixedOpacityTable(pin, ngroups, group_bounds_);
+      mixed_opacity_table_ = new MixedOpacityTable(
+          pin, ngroups, group_bounds_, opacity_materials);
     } else {
       use_opacity_table_ = true;
       opacity_table_ = new OpacityTable(pin, ngroups, group_bounds_);
@@ -752,7 +808,7 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
     if (use_mixed_table) {
       mixed_opacity_location = mixed_opacity.Locate(
           material.density, material.electron_temperature,
-          material.material0_mass_fraction);
+          material.composition);
     } else if (use_table) {
       opacity_location = opacity.Locate(
           material.density, material.electron_temperature);
@@ -792,7 +848,7 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
     if (use_mixed_table) {
       mixed_opacity_location = mixed_opacity.Locate(
           material.density, material.electron_temperature,
-          material.material0_mass_fraction);
+          material.composition);
     } else if (use_table) {
       opacity_location = opacity.Locate(
           material.density, material.electron_temperature);
@@ -832,7 +888,7 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
     if (use_mixed_table) {
       mixed_opacity_location = mixed_opacity.Locate(
           material.density, material.electron_temperature,
-          material.material0_mass_fraction);
+          material.composition);
     } else if (use_table) {
       opacity_location = opacity.Locate(
           material.density, material.electron_temperature);
@@ -900,10 +956,10 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real density = cons(m, IDN, k, j, i);
     Real eele_old = fmax(cons(m, ie, k, j, i), 0.0);
-    Real y0 = 0.0;
+    materials::MaterialComposition composition;
     Real tele;
     if (use_materials) {
-      y0 = mixture.Material0MassFractionFromConserved(cons, m, k, j, i);
+      composition = mixture.CompositionFromConserved(cons, m, k, j, i);
       tele = temperature(m, 1, k, j, i);
     } else {
       tele = gm1*eele_old/(density*fe);
@@ -911,7 +967,9 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     OpacityTableLocation opacity_location;
     if (use_table) opacity_location = opacity.Locate(density, tele);
     MixedOpacityTableLocation mixed_location;
-    if (use_mixed_table) mixed_location = mixed_opacity.Locate(density, tele, y0);
+    if (use_mixed_table) {
+      mixed_location = mixed_opacity.Locate(density, tele, composition);
+    }
     Real blackbody = arad*tele*tele*tele*tele;
     Real positive = 0.0;
     Real negative = 0.0;
@@ -952,7 +1010,7 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     if (use_materials && mixture.UsesTabularEOS()) {
       const materials::MaterialPressureEnergyState floor_state =
           mixture.MinimumPressureEnergyState(
-              density, y0, pressure_floor, temperature_floor);
+              density, composition, pressure_floor, temperature_floor);
       eele_floor = density*floor_state.electron_specific_internal_energy;
     }
     // Absorbed radiation is immediately available, but tabular emission may not draw
@@ -984,7 +1042,7 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
       temperature(m, 1, k, j, i) = gm1*eele_new/(density*fe);
     } else if (!mixture.UsesTabularEOS()) {
       temperature(m, 1, k, j, i) =
-          mixture.ElectronTemperature(density, eele_new/density, y0);
+          mixture.ElectronTemperature(density, eele_new/density, composition);
     }
     diag(m, 0, k, j, i) = total_radiation/density;
     diag(m, 1, k, j, i) = pow(total_radiation/arad, 0.25);
@@ -1070,7 +1128,7 @@ void ThermalRadiation::NewTimeStep(
     if (use_mixed_table) {
       mixed_opacity_location = mixed_opacity.Locate(
           material.density, material.electron_temperature,
-          material.material0_mass_fraction);
+          material.composition);
     } else if (use_table) {
       opacity_location = opacity.Locate(
           material.density, material.electron_temperature);
@@ -1120,7 +1178,7 @@ void ThermalRadiation::NewTimeStep(
       if (use_mixed_table) {
         mixed_opacity_location = mixed_opacity.Locate(
             material.density, material.electron_temperature,
-            material.material0_mass_fraction);
+            material.composition);
       } else if (use_table) {
         opacity_location = opacity.Locate(
             material.density, material.electron_temperature);
@@ -1170,7 +1228,7 @@ void ThermalRadiation::NewTimeStep(
       if (use_mixed_table) {
         mixed_opacity_location = mixed_opacity.Locate(
             material.density, material.electron_temperature,
-            material.material0_mass_fraction);
+            material.composition);
       } else if (use_table) {
         opacity_location = opacity.Locate(
             material.density, material.electron_temperature);
@@ -1220,10 +1278,10 @@ void ThermalRadiation::NewTimeStep(
       Real density = w0(m, IDN, k, j, i);
       Real cell_dt = FLT_MAX;
       Real source_rate = 0.0;
-      Real y0 = 0.0;
+      materials::MaterialComposition composition;
       Real tele;
       if (use_materials) {
-        y0 = mixture.Material0MassFractionFromPrimitive(w0, m, k, j, i);
+        composition = mixture.CompositionFromPrimitive(w0, m, k, j, i);
         tele = temperature(m, 1, k, j, i);
       } else {
         tele = gm1*w0(m, ie, k, j, i)/fe;
@@ -1234,7 +1292,9 @@ void ThermalRadiation::NewTimeStep(
       OpacityTableLocation opacity_location;
       if (use_table) opacity_location = opacity.Locate(density, tele);
       MixedOpacityTableLocation mixed_location;
-      if (use_mixed_table) mixed_location = mixed_opacity.Locate(density, tele, y0);
+      if (use_mixed_table) {
+        mixed_location = mixed_opacity.Locate(density, tele, composition);
+      }
 
       for (int g = 0; g < ng; ++g) {
         int n = i0+g;

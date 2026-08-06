@@ -38,19 +38,23 @@ be described as bit-for-bit FLASH behavior.
 
 ## User requirements that override the archive
 
-The first AthenaK version retains the explicitly requested:
+The AthenaK case now follows the archive for target shape, domain, materials, beams, and
+pulse.  Only these user requirements remain as overrides:
 
-- all-CH shell with outer radius 1.0 mm and thickness 0.2 mm;
-- 1.1 g/cm3 initial CH density;
-- Gaussian beam in space;
-- square pulse in time;
-- 1ω wavelength, taken as 1.053 micrometres;
-- 10 kJ total incident energy over 5 ns;
-- a converging spot covering most of the projected open shell;
+- 1.1 g/cm3 initial CH density (the archive agrees: `sim_rhoFoam = 1.1`);
 - evolution through 10 ns;
-- uniform mesh using 60--80 percent of every one of eight V100 GPUs.
+- uniform mesh using 60--80 percent of every available V100 GPU.
 
-These choices are not claimed to reproduce the archived 3ω, uniform, four-beam pulse.
+Two earlier overrides have been withdrawn.  The first version used a requested
+single-beam drive (axial 1ω Gaussian, square 10 kJ/5 ns pulse); the laser now follows
+`ParDir/1l_4beam_BB.par` directly.  The first version also used a requested 1.0 mm CH
+shell of 0.2 mm thickness; the target is now the archive's own 0.52--0.55 mm cap plus its
+Au cone, so the archived beam coordinates apply without rescaling.
+
+That change is self-validating: sampling all four 0.275 mm apertures, every ray lands on
+the CH cap, and the outermost strikes it at 49.89 degrees against the 50-degree cap edge.
+The archived beams were evidently sized for exactly this target, a fit that the earlier
+1.0 mm shell obscured (rays then hit at only ~34 degrees, lighting an annulus).
 
 ## Reference choices carried into AthenaK
 
@@ -70,10 +74,11 @@ The newest laser/Biermann reference is `3d_zb/ParDir/1l_4beam_BB.par` together w
 - Hall and explicit resistivity are disabled;
 - all full-domain hydro boundaries are outflow;
 - the run ends at 10 ns;
-- CH and helium use IONMIX material tables.
+- CH, gold, and helium use IONMIX material tables.
 
-The archived Au cone is omitted because the requested target is an open spherical CH
-shell and one conservative scalar is reserved for CH versus helium.  Electron conduction
+The archived Au cone is now included: `MaterialMixture` was generalized from a fixed two
+material closure to `nmaterials` components, and the deck advects two mass fractions
+(`rho*Y_CH`, `rho*Y_Au`) with helium as the remainder.  Electron conduction
 is a reference feature (SpitzerHighZ with Larsen limiter 0.06) but is not an explicit
 first-version acceptance requirement; any omission must remain documented until a
 material-aware conduction model is implemented and tested.
@@ -83,10 +88,16 @@ material-aware conduction model is implemented and tested.
 | Role | Material | Abar | Zbar | Initial density | EOS source | Opacity source |
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | shell | equimolar CH | 6.5 | 3.5 | 1.1 g/cm3 | `C16H1620gPROP.cn4` | `feos_snop_CH_20g.cn4` |
+| cone | Au | 196.96655 | 79 | 19.2 g/cm3 | `feos_snop_Au.cn4` | `feos_snop_Au_20g.cn4` |
 | ambient | He | 4.002602 | 2 | 1.0e-5 g/cm3 | `He_20G_yr23.cn4` | `He20g.cn4` |
 
-The conservative passive scalar stores `rho*Y_CH`; `Y_He=1-Y_CH`.  Mixed opacity uses
-partial material densities and additive extinction,
+The Au sources are exactly the files the archived deck names (`eos_coneTableFile` and
+`op_coneFileName`).  Gold's Zeff is taken as its Zbar, and the laser reads the local
+tabular ionization rather than the deck constant, so inverse-bremsstrahlung absorption in
+the cone follows the Au table instead of a CH surrogate.
+
+The two conservative passive scalars store `rho*Y_CH` and `rho*Y_Au`;
+`Y_He=1-Y_CH-Y_Au`. Mixed opacity uses partial material densities and additive extinction,
 
 ```text
 kappa_mix(rho, Te, Y) = sum_s Y_s kappa_s(rho*Y_s, Te).
@@ -99,8 +110,9 @@ are clamped to the nearest endpoint.  EOS energy and ionization use the minimum-
 surface, while trace-material pressure is scaled linearly from that surface to zero as the
 partial density vanishes; this is an explicit part of the AthenaK closure.
 
-`generate_reference_tables.py` verifies the archive hash and converts the separate CH/He
-ion-electron EOS surfaces plus both opacity payloads into ignored local AthenaK tables.
+`generate_reference_tables.py` verifies the archive hash and converts the separate
+CH/Au/He ion-electron EOS surfaces plus all three opacity payloads into ignored local
+AthenaK tables.
 Its manifest records hashes of the archive members and generated files.
 
 ## Radiation groups
@@ -123,24 +135,48 @@ radiation reservoir is not relatively converged, its absolute difference is norm
 deposited laser energy and bounded separately while its relative difference remains
 reported.
 
-## Laser comparison
+## Laser drive adopted from the archive
 
-The newest archived laser deck has four 50,000-ray uniform beams at 0.351 micrometres.
-They are inclined approximately 50 degrees from `-z`, have equal 0.275 mm lens/target
-radii (collimated), and use a shaped pulse inferred to integrate to 7.0982 kJ total.
-Those settings demonstrate the archive's ray and symmetry conventions but conflict with
-the requested 1ω Gaussian converging 10 kJ square drive.  The AthenaK laser therefore
-uses one axial 4,096-ray beam launched from the positive-x boundary with a 0.72 mm
-Gaussian aperture focused to 0.58 mm at the positive-x outer-surface apex.  The rays
-propagate right to left and irradiate the curved outer cap before reaching that tangent
-focal plane.  Incident,
-deposited, and escaped-radiation power are recorded for energy closure.  Initial compact
-and production-layout sweeps establish a hard cap of 64.  An evolved 100-cycle
-doubled-mesh sweep additionally brackets the one-percent underdense rearm band, the
-`1e-5`-cell normal offset, and caps 64/128; it retains zero terminal power with at most
-19 observed turns per ray.  Wave-cap and reflection-cap remainders are reported
-separately, are fatal above `1e-10` of launched power, and are checked in every baseline,
-resolution, light-speed, and calibration laser record by the production gate.
+The newest archived laser deck, `ParDir/1l_4beam_BB.par`, is now adopted directly.  It
+defines four uniform beams at 0.351 micrometres (3ω) inclined 50 degrees from the cone
+axis at the four diagonal azimuths, with equal 0.275 mm lens/target radii (collimated)
+and one shared 13-section picket pulse that integrates to 1774.55 J per beam, 7.0982 kJ
+total.  The AthenaK decks map the archive's cone axis `+z` to `+x1` (`x -> x2`,
+`y -> x3`) and convert cm to the 0.1 cm code length unit:
+
+```text
+ed_lens (+/-0.14142, +/-0.14142, 0.2037) cm -> lens (2.037, +/-1.4142, +/-1.4142)
+ed_target (0, 0, 0.0359) cm               -> target (0.359, 0, 0)
+ed_lens/targetSemiAxis 0.0275 cm          -> aperture_radius = target_radius = 0.275
+ed_wavelength 0.351 um                    -> wavelength 3.51e-5 cm (unit_system=cgs)
+ed_time/ed_power pulse 1 (s, W)           -> pulse0 knots (code ns, erg/s)
+```
+
+The pulse is written inline through the laser module's FLASH-style shared tables
+(`npulses`, `pulse0_nsections`, `pulse0_time_S`/`pulse0_power_S`) and each beam
+references it with `beamN_pulse_number`, which is an absolute power table exactly like
+`ed_pulseNumber`.  Explicit modeling choices in this mapping:
+
+- The archived `ed_numberOfRays = 50000` is used as each beam's deterministic
+  Fibonacci-aperture ray count.  FLASH's `delta2D` grid at the archived 1 um spacing
+  would instead produce about 237,000 grid rays per beam; the parameter file's stated
+  ray count is honored rather than the implied delta-grid count.
+- The beams and the target now come from the same archived deck, so no aim rescaling is
+  needed.  Sampling all four apertures, every ray reaches the CH cap and the outermost
+  lands at 49.89 degrees against the 50-degree cap edge, confirming the archived spot
+  size was chosen for this shell.
+- Beam `start_time`/`end_time` remain `0`/`5 ns` as an independent gate; the pulse
+  itself is zero outside `[0, 4.71] ns`.
+
+Incident, deposited, and escaped-radiation power are recorded for energy closure.
+Initial compact and production-layout sweeps (performed with the earlier single-beam
+drive) establish a hard reflection cap of 64.  An evolved 100-cycle doubled-mesh sweep
+additionally brackets the one-percent underdense rearm band, the `1e-5`-cell normal
+offset, and caps 64/128; it retains zero terminal power with at most 19 observed turns
+per ray.  Those chatter-control selections carry over unchanged.  Wave-cap and
+reflection-cap remainders are reported separately, are fatal above `1e-10` of launched
+power, and are checked in every baseline, resolution, light-speed, and calibration
+laser record by the production gate.
 
 ## Exchange and numerical controls
 

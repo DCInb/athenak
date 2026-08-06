@@ -109,7 +109,7 @@ Real MaterialElectronDensityCgs(
         m, two_temperature::TwoTemperature::electron_number_density_cgs,
         k, j, i), 0.0);
   }
-  const Real y0 = mixture.Material0MassFractionFromPrimitive(
+  const auto y0 = mixture.CompositionFromPrimitive(
       primitive, m, k, j, i);
   return mixture.ElectronNumberDensityCgs(
       primitive(m, IDN, k, j, i), density_scale_cgs, y0);
@@ -826,7 +826,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                       m, two_temperature::TwoTemperature::effective_charge,
                       k, j, i), 0.0);
                 } else if (use_materials) {
-                  Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                  const auto y0 = material_mixture.CompositionFromPrimitive(
                       primitive, m, k, j, i);
                   local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
                   local_temperature_scale *=
@@ -1290,7 +1290,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
                     m, two_temperature::TwoTemperature::effective_charge,
                     k, j, i), 0.0);
               } else if (use_materials) {
-                Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+                const auto y0 = material_mixture.CompositionFromPrimitive(
                     primitive, m, k, j, i);
                 local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
                 local_temperature_scale *=

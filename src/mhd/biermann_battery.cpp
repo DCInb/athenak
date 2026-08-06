@@ -441,12 +441,12 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
         } else if (use_materials) {
           const Real rho_l = fmax(w(m, IDN, k, j, i-1), dfloor);
           const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
-          const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
-              w, m, k, j, i-1);
-          const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
-              w, m, k, j, i);
-          const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
-                               material_mixture.ElectronNumberDensity(rho_r, y_r));
+              const auto mix_l = material_mixture.CompositionFromPrimitive(
+                  w, m, k, j, i-1);
+              const auto mix_r = material_mixture.CompositionFromPrimitive(
+                  w, m, k, j, i);
+          const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, mix_l)+
+                               material_mixture.ElectronNumberDensity(rho_r, mix_r));
           inv_ne = 1.0/ne;
         } else {
           const Real rho = fmax(
@@ -507,12 +507,12 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           } else if (use_materials) {
             const Real rho_l = fmax(w(m, IDN, k, j-1, i), dfloor);
             const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
-            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k, j-1, i);
-            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k, j, i);
-            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
-                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+                const auto mix_l = material_mixture.CompositionFromPrimitive(
+                    w, m, k, j-1, i);
+                const auto mix_r = material_mixture.CompositionFromPrimitive(
+                    w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, mix_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, mix_r));
             inv_ne = 1.0/ne;
           } else {
             const Real rho = fmax(
@@ -568,12 +568,12 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
           } else if (use_materials) {
             const Real rho_l = fmax(w(m, IDN, k-1, j, i), dfloor);
             const Real rho_r = fmax(w(m, IDN, k, j, i), dfloor);
-            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k-1, j, i);
-            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k, j, i);
-            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
-                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+                const auto mix_l = material_mixture.CompositionFromPrimitive(
+                    w, m, k-1, j, i);
+                const auto mix_r = material_mixture.CompositionFromPrimitive(
+                    w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, mix_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, mix_r));
             inv_ne = 1.0/ne;
           } else {
             const Real rho = fmax(
@@ -624,12 +624,12 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
               minimum_electron_fraction, minimum_positive, m, k, j, i);
           drift = -coeff*mask*j1*FaceInverseElectronDensity(ne_l, ne_r);
         } else if (use_materials) {
-          const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
-              w, m, k, j, i-1);
-          const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
-              w, m, k, j, i);
-          const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
-                               material_mixture.ElectronNumberDensity(rho_r, y_r));
+              const auto mix_l = material_mixture.CompositionFromPrimitive(
+                  w, m, k, j, i-1);
+              const auto mix_r = material_mixture.CompositionFromPrimitive(
+                  w, m, k, j, i);
+          const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, mix_l)+
+                               material_mixture.ElectronNumberDensity(rho_r, mix_r));
           drift = -coeff*mask*j1/ne;
         } else {
           const Real rho = fmax(0.5*(rho_l+rho_r), dfloor);
@@ -693,12 +693,12 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                 minimum_electron_fraction, minimum_positive, m, k, j, i);
             drift = -coeff*mask*j2*FaceInverseElectronDensity(ne_l, ne_r);
           } else if (use_materials) {
-            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k, j-1, i);
-            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k, j, i);
-            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
-                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+                const auto mix_l = material_mixture.CompositionFromPrimitive(
+                    w, m, k, j-1, i);
+                const auto mix_r = material_mixture.CompositionFromPrimitive(
+                    w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, mix_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, mix_r));
             drift = -coeff*mask*j2/ne;
           } else {
             const Real rho = fmax(0.5*(rho_l+rho_r), dfloor);
@@ -761,12 +761,12 @@ void BiermannBattery::AddFluxes(const DvceArray5D<Real> &prim,
                 minimum_electron_fraction, minimum_positive, m, k, j, i);
             drift = -coeff*mask*j3*FaceInverseElectronDensity(ne_l, ne_r);
           } else if (use_materials) {
-            const Real y_l = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k-1, j, i);
-            const Real y_r = material_mixture.Material0MassFractionFromPrimitive(
-                w, m, k, j, i);
-            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, y_l)+
-                                 material_mixture.ElectronNumberDensity(rho_r, y_r));
+                const auto mix_l = material_mixture.CompositionFromPrimitive(
+                    w, m, k-1, j, i);
+                const auto mix_r = material_mixture.CompositionFromPrimitive(
+                    w, m, k, j, i);
+            const Real ne = 0.5*(material_mixture.ElectronNumberDensity(rho_l, mix_l)+
+                                 material_mixture.ElectronNumberDensity(rho_r, mix_r));
             drift = -coeff*mask*j3/ne;
           } else {
             const Real rho = fmax(0.5*(rho_l+rho_r), dfloor);
@@ -883,9 +883,9 @@ void BiermannBattery::AddEMFs(DvceEdgeFld4D<Real> &efld) {
                   pe *= bounded.activation;
                   ne = bounded.value;
                 } else if (use_materials) {
-                  const Real y = material_mixture.Material0MassFractionFromPrimitive(
+                  const auto mix_y = material_mixture.CompositionFromPrimitive(
                       w, m, ks, jc, ic);
-                  ne = material_mixture.ElectronNumberDensity(rho, y);
+                  ne = material_mixture.ElectronNumberDensity(rho, mix_y);
                 } else {
                   ne = fe*rho;
                 }
@@ -952,10 +952,10 @@ void BiermannBattery::AddEMFs(DvceEdgeFld4D<Real> &efld) {
                     pe *= bounded.activation;
                     ne = bounded.value;
                   } else if (use_materials) {
-                    const Real y =
-                        material_mixture.Material0MassFractionFromPrimitive(
+                    const auto mix_y =
+                        material_mixture.CompositionFromPrimitive(
                             w, m, kc, jc, ic);
-                    ne = material_mixture.ElectronNumberDensity(rho, y);
+                    ne = material_mixture.ElectronNumberDensity(rho, mix_y);
                   } else {
                     ne = fe*rho;
                   }
@@ -1355,18 +1355,18 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           dln1 = fmax(fabs(log(ne_p.value)-log_ne),
                       fabs(log_ne-log(ne_m.value)))/dx1;
         } else if (use_materials) {
-          const Real y0 = material_mixture.Material0MassFractionFromPrimitive(
+          const auto mix_y0 = material_mixture.CompositionFromPrimitive(
               w, m, k, j, i);
-          local_fe = material_mixture.ElectronHeatCapacityFraction(y0);
-          ne = material_mixture.ElectronNumberDensity(rho, y0);
+          local_fe = material_mixture.ElectronHeatCapacityFraction(mix_y0);
+          ne = material_mixture.ElectronNumberDensity(rho, mix_y0);
           const Real rho_p = fmax(w(m, IDN, k, j, i+1), dfloor);
           const Real rho_m = fmax(w(m, IDN, k, j, i-1), dfloor);
-          const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
+          const auto mix_p = material_mixture.CompositionFromPrimitive(
               w, m, k, j, i+1);
-          const Real y_m = material_mixture.Material0MassFractionFromPrimitive(
+          const auto mix_m = material_mixture.CompositionFromPrimitive(
               w, m, k, j, i-1);
-          const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
-          const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
+          const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, mix_p);
+          const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, mix_m);
           log_ne = log(ne);
           dln1 = fmax(fabs(log(ne_p)-log_ne),
                       fabs(log_ne-log(ne_m)))/dx1;
@@ -1395,12 +1395,12 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           } else if (use_materials) {
             const Real rho_p = fmax(w(m, IDN, k, j+1, i), dfloor);
             const Real rho_m = fmax(w(m, IDN, k, j-1, i), dfloor);
-            const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
+            const auto mix_p = material_mixture.CompositionFromPrimitive(
                 w, m, k, j+1, i);
-            const Real y_m = material_mixture.Material0MassFractionFromPrimitive(
+            const auto mix_m = material_mixture.CompositionFromPrimitive(
                 w, m, k, j-1, i);
-            const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
-            const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
+            const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, mix_p);
+            const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, mix_m);
             dln2 = fmax(fabs(log(ne_p)-log_ne),
                         fabs(log_ne-log(ne_m)))/dx2;
           } else {
@@ -1425,12 +1425,12 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
           } else if (use_materials) {
             const Real rho_p = fmax(w(m, IDN, k+1, j, i), dfloor);
             const Real rho_m = fmax(w(m, IDN, k-1, j, i), dfloor);
-            const Real y_p = material_mixture.Material0MassFractionFromPrimitive(
+            const auto mix_p = material_mixture.CompositionFromPrimitive(
                 w, m, k+1, j, i);
-            const Real y_m = material_mixture.Material0MassFractionFromPrimitive(
+            const auto mix_m = material_mixture.CompositionFromPrimitive(
                 w, m, k-1, j, i);
-            const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, y_p);
-            const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, y_m);
+            const Real ne_p = material_mixture.ElectronNumberDensity(rho_p, mix_p);
+            const Real ne_m = material_mixture.ElectronNumberDensity(rho_m, mix_m);
             dln3 = fmax(fabs(log(ne_p)-log_ne),
                         fabs(log_ne-log(ne_m)))/dx3;
           } else {

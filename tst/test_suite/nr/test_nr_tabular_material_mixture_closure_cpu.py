@@ -244,10 +244,13 @@ def test_cached_flux_and_exchange_sources():
         1)[1].split(
             "ComponentTemperatureState SpeciesTemperatureFromRhoTemperature(",
             1)[0]
+    # The mixture now loops over its components instead of unrolling two materials, so
+    # one guarded call inside the loop covers every species in ascending index order.
     assert mixture_cached_source.count(
-        "SpeciesComponentFromCachedDensity(") == 2
-    assert mixture_cached_source.index("material0_table") < (
-        mixture_cached_source.index("material1_table"))
+        "SpeciesComponentFromCachedDensity(") == 1
+    assert "for (int n = 0; n < mix.count; ++n)" in mixture_cached_source
+    assert "SpeciesTable(n)" in mixture_cached_source
+    assert "cache.material[n]" in mixture_cached_source
 
     cached_inverse_source = material_source.split(
         "ComponentAtTemperature MixtureComponentFromRhoSpecificEnergyCached(",
@@ -268,15 +271,16 @@ def test_cached_flux_and_exchange_sources():
         1)[1].split(
             "int MixtureComponentSpecificEnergyQueryFlags(",
             1)[0]
-    assert single_inverse_source.count("MixedDensityCache cache;") == 1
+    # Composition form plus its scalar-y0 forwarding overload: each owns one cache.
+    assert single_inverse_source.count("MixedDensityCache cache;") == 2
     assert single_inverse_source.count(
-        "MixtureComponentFromRhoSpecificEnergyCached(") == 1
+        "MixtureComponentFromRhoSpecificEnergyCached(") == 2
 
     reduced_flag_source = material_source.split(
         "int MixtureComponentSpecificEnergyQueryFlags(", 1)[1].split(
             "ComponentPairAtTemperature MixtureComponentsFromRhoSpecificEnergies(",
             1)[0]
-    assert reduced_flag_source.count("MixedDensityCache cache;") == 1
+    assert reduced_flag_source.count("MixedDensityCache cache;") == 2
     assert "for (int iteration = 0;" not in reduced_flag_source
 
     pair_inverse_source = material_source.split(
@@ -305,10 +309,12 @@ def test_cached_flux_and_exchange_sources():
         1)[1].split(
             "MaterialPressureEnergyState TabularPressureEnergyFromRhoTemperatures(",
             1)[0]
+    # Component loop plus the scalar-y0 forwarding overload: one guarded species call
+    # inside the loop, evaluated in ascending component order.
     assert paired_mixture_source.count(
-        "SpeciesPressureEnergyFromRhoTemperature(") == 2
-    assert paired_mixture_source.index("material0_table") < (
-        paired_mixture_source.index("material1_table"))
+        "SpeciesPressureEnergyFromRhoTemperature(") == 1
+    assert "for (int n = 0; n < mix.count; ++n)" in paired_mixture_source
+    assert "SpeciesTable(n)" in paired_mixture_source
     paired_species_source = material_source.split(
         "MaterialPressureEnergyState SpeciesPressureEnergyFromRhoTemperature(",
         1)[1].split(
@@ -330,12 +336,14 @@ def test_cached_flux_and_exchange_sources():
     native_mixture_source = material_source.split(
         "MaterialPressureEnergyState TabularPressureEnergyFromRhoNativeMinimum(",
         1)[1].split("MaterialPressureEnergyState IdealPressureEnergy", 1)[0]
+    # One native/non-native branch pair inside the component loop, plus the scalar-y0
+    # forwarding overload; the per-component mask bit selects the native surface.
     assert native_mixture_source.count(
-        "SpeciesPressureEnergyFromRhoMinimumTemperature(") == 2
+        "SpeciesPressureEnergyFromRhoMinimumTemperature(") == 1
     assert native_mixture_source.count(
-        "SpeciesPressureEnergyFromRhoTemperature(") == 2
-    assert native_mixture_source.index("material0_table") < (
-        native_mixture_source.index("material1_table"))
+        "SpeciesPressureEnergyFromRhoTemperature(") == 1
+    assert "for (int n = 0; n < mix.count; ++n)" in native_mixture_source
+    assert "native_material_mask & (1 << n)" in native_mixture_source
     # The prepared token is forward-only; pure endpoints retain the direct inverse API.
     assert "PreparedDensitySpecificEnergy" not in ionmix_source
     assert "SpecificEnergyFromPreparedDensity" not in ionmix_source
@@ -349,7 +357,9 @@ def test_cached_flux_and_exchange_sources():
     # Radiation coupling consumes only the electron floor energy.
     assert radiation_source.count("mixture.MinimumPressureEnergyState(") == 1
     assert "mixture.MinimumStateNoSound(" not in radiation_source
-    assert "density, y0, pressure_floor, temperature_floor" in radiation_source
+    assert "density, composition, pressure_floor, temperature_floor" in (
+        radiation_source)
+    assert "closed.composition" in exchange_source
     assert "eele_old-eele_floor-negative" in radiation_source
     assert '"eos_flags"' in output_source
     assert "TwoTemperature::eos_query_flags" in output_source

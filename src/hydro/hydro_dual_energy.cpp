@@ -93,7 +93,7 @@ void Hydro::ApplyDualEnergyFormalism(const Real dt) {
     const Real component_sum = eion + eele;
     Real initial_fraction = fe0;
     if (use_materials) {
-      const Real y0 = material_mixture.Material0MassFractionFromConserved(
+      const auto y0 = material_mixture.CompositionFromConserved(
           u0_, m, k, j, i, eos.dfloor);
       if (material_mixture.UsesTabularEOS()) {
         const materials::MaterialPressureEnergyState state =
@@ -202,7 +202,7 @@ void Hydro::SynchronizeDualEnergyFromTotal() {
     const Real component_sum = eion + eele;
     Real initial_fraction = fe0;
     if (use_materials) {
-      const Real y0 = material_mixture.Material0MassFractionFromConserved(
+      const auto y0 = material_mixture.CompositionFromConserved(
           u0_, m, k, j, i, eos.dfloor);
       if (material_mixture.UsesTabularEOS()) {
         const materials::MaterialPressureEnergyState floor =
@@ -221,7 +221,7 @@ void Hydro::SynchronizeDualEnergyFromTotal() {
         }
         Real ion_fraction;
         const bool zero_residual_fast_path =
-            y0 > 0.0 && y0 < 1.0 && eion > 0.0 && eele > 0.0 &&
+            material_mixture.IsMixed(y0) && eion > 0.0 && eele > 0.0 &&
             Kokkos::isfinite(eint_aux) && eint_aux == component_sum &&
             material_mixture.TabularPressureSumsAreSafelyFinite();
         if (zero_residual_fast_path) {

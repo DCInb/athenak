@@ -396,7 +396,9 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
             "phase1_exit_code": 0, "phase2_exit_code": 0,
             "case_artifacts": artifacts,
             "phase1_mpi_command": ["time/nlim=50"],
-            "baseline_processes": {str(index): [] for index in range(8)},
+            "baseline_processes": {
+                str(index): [] for index in range(gate.ACCEPTANCE_RANKS)
+            },
         }
 
     smoke_status = status("smoke")
@@ -412,7 +414,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
             str(index): {
                 "name": "Tesla V100-SXM2-16GB", "peak_fraction": 0.7,
                 "within_60_80_percent": True,
-            } for index in range(8)
+            } for index in range(gate.ACCEPTANCE_RANKS)
         },
     }
 
@@ -463,8 +465,12 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
 
     deck = tmp_path/"dci.athinput"
     deck.write_text(
+        "<mesh>\nx1min = -0.45\nx1max = 0.75\nx2min = -0.6\nx2max = 0.6\n"
+        "x3min = -0.6\nx3max = 0.6\n"
         "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
-        "<laser>\nbeam0_power = 2e19\n"
+        "<laser>\nnbeams = 4\npulse0_nsections = 2\n"
+        "pulse0_time_0 = 0\npulse0_time_1 = 1\n"
+        "pulse0_power_0 = 1.77455e19\npulse0_power_1 = 1.77455e19\n"
         "max_reflections_per_ray = 64\n"
         "max_mpi_waves = 1024\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")
@@ -699,16 +705,24 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     write_history(sources["physical_history"], final_time=1.0e-2)
 
     deck.write_text(
+        "<mesh>\nx1min = -0.45\nx1max = 0.75\nx2min = -0.6\nx2max = 0.6\n"
+        "x3min = -0.6\nx3max = 0.6\n"
         "<thermal_radiation>\nc_light = 10\nn_groups = 20\n"
-        "<laser>\nbeam0_power = 2e19\n"
+        "<laser>\nnbeams = 4\npulse0_nsections = 2\n"
+        "pulse0_time_0 = 0\npulse0_time_1 = 1\n"
+        "pulse0_power_0 = 1.77455e19\npulse0_power_1 = 1.77455e19\n"
         "max_reflections_per_ray = 64\n"
         "max_mpi_waves = 1024\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")
     checks = gate.evaluate_checks(sources, settings)
     assert not checks["compact_20group_50step"]["passed"]
     deck.write_text(
+        "<mesh>\nx1min = -0.45\nx1max = 0.75\nx2min = -0.6\nx2max = 0.6\n"
+        "x3min = -0.6\nx3max = 0.6\n"
         "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
-        "<laser>\nbeam0_power = 2e19\n"
+        "<laser>\nnbeams = 4\npulse0_nsections = 2\n"
+        "pulse0_time_0 = 0\npulse0_time_1 = 1\n"
+        "pulse0_power_0 = 1.77455e19\npulse0_power_1 = 1.77455e19\n"
         "max_reflections_per_ray = 64\n"
         "max_mpi_waves = 1024\n"
         "beam0_start_time = 0\nbeam0_end_time = 5\n")

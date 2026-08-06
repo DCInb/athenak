@@ -514,6 +514,12 @@ int main(int argc, char **argv) {
     mixture.density_to_cgs = 1.0;
     mixture.temperature_to_kelvin = 1.0;
     mixture.wave_speed_safety = 1.05;
+    materials::MaterialMixtureDevice three_mixture = mixture;
+    three_mixture.nmaterials = 3;
+    three_mixture.extra_material[0].abar = 12.0;
+    three_mixture.extra_material[0].zbar = 1.5;
+    three_mixture.extra_material[0].zeff = 3.0;
+    three_mixture.extra_material_table[0] = ch.DeviceData();
     materials::MaterialMixtureDevice nonlinear_mixture = mixture;
     nonlinear_mixture.material0_table = nonlinear_ch.DeviceData();
     nonlinear_mixture.material1_table = nonlinear_he.DeviceData();
@@ -525,6 +531,9 @@ int main(int argc, char **argv) {
     ideal_mixture.material1 = mixture.material1;
     ideal_mixture.use_tabular_eos = false;
     ideal_mixture.gamma_minus_one = 2.0/3.0;
+    materials::MaterialMixtureDevice ideal_three_mixture = ideal_mixture;
+    ideal_three_mixture.nmaterials = 3;
+    ideal_three_mixture.extra_material[0] = three_mixture.extra_material[0];
 
     // Clone the paired value/log-value views, then make both component-energy surfaces
     // vary with density. The primary fixtures intentionally use density-independent
@@ -637,6 +646,83 @@ int main(int argc, char **argv) {
           const Real ne_he = 0.5*2.0/4.0;
           const Real expected_zeff = (ne_ch*6.0+ne_he*4.0)/(ne_ch+ne_he);
           if (!NearlyEqual(mixed.effective_charge, expected_zeff)) {
+            ++local_failures;
+          }
+
+          // Exercise the actual three-component path rather than only checking that the
+          // generalized source loops exist. The third component deliberately reuses a
+          // table with distinct species weights so both table and ideal mixing are tested.
+          Real three_fractions[2] = {0.2, 0.3};
+          const materials::MaterialComposition mix3 =
+              three_mixture.CompositionFromFractions(three_fractions);
+          materials::MaterialComposition pure[3];
+          for (int n = 0; n < 3; ++n) {
+            pure[n].count = 3;
+            for (int q = 0; q < 3; ++q) pure[n].y[q] = 0.0;
+            pure[n].y[n] = 1.0;
+          }
+          materials::MaterialThermodynamicState component[3];
+          for (int n = 0; n < 3; ++n) {
+            component[n] = three_mixture.StateFromRhoTemperaturesNoSound(
+                density*mix3.y[n], 100.0, 100.0, pure[n]);
+          }
+          const auto mixed3 = three_mixture.StateFromRhoTemperatures(
+              density, 100.0, 100.0, mix3);
+          Real expected_ion_energy = 0.0;
+          Real expected_electron_energy = 0.0;
+          Real expected_ion_pressure = 0.0;
+          Real expected_electron_pressure = 0.0;
+          Real expected_electron_density = 0.0;
+          int expected_flags = materials::ionmix_query_in_bounds;
+          for (int n = 0; n < 3; ++n) {
+            expected_ion_energy +=
+                mix3.y[n]*component[n].ion_specific_internal_energy;
+            expected_electron_energy +=
+                mix3.y[n]*component[n].electron_specific_internal_energy;
+            expected_ion_pressure += component[n].ion_pressure;
+            expected_electron_pressure += component[n].electron_pressure;
+            expected_electron_density += component[n].electron_number_density_cgs;
+            expected_flags |= component[n].query_flags;
+          }
+          const auto inverse3 = three_mixture.StateFromRhoSpecificEnergies(
+              density, mixed3.ion_specific_internal_energy,
+              mixed3.electron_specific_internal_energy, mix3);
+          const auto electron3 = three_mixture.ElectronStateFromRhoSpecificEnergy(
+              density, mixed3.electron_specific_internal_energy, mix3);
+          const auto ideal3 = ideal_three_mixture.StateFromRhoTemperaturesNoSound(
+              density, 2.5, 1.5, mix3);
+          Real overshoot_fractions[2] = {0.8, 0.7};
+          const auto overshoot =
+              three_mixture.CompositionFromFractions(overshoot_fractions);
+          if (!NearlyEqual(mix3.y[0], 0.2) ||
+              !NearlyEqual(mix3.y[1], 0.3) ||
+              !NearlyEqual(mix3.y[2], 0.5) ||
+              !NearlyEqual(mixed3.ion_specific_internal_energy,
+                           expected_ion_energy) ||
+              !NearlyEqual(mixed3.electron_specific_internal_energy,
+                           expected_electron_energy) ||
+              !NearlyEqual(mixed3.ion_pressure, expected_ion_pressure) ||
+              !NearlyEqual(mixed3.electron_pressure,
+                           expected_electron_pressure) ||
+              !NearlyEqual(mixed3.electron_number_density_cgs,
+                           expected_electron_density) ||
+              mixed3.query_flags != expected_flags ||
+              !(mixed3.sound_speed_squared > 0.0) ||
+              !NearlyEqual(inverse3.ion_temperature, 100.0) ||
+              !NearlyEqual(inverse3.electron_temperature, 100.0) ||
+              !NearlyEqual(electron3.electron_temperature, 100.0) ||
+              !NearlyEqual(electron3.electron_pressure,
+                           mixed3.electron_pressure) ||
+              !NearlyEqual(electron3.electron_number_density_cgs,
+                           mixed3.electron_number_density_cgs) ||
+              !NearlyEqual(ideal_three_mixture.ElectronTemperature(
+                               density,
+                               ideal3.electron_specific_internal_energy,
+                               mix3),
+                           1.5) ||
+              !NearlyEqual(overshoot.y[0], 0.8/1.5) ||
+              !NearlyEqual(overshoot.y[1], 0.7/1.5) ||
+              overshoot.y[2] != 0.0) {
             ++local_failures;
           }
 
