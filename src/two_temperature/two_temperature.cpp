@@ -846,6 +846,16 @@ void TwoTemperature::AddRadiationFluxes(const DvceArray5D<Real> &prim,
 
 //----------------------------------------------------------------------------------------
 
+void TwoTemperature::SolveImplicitRadiationTransport(
+    const Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
+    MeshBoundaryValuesCC *pbval) {
+  if (pradiation != nullptr) {
+    pradiation->SolveImplicitTransport(dt, cons, prim, temperature, pbval);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+
 void TwoTemperature::RadiationNewTimeStep(const DvceArray5D<Real> &prim) {
   if (pradiation != nullptr) pradiation->NewTimeStep(prim, temperature);
 }

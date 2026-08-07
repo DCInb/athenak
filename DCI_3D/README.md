@@ -40,8 +40,8 @@ while CH matches its analytic cap mass to within `0.01%`.
 
 The deck runs on either carrier.  Renaming the `<mhd>` block to `<hydro>` (and nothing
 else) switches the case to pure hydrodynamics: the same target, laser drive, tabular
-CH/Au/He 3T closure, 20-group AP-FLD transport, dual energy, and Spitzer exchange, with no
-magnetic field evolved at all.  The `biermann_*` parameters stay in the block and are
+CH/Au/He 3T closure, 20-group centered implicit FLD transport, dual energy, and Spitzer
+exchange, with no magnetic field evolved at all.  The `biermann_*` parameters stay in the block and are
 reported as ignored on startup, because the Biermann battery is a magnetic-field source
 and has no meaning without `<mhd>`.
 
@@ -117,6 +117,16 @@ scaled linearly from that surface to zero as its partial density vanishes.  This
 rule is testable and recovers both pure-material limits, but it is not claimed to reproduce
 an unavailable FLASH mixing implementation bit-for-bit.
 
+Both DCI decks select `eos_table_bounds = flash-extrapolate`.  Native table values are
+unchanged through the last temperature node.  Above it, each positive pressure and
+specific-energy surface continues with the logarithmic slope of its final interval (or a
+continuous `T^1` ideal-gas tail when that interval has no positive increasing slope),
+while mean ionization remains at its endpoint value.  The inverse closure expands its
+temperature bracket above the native maximum, including for any runtime material count,
+so laser-deposited energy is not retained in the conservative state while temperature and
+pressure are pinned to the endpoint.  This follows FLASH's use of a wider configured EOS
+temperature bracket; the original `clamp` and `error` policies remain available.
+
 `run_case.py` verifies the source manifest, copies the six tables and manifest into the
 owned run directory, and launches with run-relative `material_tables/...` paths.  Restarts
 therefore see byte-identical tables and the same auto-recorded table fingerprints, and the
@@ -127,27 +137,90 @@ transferred run tree is self-contained.
 The reference boundaries are `1, 10, 50, 100, 150, 250, 400, 550, 700, 900, 1200,
 1600, 2000, 2200, 2400, 2600, 2800, 3100, 3500, 4000, 10000 eV`.  Both decks use the
 matching CH/Au/He Rosseland and Planck coefficients, harmonic flux limiter with coefficient
-one, and zero-energy Dirichlet radiation ghosts on every global face.
+one, and vacuum (zero-energy ghost) radiation boundaries on every global face.
 
-Optically thin transport uses the explicit asymptotic-preserving face flux.  The deck pins
-all controls instead of relying on defaults:
+The production and calibration decks are uniform-grid cases.  In implicit mode AthenaK
+computes a harmonic-limited FLD coefficient from the old-state centered cell gradient,
+and retains the physical coefficient at resolved gradients.  Only a roundoff-flat
+flux-limited cell receives the causal regularization
+`D <= flux_limit_coefficient*dx_min/2`.  The frozen cell coefficient halo is explicitly
+exchanged before the solve, so both MPI ranks use the same arithmetic coefficient on a
+shared face even when the preceding implicit-conduction step refreshed only interior
+temperatures.  A physical vacuum face separately enforces
+`D_face <= flux_limit_coefficient*dx_normal/2`; the matrix operator, Jacobi diagonal, and
+`rad_Pesc` surface flux all use that same capped face coefficient.  The resulting
+centered finite-volume backward-Euler system is solved by Jacobi-preconditioned conjugate
+gradients (PCG), not by the explicit AP/upwind face flux.  This first implicit
+implementation rejects multilevel meshes rather than applying an unverified coarse-fine
+diffusion operator:
 
 ```text
+transport_integrator = implicit
+implicit_tolerance = 1.0e-10
+implicit_max_iterations = 2000
+implicit_x1_inner_boundary = vacuum
+implicit_x1_outer_boundary = vacuum
+# ...and the matching x2/x3 inner/outer faces
+source_cfl = 0.1
+
+# Explicit-mode fallback controls; inactive in the centered implicit solve:
 transport_discretization = asymptotic-preserving
 ap_streaming_threshold = 0.5
 ap_optical_depth_threshold = 1.0
 ```
 
-The production candidate uses a documented reduced light speed
-`c_hat=3.0e9 cm/s = 30 mm/ns`, about `c/10`.  Physical light speed would require many
-more global steps at this mesh spacing before tighter hydro/laser limits and would make
-the requested 10 ns evolution impractical.  This RSLA is a modeling approximation, not a
-numerical identity: production is gated on matched compact comparisons against
-`c_hat=10` and physical `c`.  Laser deposition, ion/electron energy, chain energy, and
-laser centroid must each differ by at most five percent.  The radiation reservoir is
-small but not relatively converged, so its relative difference is reported while its
-absolute difference must remain below one percent of deposited laser energy.  Opacity is
-never inflated to compensate for the reduced speed.
+The DCI decks pin a relative PCG tolerance of `1e-10` and allow 2000 iterations per
+group.  The incoming conserved radiation state must already be finite and nonnegative.
+A recursively converged PCG result is accepted only after a fresh true-residual
+evaluation of `b-Ax`.  Non-finite values or negative values larger than the tolerance
+scale are fatal.  Finite tolerance-scale solver undershoots alone may be set to zero
+while all positive cells receive one volume-weighted rescaling that preserves the
+global volume-integrated group energy; the projected state must then pass another true
+`b-Ax` residual check.  This cleanup is not a general clipping or positivity substitute.
+
+The physical-`c`, time-lagged backward-Euler strategy follows FLASH MGD; this does not
+claim that AthenaK reproduces FLASH's spatial discretization or fully coupled nonlinear
+source solve.  FLASH retains physical `c`, evaluates the diffusion/opacity/flux-limiter
+coefficients at the old state, and solves each radiation group backward implicitly
+(FLASH 4.8 guide, equations 25.6 and 19.2).  Its archived DCI decks set
+`dt_diff_factor=1.0e100`, explicitly labelled "Disable diffusion dt".  AthenaK therefore
+uses physical
+`c=2.99792458e10 cm/s = 299.792458 mm/ns`; `c` remains in both FLD transport and
+emission/absorption, but transport no longer contributes an explicit `c*dt/dx` limit.
+
+Only the transport stability restriction is disabled.  AthenaK's local
+emission/absorption update is implicit and positivity preserving, but it time-lags the
+emission state and is not FLASH's fully coupled nonlinear source solve.  DCI therefore
+retains `source_cfl=0.1` as an independent source-splitting accuracy guard.  This guard
+limits the fractional matter-radiation source change; it does not restore a `c*dt/dx`
+transport limit, but it still contains physical `c` through the source rate.  At DCI
+initialization it reduces the candidate step from `1.068285e-6 ns` with the guard
+disabled to `7.88743694e-7 ns`, about 26 percent.  The archived `rt_dtFactor=0.02`
+setting is inactive because
+`rt_computeDt` defaults false, but that FLASH switch does not map directly to AthenaK's
+source guard.  The legacy `--radiation-c-light` launcher option is retained only for
+non-production model-sensitivity diagnostics; it is not used to make the production
+timestep affordable.
+
+The focused implicit regressions compare dense centered backward-Euler reference
+matrices for constant periodic diffusion, variable harmonic-limited periodic diffusion,
+and harmonic-limited vacuum diffusion.  The transport-only timestep test disables matter
+coupling and its source guard; in that deliberately isolated case changing physical `c`
+does not add an explicit transport CFL.  It must not be read as saying that the full DCI
+macro timestep is independent of `c`, because `source_cfl` remains active as quantified
+above.
+
+On the exact implementation and decks described here, 10 focused CPU tests passed, the
+CUDA/MPI target built, and compact seven-GPU initialization validation passed.  A
+seven-GPU 50-cycle phase-1 smoke also passed in 27.36 s, ending at
+`t=6.542658936097e-05 ns` with `eos_bad=0`.  Its domain-integrated CH/Au/He mass fractions
+were respectively `0.07224481712971552`, `0.9276974187345620`, and
+`5.776413572244726e-05`, summing to one within roundoff.  This time is about 382 times
+shorter than the historical first bad-EOS observation at `0.025 ns`; the smoke therefore
+checks integration and early behavior, not long-time elimination of the original DCI
+symptom.  It is also not evidence for SMR/AMR, a nonlinear coefficient iteration, or
+full-scale PCG convergence/performance.  Quantitative vacuum-loss/energy closure,
+restart, long-horizon, and production-scale gates below remain required.
 
 ## Laser
 
@@ -223,12 +296,15 @@ requested plane.
 
 ## Mesh and output cadence
 
-The measured production candidate is `315 x 315 x 315` cubic `3.81 um` cells with
+The historically measured production candidate is `315 x 315 x 315` cubic `3.81 um` cells with
 `45 x 45 x 45` MeshBlocks: `7 x 7 x 7 = 343` blocks, exactly 49 blocks per rank on the
 seven available GPUs.  That resolves both the `30 um` CH shell and the `31 um` Au cone
 wall with about eight cells.  The measured allocation is 10,050--10,054 MiB, or
 61.3--61.4 percent, on every V100 with no pre-existing compute process or monitor error.
 A `288^3` trial used 51.0 percent and a `320^3` layout exhausted the 16 GiB cards.
+Those allocation measurements predate the current implicit-radiation work arrays and are
+sizing history, not current-tree production evidence; the full calibration must be
+remeasured.
 
 The rank map assigns one complete `x3` slab per rank so that no rank boundary cuts a
 ray's path along the drive axis.  Over 60 cycles that measured 110.2 s against 120.2 s
@@ -236,7 +312,11 @@ for plain `z_order`, even though it moves about twice as many rays across ranks;
 radially interleaved map that balances near-axis work more evenly on paper was the
 slowest of the three.
 
-History is written every `0.025 ns`.  Its 20 reductions include laser deposited energy
+Those rank-map timings also predate the current 20-group Jacobi-PCG transport.  Full-scale
+iteration counts, convergence, memory use, and runtime are unproven.  A multigrid or
+stronger preconditioner is future work if Jacobi-PCG is not adequate at production scale.
+
+History is written every `0.025 ns`.  Its 22 reductions include laser deposited energy
 and power, outward radiation power, total/CH mass, material/kinetic/magnetic/ion/electron
 energies, total and three broad-band radiation energies, matter-plus-radiation energy,
 integrated `|B|`, laser/radiation x-centroid numerators, and separate counts for the
@@ -247,6 +327,8 @@ rule.  The lower-energy flag is allowed in at most five percent of cells because
 requested 11,606 K start is only 0.013 percent above the helium table edge; density-high,
 temperature, and energy-high flags retain a strict zero tolerance.
 Integrating `rad_Pesc` permits the chain-energy budget to include radiation boundary loss.
+Explicit FLD obtains that power from finite-volume face fluxes; implicit FLD reports the
+centered discrete surface integral from its converged backward-Euler solution.
 All 20 individual group fields remain available in `fluid_3t` (`mhd_3t`/`hydro_3t`)
 outputs.
 
@@ -296,8 +378,9 @@ single-file MPI layout; the gate requires all 20 `eradNN` fields and exactly
 python3 DCI_3D/run_case.py --clean --mode smoke
 ```
 
-Generate matched doubled-resolution, `c_hat=10`, and physical-light-speed evidence in
-separate owned trees:
+Generate matched doubled-resolution and optional reduced-light-speed diagnostic evidence,
+plus an extended physical-`c` stability run, in separate owned trees.  Implicit transport
+keeps all default smoke runs at 50 cycles regardless of a diagnostic `c_light` override:
 
 ```bash
 python3 DCI_3D/run_case.py --clean --mode smoke --compact-scale 2 \
@@ -321,7 +404,7 @@ Calibration returns status 2 unless every GPU's measured allocation increase is 
 
 An actual `--mode production` call requires ignored local
 `DCI_3D/production_gate.json`.  It is generated from the five smoke, resolution,
-reduced-speed, physical-speed, and calibration evidence trees above; it is never
+reduced-speed diagnostic, extended physical-speed, and calibration evidence trees above; it is never
 hand-authored.  Preview all derived metrics without writing, then create or update it:
 
 ```bash
@@ -352,15 +435,15 @@ The exact required check names are:
 - `gpu_memory_60_80_all`
 
 The evidence must show finite, nonnegative ion/electron/group energies and no disallowed
-EOS-table clamps; a timestep of order `dx/c` without secular collapse; the archived
+EOS-table clamps; an implicit-transport timestep that is not bounded by `dx/c`; the archived
 `7.0982 kJ` four-beam incident energy and laser power closure with no
 wave/reflection-cap remainder and at least a factor-two
 margin to both the reflection and distributed-transport-wave caps in every baseline,
 resolution, light-speed, and calibration solve; chain-energy closure including
 integrated outward radiation; CH-mass
 conservation; continuous restart time/timestep/energies; a doubled-resolution or
-opacity-sensitivity result; acceptable `c_hat=30` versus `10` and physical-`c`
-sensitivity under the split matter/radiation limits above; and 60--80 percent memory on
+opacity-sensitivity result; acceptable optional reduced-`c` diagnostic and extended
+physical-`c` behavior under the split matter/radiation limits above; and 60--80 percent memory on
 all seven V100s.  Every laser record must contain an integral `waves` diagnostic.  The
 full-layout calibration must also reach exactly 22 complete cycles, covering exactly 44
 RK2 laser solves before production can be staged.

@@ -657,6 +657,12 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
       }, Kokkos::Sum<array_sum::GlobalSum>(sum_this_rank));
   Kokkos::fence();
 
+  // Explicit FLD contributes directly to uflx above.  The backward-Euler solve is
+  // operator split, so add its step-averaged physical-boundary surface integral here.
+  if (prad->IsImplicit()) {
+    sum_this_rank.the_array[2] += prad->implicit_boundary_power;
+  }
+
   for (int n = 0; n < pdata->nhist; ++n) {
     pdata->hdata[n] = sum_this_rank.the_array[n];
   }

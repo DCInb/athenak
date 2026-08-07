@@ -14,6 +14,7 @@
 #include "materials/material_mixture.hpp"
 
 class MeshBlockPack;
+class MeshBoundaryValuesCC;
 class ParameterInput;
 
 namespace two_temperature {
@@ -89,6 +90,9 @@ class TwoTemperature {
 
   // Add multigroup FLD fluxes and compute their explicit stability limit.
   void AddRadiationFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx);
+  void SolveImplicitRadiationTransport(Real dt, DvceArray5D<Real> &cons,
+                                       DvceArray5D<Real> &prim,
+                                       MeshBoundaryValuesCC *pbval);
   void RadiationNewTimeStep(const DvceArray5D<Real> &prim);
 
   // Public because nvcc requires a member enclosing an extended device lambda to have

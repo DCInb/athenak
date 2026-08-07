@@ -165,8 +165,11 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     options.bounds_policy = IonmixBoundsPolicy::clamp;
   } else if (bounds == "error") {
     options.bounds_policy = IonmixBoundsPolicy::error;
+  } else if (bounds == "flash-extrapolate") {
+    options.bounds_policy = IonmixBoundsPolicy::flash_extrapolate;
   } else {
-    MaterialInputError("eos_table_bounds must be 'clamp' or 'error'");
+    MaterialInputError(
+        "eos_table_bounds must be 'clamp', 'error', or 'flash-extrapolate'");
   }
   if (interpolation == "geometric") {
     options.geometric_interpolation = true;

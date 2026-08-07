@@ -4,17 +4,21 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file thermal_radiation.cpp
-//! \brief Explicit multigroup FLD and electron-radiation energy exchange.
+//! \brief Explicit/implicit multigroup FLD and electron-radiation energy exchange.
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "athena.hpp"
+#include "bvals/bvals.hpp"
 #include "coordinates/cell_locations.hpp"
+#include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
 #include "two_temperature/opacity_table.hpp"
@@ -30,6 +34,31 @@ constexpr Real kRealEpsilon = FLT_EPSILON;
 #else
 constexpr Real kRealEpsilon = DBL_EPSILON;
 #endif
+
+[[noreturn]] void ImplicitRadiationError(const std::string &message) {
+  if (global_variable::my_rank == 0) {
+    std::cerr << "### FATAL ERROR in " << __FILE__ << std::endl
+              << message << std::endl;
+  }
+#if MPI_PARALLEL_ENABLED
+  MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+#endif
+  std::exit(EXIT_FAILURE);
+}
+
+KOKKOS_INLINE_FUNCTION
+bool IsPhysicalBoundary(const BoundaryFlag flag) {
+  return flag != BoundaryFlag::block && flag != BoundaryFlag::periodic &&
+         flag != BoundaryFlag::shear_periodic && flag != BoundaryFlag::undef;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ImplicitFrozenFaceCoefficient(const Real center, const Real neighbor,
+                                   const bool vacuum_face,
+                                   const Real vacuum_face_cap) {
+  const Real arithmetic_face = 0.5*(center+neighbor);
+  return vacuum_face ? fmin(arithmetic_face, vacuum_face_cap) : arithmetic_face;
+}
 
 // The face flux can be written as
 //
@@ -443,6 +472,81 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   energy_floor_ = pin->GetOrAddReal("thermal_radiation", "energy_floor", 1.0e-30);
   source_cfl_ = pin->GetOrAddReal("thermal_radiation", "source_cfl", 0.1);
   couple_matter_ = pin->GetOrAddBoolean("thermal_radiation", "couple_matter", true);
+  const std::string transport_integrator = pin->GetOrAddString(
+      "thermal_radiation", "transport_integrator", "explicit");
+  if (transport_integrator == "explicit") {
+    implicit_transport_ = false;
+  } else if (transport_integrator == "implicit") {
+    implicit_transport_ = true;
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Unknown <thermal_radiation>/transport_integrator='"
+              << transport_integrator << "'; expected explicit or implicit" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const Real minimum_implicit_tolerance = 64.0*kRealEpsilon;
+  const Real default_implicit_tolerance =
+      std::max(static_cast<Real>(1.0e-10), minimum_implicit_tolerance);
+  implicit_tolerance_ = pin->GetOrAddReal(
+      "thermal_radiation", "implicit_tolerance", default_implicit_tolerance);
+  implicit_max_iterations_ = pin->GetOrAddInteger(
+      "thermal_radiation", "implicit_max_iterations", 400);
+  implicit_report_ = pin->GetOrAddBoolean(
+      "thermal_radiation", "implicit_report", false);
+  if (!std::isfinite(implicit_tolerance_) ||
+      implicit_tolerance_ < minimum_implicit_tolerance ||
+      implicit_tolerance_ >= 1.0 ||
+      implicit_max_iterations_ <= 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Implicit radiation tolerance must be finite, at least "
+              << minimum_implicit_tolerance << ", and less than one; iteration limit "
+              << "must be positive" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (implicit_transport_ && ppack->pmesh->multilevel) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Implicit thermal-radiation transport does not yet "
+              << "support SMR/AMR" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
+  const char *boundary_names[6] = {
+      "implicit_x1_inner_boundary", "implicit_x1_outer_boundary",
+      "implicit_x2_inner_boundary", "implicit_x2_outer_boundary",
+      "implicit_x3_inner_boundary", "implicit_x3_outer_boundary"};
+  const char *value_names[6] = {
+      "implicit_x1_inner_value", "implicit_x1_outer_value",
+      "implicit_x2_inner_value", "implicit_x2_outer_value",
+      "implicit_x3_inner_value", "implicit_x3_outer_value"};
+  for (int face = 0; face < 6; ++face) {
+    const std::string boundary = pin->GetOrAddString(
+        "thermal_radiation", boundary_names[face], "neumann");
+    if (boundary == "neumann" || boundary == "zero-gradient" ||
+        boundary == "reflecting") {
+      implicit_boundary_type_[face] = 0;
+    } else if (boundary == "dirichlet") {
+      implicit_boundary_type_[face] = 1;
+    } else if (boundary == "vacuum") {
+      implicit_boundary_type_[face] = 2;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Unknown <thermal_radiation>/"
+                << boundary_names[face] << "='" << boundary
+                << "'; expected neumann, dirichlet, or vacuum" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    implicit_boundary_value_[face] = pin->GetOrAddReal(
+        "thermal_radiation", value_names[face], 0.0);
+    if (!std::isfinite(implicit_boundary_value_[face]) ||
+        implicit_boundary_value_[face] < 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Implicit radiation boundary values must be finite "
+                << "and non-negative" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  // These AP/upwind controls apply only to the explicit face-flux path.  The implicit
+  // integrator uses a centered frozen-coefficient diffusion matrix.
   std::string transport_discretization = pin->GetOrAddString(
       "thermal_radiation", "transport_discretization", "asymptotic-preserving");
   if (transport_discretization == "asymptotic-preserving" ||
@@ -621,6 +725,25 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   int ncells2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
   Kokkos::realloc(diagnostics, nmb, 2, ncells3, ncells2, ncells1);
+  if (implicit_transport_) {
+    if (indcs.ng < 2) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Implicit thermal-radiation transport requires at "
+                << "least two ghost cells" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    auto allocate = [&](DvceArray5D<Real> &view) {
+      Kokkos::realloc(view, nmb, 1, ncells3, ncells2, ncells1);
+    };
+    allocate(implicit_old_);
+    allocate(implicit_solution_);
+    allocate(implicit_coefficient_);
+    allocate(implicit_residual_);
+    allocate(implicit_direction_);
+    allocate(implicit_preconditioned_);
+    allocate(implicit_operator_);
+    allocate(implicit_coarse_scratch_);
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -704,6 +827,9 @@ void ThermalRadiation::UpdateDiagnostics(const DvceArray5D<Real> &cons,
 void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
                                  const DvceArray5D<Real> &temperature,
                                  DvceFaceFld5D<Real> &flx) {
+  // In FLASH-like implicit mode the ordinary fluid flux still advects every radiation
+  // scalar, while diffusion is applied once as an operator-split backward-Euler solve.
+  if (implicit_transport_) return;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
@@ -852,6 +978,837 @@ void ThermalRadiation::AddFluxes(const DvceArray5D<Real> &w0,
           state.energy_right, chat, use_ap_face);
     }
   });
+}
+
+//----------------------------------------------------------------------------------------
+//! Fill the scalar solver's physical ghost cells.  Internal and periodic faces are filled
+//! by the ordinary cell-centered communicator.  `homogeneous_boundary` supplies the
+//! linearized boundary operator required when conjugate gradient applies A to a search
+//! direction.
+
+void ThermalRadiation::ApplyImplicitPhysicalBoundaries(
+    DvceArray5D<Real> &field, const bool homogeneous_boundary,
+    const bool coefficient_field) {
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int ng = indcs.ng;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  const int nmb1 = pmy_pack_->nmb_thispack-1;
+  const int n1 = indcs.nx1+2*ng;
+  const int n2 = (indcs.nx2 > 1) ? indcs.nx2+2*ng : 1;
+  const int n3 = (indcs.nx3 > 1) ? indcs.nx3+2*ng : 1;
+  auto mb_bcs = pmy_pack_->pmb->mb_bcs;
+  auto f = field;
+
+  const int b0 = implicit_boundary_type_[0];
+  const int b1 = implicit_boundary_type_[1];
+  const Real v0 = homogeneous_boundary ? 0.0 : implicit_boundary_value_[0];
+  const Real v1 = homogeneous_boundary ? 0.0 : implicit_boundary_value_[1];
+  par_for("thermal_rad_impl_bc_x1", DevExeSpace(), 0, nmb1,
+          0, n3-1, 0, n2-1, 0, ng-1,
+  KOKKOS_LAMBDA(int m, int k, int j, int n) {
+    if (IsPhysicalBoundary(mb_bcs.d_view(m, BoundaryFace::inner_x1))) {
+      if (coefficient_field || b0 == 0) {
+        f(m, 0, k, j, is-n-1) = f(m, 0, k, j, is);
+      } else if (b0 == 1) {
+        f(m, 0, k, j, is-n-1) = 2.0*v0-f(m, 0, k, j, is+n);
+      } else {
+        f(m, 0, k, j, is-n-1) = 0.0;
+      }
+    }
+    if (IsPhysicalBoundary(mb_bcs.d_view(m, BoundaryFace::outer_x1))) {
+      if (coefficient_field || b1 == 0) {
+        f(m, 0, k, j, ie+n+1) = f(m, 0, k, j, ie);
+      } else if (b1 == 1) {
+        f(m, 0, k, j, ie+n+1) = 2.0*v1-f(m, 0, k, j, ie-n);
+      } else {
+        f(m, 0, k, j, ie+n+1) = 0.0;
+      }
+    }
+  });
+  if (pmy_pack_->pmesh->one_d) return;
+
+  const int b2 = implicit_boundary_type_[2];
+  const int b3 = implicit_boundary_type_[3];
+  const Real v2 = homogeneous_boundary ? 0.0 : implicit_boundary_value_[2];
+  const Real v3 = homogeneous_boundary ? 0.0 : implicit_boundary_value_[3];
+  par_for("thermal_rad_impl_bc_x2", DevExeSpace(), 0, nmb1,
+          0, n3-1, 0, n1-1, 0, ng-1,
+  KOKKOS_LAMBDA(int m, int k, int i, int n) {
+    if (IsPhysicalBoundary(mb_bcs.d_view(m, BoundaryFace::inner_x2))) {
+      if (coefficient_field || b2 == 0) {
+        f(m, 0, k, js-n-1, i) = f(m, 0, k, js, i);
+      } else if (b2 == 1) {
+        f(m, 0, k, js-n-1, i) = 2.0*v2-f(m, 0, k, js+n, i);
+      } else {
+        f(m, 0, k, js-n-1, i) = 0.0;
+      }
+    }
+    if (IsPhysicalBoundary(mb_bcs.d_view(m, BoundaryFace::outer_x2))) {
+      if (coefficient_field || b3 == 0) {
+        f(m, 0, k, je+n+1, i) = f(m, 0, k, je, i);
+      } else if (b3 == 1) {
+        f(m, 0, k, je+n+1, i) = 2.0*v3-f(m, 0, k, je-n, i);
+      } else {
+        f(m, 0, k, je+n+1, i) = 0.0;
+      }
+    }
+  });
+  if (pmy_pack_->pmesh->two_d) return;
+
+  const int b4 = implicit_boundary_type_[4];
+  const int b5 = implicit_boundary_type_[5];
+  const Real v4 = homogeneous_boundary ? 0.0 : implicit_boundary_value_[4];
+  const Real v5 = homogeneous_boundary ? 0.0 : implicit_boundary_value_[5];
+  par_for("thermal_rad_impl_bc_x3", DevExeSpace(), 0, nmb1,
+          0, n2-1, 0, n1-1, 0, ng-1,
+  KOKKOS_LAMBDA(int m, int j, int i, int n) {
+    if (IsPhysicalBoundary(mb_bcs.d_view(m, BoundaryFace::inner_x3))) {
+      if (coefficient_field || b4 == 0) {
+        f(m, 0, ks-n-1, j, i) = f(m, 0, ks, j, i);
+      } else if (b4 == 1) {
+        f(m, 0, ks-n-1, j, i) = 2.0*v4-f(m, 0, ks+n, j, i);
+      } else {
+        f(m, 0, ks-n-1, j, i) = 0.0;
+      }
+    }
+    if (IsPhysicalBoundary(mb_bcs.d_view(m, BoundaryFace::outer_x3))) {
+      if (coefficient_field || b5 == 0) {
+        f(m, 0, ke+n+1, j, i) = f(m, 0, ke, j, i);
+      } else if (b5 == 1) {
+        f(m, 0, ke+n+1, j, i) = 2.0*v5-f(m, 0, ke-n, j, i);
+      } else {
+        f(m, 0, ke+n+1, j, i) = 0.0;
+      }
+    }
+  });
+}
+
+//----------------------------------------------------------------------------------------
+//! Synchronously exchange one scalar using the carrier fluid's existing communicator.
+
+void ThermalRadiation::ExchangeImplicitField(
+    DvceArray5D<Real> &field, MeshBoundaryValuesCC *pbval,
+    const bool homogeneous_boundary, const bool coefficient_field) {
+  if (pbval->InitRecv(1) != TaskStatus::complete) {
+    ImplicitRadiationError("Could not initialize implicit-radiation halo receives");
+  }
+  if (pbval->PackAndSendCC(field, implicit_coarse_scratch_, 1) !=
+      TaskStatus::complete) {
+    ImplicitRadiationError("Could not send implicit-radiation halo data");
+  }
+  TaskStatus status = TaskStatus::incomplete;
+  while (status == TaskStatus::incomplete) {
+    status = pbval->RecvAndUnpackCC(field, implicit_coarse_scratch_, 1);
+  }
+  if (status != TaskStatus::complete) {
+    ImplicitRadiationError("Could not receive implicit-radiation halo data");
+  }
+  if (pbval->ClearSend() != TaskStatus::complete ||
+      pbval->ClearRecv() != TaskStatus::complete) {
+    ImplicitRadiationError("Could not clear implicit-radiation halo communication");
+  }
+  ApplyImplicitPhysicalBoundaries(
+      field, homogeneous_boundary, coefficient_field);
+}
+
+//----------------------------------------------------------------------------------------
+//! Apply A=I-dt*div(K*grad), with the time-lagged FLD coefficient K=c*lambda/sigma.
+
+void ThermalRadiation::ApplyImplicitOperator(
+    const DvceArray5D<Real> &field, DvceArray5D<Real> &result, const Real dt) {
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  const int nmb1 = pmy_pack_->nmb_thispack-1;
+  const bool multi_d = pmy_pack_->pmesh->multi_d;
+  const bool three_d = pmy_pack_->pmesh->three_d;
+  auto size = pmy_pack_->pmb->mb_size;
+  auto mb_bcs = pmy_pack_->pmb->mb_bcs;
+  const int b0 = implicit_boundary_type_[0];
+  const int b1 = implicit_boundary_type_[1];
+  const int b2 = implicit_boundary_type_[2];
+  const int b3 = implicit_boundary_type_[3];
+  const int b4 = implicit_boundary_type_[4];
+  const int b5 = implicit_boundary_type_[5];
+  const Real vacuum_cap_coefficient = 0.5*chat_*flux_limit_coefficient_;
+  auto coefficient = implicit_coefficient_;
+  auto f = field;
+  auto out = result;
+
+  par_for("thermal_rad_impl_operator", DevExeSpace(), 0, nmb1,
+          ks, ke, js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real kc = coefficient(m, 0, k, j, i);
+    const Real dx1 = size.d_view(m).dx1;
+    const bool vacuum_p1 = i == ie && b1 == 2 && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::outer_x1));
+    const bool vacuum_m1 = i == is && b0 == 2 && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::inner_x1));
+    const Real kp1 = ImplicitFrozenFaceCoefficient(
+        kc, coefficient(m, 0, k, j, i+1), vacuum_p1,
+        vacuum_cap_coefficient*dx1);
+    const Real km1 = ImplicitFrozenFaceCoefficient(
+        kc, coefficient(m, 0, k, j, i-1), vacuum_m1,
+        vacuum_cap_coefficient*dx1);
+    Real lap = (kp1*(f(m, 0, k, j, i+1)-f(m, 0, k, j, i))-
+                km1*(f(m, 0, k, j, i)-f(m, 0, k, j, i-1)))/(dx1*dx1);
+    if (multi_d) {
+      const Real dx2 = size.d_view(m).dx2;
+      const bool vacuum_p2 = j == je && b3 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x2));
+      const bool vacuum_m2 = j == js && b2 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x2));
+      const Real kp2 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j+1, i), vacuum_p2,
+          vacuum_cap_coefficient*dx2);
+      const Real km2 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j-1, i), vacuum_m2,
+          vacuum_cap_coefficient*dx2);
+      lap += (kp2*(f(m, 0, k, j+1, i)-f(m, 0, k, j, i))-
+              km2*(f(m, 0, k, j, i)-f(m, 0, k, j-1, i)))/(dx2*dx2);
+    }
+    if (three_d) {
+      const Real dx3 = size.d_view(m).dx3;
+      const bool vacuum_p3 = k == ke && b5 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x3));
+      const bool vacuum_m3 = k == ks && b4 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x3));
+      const Real kp3 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k+1, j, i), vacuum_p3,
+          vacuum_cap_coefficient*dx3);
+      const Real km3 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k-1, j, i), vacuum_m3,
+          vacuum_cap_coefficient*dx3);
+      lap += (kp3*(f(m, 0, k+1, j, i)-f(m, 0, k, j, i))-
+              km3*(f(m, 0, k, j, i)-f(m, 0, k-1, j, i)))/(dx3*dx3);
+    }
+    out(m, 0, k, j, i) = f(m, 0, k, j, i)-dt*lap;
+  });
+}
+
+//----------------------------------------------------------------------------------------
+
+Real ThermalRadiation::ImplicitGlobalDot(
+    const DvceArray5D<Real> &lhs, const DvceArray5D<Real> &rhs) const {
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, nx1 = indcs.nx1;
+  const int js = indcs.js, nx2 = indcs.nx2;
+  const int ks = indcs.ks, nx3 = indcs.nx3;
+  const int nkji = nx3*nx2*nx1;
+  const int nji = nx2*nx1;
+  const int ncell = pmy_pack_->nmb_thispack*nkji;
+  auto a = lhs;
+  auto b = rhs;
+  Real sum = 0.0;
+  Kokkos::parallel_reduce("thermal_rad_impl_dot",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+  KOKKOS_LAMBDA(const int idx, Real &local_sum) {
+    const int m = idx/nkji;
+    const int local = idx-m*nkji;
+    const int k = local/nji+ks;
+    const int j = (local-(k-ks)*nji)/nx1+js;
+    const int i = local-(k-ks)*nji-(j-js)*nx1+is;
+    local_sum += a(m, 0, k, j, i)*b(m, 0, k, j, i);
+  }, sum);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &sum, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  return sum;
+}
+
+//----------------------------------------------------------------------------------------
+//! FLASH-like multigroup diffusion: freeze opacity and limiter coefficients at the old
+//! state, then solve one centered backward-Euler scalar diffusion equation for each
+//! group.  The explicit AP/upwind correction is not part of this matrix.  The group loop
+//! is deliberately sequential so solver storage is independent of ngroups.
+
+void ThermalRadiation::SolveImplicitTransport(
+    const Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
+    const DvceArray5D<Real> &temperature, MeshBoundaryValuesCC *pbval) {
+  if (!implicit_transport_ || !(dt > 0.0)) return;
+  if (pbval == nullptr) {
+    ImplicitRadiationError("Implicit thermal radiation requires a fluid communicator");
+  }
+
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  const int ngh = indcs.ng;
+  const bool multi_d = pmy_pack_->pmesh->multi_d;
+  const bool three_d = pmy_pack_->pmesh->three_d;
+  const int n1 = indcs.nx1+2*ngh;
+  const int n2 = multi_d ? indcs.nx2+2*ngh : 1;
+  const int n3 = three_d ? indcs.nx3+2*ngh : 1;
+  const int nmb1 = pmy_pack_->nmb_thispack-1;
+  const int ncell = pmy_pack_->nmb_thispack*indcs.nx1*indcs.nx2*indcs.nx3;
+
+  auto kt = kappa_transport_.d_view;
+  const bool use_table = use_opacity_table_;
+  OpacityTableDevice opacity;
+  if (use_table) opacity = opacity_table_->DeviceData();
+  const bool use_mixed_table = use_mixed_opacity_table_;
+  MixedOpacityTableDevice mixed_opacity;
+  if (use_mixed_table) mixed_opacity = mixed_opacity_table_->DeviceData();
+  const bool use_materials = use_material_mixture_;
+  auto mixture = material_mixture_;
+  auto size = pmy_pack_->pmb->mb_size;
+  auto mb_bcs = pmy_pack_->pmb->mb_bcs;
+  const int ielectron = iele_;
+  const Real gm1 = gamma_minus_one_;
+  const Real fe = cv_e_fraction_;
+  const Real chat = chat_;
+  const Real alpha = flux_limit_coefficient_;
+  const Real floor = energy_floor_;
+  const int mode = limiter_mode_;
+  const int b0 = implicit_boundary_type_[0];
+  const int b1 = implicit_boundary_type_[1];
+  const int b2 = implicit_boundary_type_[2];
+  const int b3 = implicit_boundary_type_[3];
+  const int b4 = implicit_boundary_type_[4];
+  const int b5 = implicit_boundary_type_[5];
+  const Real vacuum_cap_coefficient = 0.5*chat*alpha;
+  const Real tolerance_squared = implicit_tolerance_*implicit_tolerance_;
+
+  auto old = implicit_old_;
+  auto solution = implicit_solution_;
+  auto coefficient = implicit_coefficient_;
+  auto residual = implicit_residual_;
+  auto direction = implicit_direction_;
+  auto preconditioned = implicit_preconditioned_;
+  auto applied = implicit_operator_;
+
+  implicit_iterations_last_solve = 0;
+  implicit_residual_last_solve = 0.0;
+  implicit_boundary_power = 0.0;
+  for (int g = 0; g < ngroups; ++g) {
+    const int group_index = ifirst+g;
+    Kokkos::deep_copy(DevExeSpace(), implicit_old_, 0.0);
+    Kokkos::deep_copy(DevExeSpace(), implicit_solution_, 0.0);
+    Kokkos::deep_copy(DevExeSpace(), implicit_coefficient_, 0.0);
+    Kokkos::deep_copy(DevExeSpace(), implicit_residual_, 0.0);
+    Kokkos::deep_copy(DevExeSpace(), implicit_direction_, 0.0);
+    Kokkos::deep_copy(DevExeSpace(), implicit_preconditioned_, 0.0);
+    Kokkos::deep_copy(DevExeSpace(), implicit_operator_, 0.0);
+
+    par_for("thermal_rad_impl_copy", DevExeSpace(), 0, nmb1,
+            0, n3-1, 0, n2-1, 0, n1-1,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      old(m, 0, k, j, i) = cons(m, group_index, k, j, i);
+    });
+    int negative_rhs_cells = 0;
+    int nonfinite_rhs_cells = 0;
+    Kokkos::parallel_reduce("thermal_rad_impl_validate_rhs_negative",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, int &negative) {
+      const Real value = old(m, 0, k, j, i);
+      if (Kokkos::isfinite(value) && value < 0.0) ++negative;
+    }, negative_rhs_cells);
+    Kokkos::parallel_reduce("thermal_rad_impl_validate_rhs_finite",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, int &nonfinite) {
+      if (!Kokkos::isfinite(old(m, 0, k, j, i))) ++nonfinite;
+    }, nonfinite_rhs_cells);
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &negative_rhs_cells, 1, MPI_INT,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &nonfinite_rhs_cells, 1, MPI_INT,
+                  MPI_SUM, MPI_COMM_WORLD);
+#endif
+    if (negative_rhs_cells != 0 || nonfinite_rhs_cells != 0) {
+      ImplicitRadiationError(
+          "Implicit radiation right-hand side contains "+
+          std::to_string(negative_rhs_cells)+" negative and "+
+          std::to_string(nonfinite_rhs_cells)+" non-finite cells in group "+
+          std::to_string(g));
+    }
+    ExchangeImplicitField(implicit_old_, pbval, false);
+    Kokkos::deep_copy(DevExeSpace(), implicit_solution_, implicit_old_);
+
+    // Freeze the nonlinear diffusion coefficient from the state entering this transport
+    // substep (after any preceding operator-split conduction).  A centered cell gradient
+    // is converted to a symmetric arithmetic face coefficient by the operator below.
+    par_for("thermal_rad_impl_coefficient", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real density = prim(m, IDN, k, j, i);
+      materials::MaterialComposition composition;
+      Real tele;
+      if (use_materials) {
+        composition = mixture.CompositionFromPrimitive(prim, m, k, j, i);
+        tele = temperature(m, 1, k, j, i);
+      } else {
+        tele = gm1*prim(m, ielectron, k, j, i)/fe;
+      }
+      OpacityTableLocation opacity_location;
+      if (use_table) opacity_location = opacity.Locate(density, tele);
+      MixedOpacityTableLocation mixed_location;
+      if (use_mixed_table) {
+        mixed_location = mixed_opacity.Locate(density, tele, composition);
+      }
+      const Real kappa = use_mixed_table ? mixed_opacity.Get(
+          opacity_transport, g, mixed_location) : (use_table ? opacity.Get(
+          opacity_transport, g, opacity_location) : kt(g));
+      const Real sigma = density*kappa;
+      const Real dx1 = size.d_view(m).dx1;
+      const Real grad1 = (old(m, 0, k, j, i+1)-old(m, 0, k, j, i-1))/(2.0*dx1);
+      Real grad2 = 0.0;
+      Real grad3 = 0.0;
+      if (multi_d) {
+        const Real dx2 = size.d_view(m).dx2;
+        grad2 = (old(m, 0, k, j+1, i)-old(m, 0, k, j-1, i))/(2.0*dx2);
+      }
+      if (three_d) {
+        const Real dx3 = size.d_view(m).dx3;
+        grad3 = (old(m, 0, k+1, j, i)-old(m, 0, k-1, j, i))/(2.0*dx3);
+      }
+      const Real gradient = sqrt(grad1*grad1+grad2*grad2+grad3*grad3);
+      const FLDLinearization properties = FLDProperties(
+          sigma, old(m, 0, k, j, i), gradient, gradient,
+          alpha, floor, mode);
+      Real diffusion_coefficient = properties.diffusion_coefficient;
+      if (mode != 0) {
+        Real dx_short = dx1;
+        if (multi_d) dx_short = fmin(dx_short, size.d_view(m).dx2);
+        if (three_d) dx_short = fmin(dx_short, size.d_view(m).dx3);
+        const Real roundoff_gradient = 64.0*kRealEpsilon*
+            fmax(fabs(old(m, 0, k, j, i)), floor)/dx_short;
+        if (gradient <= roundoff_gradient) {
+          // At a roundoff-flat limited state the nonlinear flux is identically zero,
+          // while lambda/sigma can be arbitrarily large in the optically thin ambient.
+          // Use the same grid-scale causal regularization as FLDFaceStabilityRate only
+          // in that degenerate case.  A resolved gradient retains the actual frozen
+          // harmonic/Larsen/LP coefficient, including D proportional to E/|grad E|.
+          diffusion_coefficient = fmin(
+              diffusion_coefficient, 0.5*alpha*dx_short);
+        }
+      }
+      coefficient(m, 0, k, j, i) = chat*diffusion_coefficient;
+    });
+    // A symmetric CG matrix requires both cells sharing an internal face to use
+    // identical frozen coefficients.  In particular, an earlier implicit-conduction
+    // solve refreshes only interior material temperatures, so independently evaluating
+    // coefficient ghosts would use stale thermodynamic data.  Exchange the interior
+    // coefficients explicitly; physical coefficient ghosts use zero-gradient values.
+    ExchangeImplicitField(implicit_coefficient_, pbval, false, true);
+
+    ExchangeImplicitField(implicit_solution_, pbval, false);
+    ApplyImplicitOperator(implicit_solution_, implicit_operator_, dt);
+
+    par_for("thermal_rad_impl_initial_residual", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real r = old(m, 0, k, j, i)-applied(m, 0, k, j, i);
+      residual(m, 0, k, j, i) = r;
+      const Real kc = coefficient(m, 0, k, j, i);
+      const Real dx1 = size.d_view(m).dx1;
+      const bool vacuum_p1 = i == ie && b1 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x1));
+      const bool vacuum_m1 = i == is && b0 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x1));
+      const Real kp1 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j, i+1), vacuum_p1,
+          vacuum_cap_coefficient*dx1);
+      const Real km1 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j, i-1), vacuum_m1,
+          vacuum_cap_coefficient*dx1);
+      Real rate = (kp1+km1)/(dx1*dx1);
+      if (multi_d) {
+        const Real dx2 = size.d_view(m).dx2;
+        const bool vacuum_p2 = j == je && b3 == 2 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::outer_x2));
+        const bool vacuum_m2 = j == js && b2 == 2 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::inner_x2));
+        const Real kp2 = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j+1, i), vacuum_p2,
+            vacuum_cap_coefficient*dx2);
+        const Real km2 = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j-1, i), vacuum_m2,
+            vacuum_cap_coefficient*dx2);
+        rate += (kp2+km2)/(dx2*dx2);
+      }
+      if (three_d) {
+        const Real dx3 = size.d_view(m).dx3;
+        const bool vacuum_p3 = k == ke && b5 == 2 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::outer_x3));
+        const bool vacuum_m3 = k == ks && b4 == 2 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::inner_x3));
+        const Real kp3 = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k+1, j, i), vacuum_p3,
+            vacuum_cap_coefficient*dx3);
+        const Real km3 = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k-1, j, i), vacuum_m3,
+            vacuum_cap_coefficient*dx3);
+        rate += (kp3+km3)/(dx3*dx3);
+      }
+      const Real z = r/(1.0+dt*rate);
+      preconditioned(m, 0, k, j, i) = z;
+      direction(m, 0, k, j, i) = z;
+    });
+
+    const Real rhs_norm = ImplicitGlobalDot(implicit_old_, implicit_old_);
+    Real residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
+    const Real initial_residual_norm = residual_norm;
+    const Real scale = fmax(fmax(rhs_norm, initial_residual_norm),
+        std::numeric_limits<Real>::min()*static_cast<Real>(ncell));
+    Real rz = ImplicitGlobalDot(implicit_residual_, implicit_preconditioned_);
+    int iterations = 0;
+    while (residual_norm > tolerance_squared*scale &&
+           iterations < implicit_max_iterations_) {
+      ExchangeImplicitField(implicit_direction_, pbval, true);
+      ApplyImplicitOperator(implicit_direction_, implicit_operator_, dt);
+      const Real pap = ImplicitGlobalDot(implicit_direction_, implicit_operator_);
+      if (!(pap > 0.0) || !std::isfinite(pap) || !std::isfinite(rz)) {
+        ImplicitRadiationError("Implicit radiation operator is not positive definite");
+      }
+      const Real step = rz/pap;
+      par_for("thermal_rad_impl_cg_update", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        solution(m, 0, k, j, i) += step*direction(m, 0, k, j, i);
+        residual(m, 0, k, j, i) -= step*applied(m, 0, k, j, i);
+      });
+      residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
+      ++iterations;
+      if (residual_norm <= tolerance_squared*scale) break;
+
+      par_for("thermal_rad_impl_precondition", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        const Real kc = coefficient(m, 0, k, j, i);
+        const Real dx1 = size.d_view(m).dx1;
+        const bool vacuum_p1 = i == ie && b1 == 2 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::outer_x1));
+        const bool vacuum_m1 = i == is && b0 == 2 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::inner_x1));
+        const Real kp1 = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j, i+1), vacuum_p1,
+            vacuum_cap_coefficient*dx1);
+        const Real km1 = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j, i-1), vacuum_m1,
+            vacuum_cap_coefficient*dx1);
+        Real rate = (kp1+km1)/(dx1*dx1);
+        if (multi_d) {
+          const Real dx2 = size.d_view(m).dx2;
+          const bool vacuum_p2 = j == je && b3 == 2 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x2));
+          const bool vacuum_m2 = j == js && b2 == 2 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x2));
+          const Real kp2 = ImplicitFrozenFaceCoefficient(
+              kc, coefficient(m, 0, k, j+1, i), vacuum_p2,
+              vacuum_cap_coefficient*dx2);
+          const Real km2 = ImplicitFrozenFaceCoefficient(
+              kc, coefficient(m, 0, k, j-1, i), vacuum_m2,
+              vacuum_cap_coefficient*dx2);
+          rate += (kp2+km2)/(dx2*dx2);
+        }
+        if (three_d) {
+          const Real dx3 = size.d_view(m).dx3;
+          const bool vacuum_p3 = k == ke && b5 == 2 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x3));
+          const bool vacuum_m3 = k == ks && b4 == 2 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x3));
+          const Real kp3 = ImplicitFrozenFaceCoefficient(
+              kc, coefficient(m, 0, k+1, j, i), vacuum_p3,
+              vacuum_cap_coefficient*dx3);
+          const Real km3 = ImplicitFrozenFaceCoefficient(
+              kc, coefficient(m, 0, k-1, j, i), vacuum_m3,
+              vacuum_cap_coefficient*dx3);
+          rate += (kp3+km3)/(dx3*dx3);
+        }
+        preconditioned(m, 0, k, j, i) =
+            residual(m, 0, k, j, i)/(1.0+dt*rate);
+      });
+      const Real rz_new = ImplicitGlobalDot(
+          implicit_residual_, implicit_preconditioned_);
+      const Real beta = rz_new/rz;
+      par_for("thermal_rad_impl_direction", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        direction(m, 0, k, j, i) = preconditioned(m, 0, k, j, i)+
+            beta*direction(m, 0, k, j, i);
+      });
+      rz = rz_new;
+    }
+    const Real recursive_relative_residual = sqrt(residual_norm/scale);
+    if (residual_norm > tolerance_squared*scale ||
+        !std::isfinite(recursive_relative_residual)) {
+      ImplicitRadiationError("Implicit radiation solve failed to converge for group "+
+          std::to_string(g)+" after "+std::to_string(iterations)+
+          " iterations (relative residual="+
+          std::to_string(recursive_relative_residual)+")");
+    }
+    implicit_iterations_last_solve =
+        std::max(implicit_iterations_last_solve, iterations);
+
+    // Recursive CG residuals can drift from b-Ax.  Validate the actual matrix residual
+    // before any positivity repair, using the same exchanged ghosts and boundary
+    // operator as the solve itself.
+    ExchangeImplicitField(implicit_solution_, pbval, false);
+    ApplyImplicitOperator(implicit_solution_, implicit_operator_, dt);
+    par_for("thermal_rad_impl_true_residual", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      residual(m, 0, k, j, i) =
+          old(m, 0, k, j, i)-applied(m, 0, k, j, i);
+    });
+    residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
+    Real relative_residual = sqrt(residual_norm/scale);
+    // Roundoff in the three-term CG recurrence can make its recursively updated
+    // residual slightly more optimistic than a fresh matrix application.  Bound that
+    // drift tightly while avoiding a redundant Krylov restart for an already converged
+    // solve.
+    constexpr Real true_residual_factor = 16.0;
+    if (!std::isfinite(relative_residual) ||
+        relative_residual > true_residual_factor*implicit_tolerance_) {
+      if (global_variable::my_rank == 0) {
+        std::cerr << std::scientific << std::setprecision(17)
+                  << "# implicit radiation true-residual diagnostic: group=" << g
+                  << " recursive=" << recursive_relative_residual
+                  << " true=" << relative_residual
+                  << " tolerance=" << implicit_tolerance_ << std::endl;
+      }
+      ImplicitRadiationError(
+          "Implicit radiation true residual exceeds tolerance for group "+
+          std::to_string(g)+" (relative residual="+
+          std::to_string(relative_residual)+")");
+    }
+
+    int negative_solution_cells = 0;
+    int nonfinite_solution_cells = 0;
+    Kokkos::parallel_reduce("thermal_rad_impl_validate_solution",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, int &negative) {
+      const Real value = solution(m, 0, k, j, i);
+      if (Kokkos::isfinite(value) && value < 0.0) ++negative;
+    }, negative_solution_cells);
+    Kokkos::parallel_reduce("thermal_rad_impl_validate_finite",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, int &nonfinite) {
+      if (!Kokkos::isfinite(solution(m, 0, k, j, i))) ++nonfinite;
+    }, nonfinite_solution_cells);
+    Real minimum_solution = 0.0;
+    Kokkos::parallel_reduce("thermal_rad_impl_minimum_solution",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, Real &minimum) {
+      const Real value = solution(m, 0, k, j, i);
+      if (Kokkos::isfinite(value) && value < minimum) minimum = value;
+    }, Kokkos::Min<Real>(minimum_solution));
+    Real maximum_rhs = 0.0;
+    Kokkos::parallel_reduce("thermal_rad_impl_maximum_rhs",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, Real &maximum) {
+      maximum = fmax(maximum, fabs(old(m, 0, k, j, i)));
+    }, Kokkos::Max<Real>(maximum_rhs));
+    Real negative_solution_energy = 0.0;
+    Kokkos::parallel_reduce("thermal_rad_impl_negative_solution_energy",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, Real &negative_energy) {
+      const Real value = solution(m, 0, k, j, i);
+      if (Kokkos::isfinite(value) && value < 0.0) {
+        negative_energy -= value*size.d_view(m).dx1*size.d_view(m).dx2*
+                           size.d_view(m).dx3;
+      }
+    }, negative_solution_energy);
+    Real positive_solution_energy = 0.0;
+    Kokkos::parallel_reduce("thermal_rad_impl_positive_solution_energy",
+        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+            {0, ks, js, is}, {pmy_pack_->nmb_thispack, ke+1, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int j, int i, Real &positive_energy) {
+      const Real value = solution(m, 0, k, j, i);
+      if (Kokkos::isfinite(value) && value > 0.0) {
+        positive_energy += value*size.d_view(m).dx1*size.d_view(m).dx2*
+                           size.d_view(m).dx3;
+      }
+    }, positive_solution_energy);
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &negative_solution_cells, 1, MPI_INT,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &nonfinite_solution_cells, 1, MPI_INT,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &minimum_solution, 1, MPI_ATHENA_REAL,
+                  MPI_MIN, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &maximum_rhs, 1, MPI_ATHENA_REAL,
+                  MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &negative_solution_energy, 1, MPI_ATHENA_REAL,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &positive_solution_energy, 1, MPI_ATHENA_REAL,
+                  MPI_SUM, MPI_COMM_WORLD);
+#endif
+    if (nonfinite_solution_cells != 0) {
+      if (global_variable::my_rank == 0) {
+        std::cerr << std::scientific << std::setprecision(17)
+                  << "# implicit radiation positivity diagnostic: group=" << g
+                  << " minimum=" << minimum_solution
+                  << " negative_energy=" << negative_solution_energy
+                  << " positive_energy=" << positive_solution_energy << std::endl;
+      }
+      ImplicitRadiationError(
+          "Implicit radiation produced "+std::to_string(negative_solution_cells)+
+          " negative and "+std::to_string(nonfinite_solution_cells)+
+          " non-finite cells in group "+std::to_string(g)+
+          " (minimum="+std::to_string(minimum_solution)+
+          ", negative energy="+std::to_string(negative_solution_energy)+")");
+    }
+    if (negative_solution_cells != 0) {
+      // The exact backward-Euler diffusion matrix is an M-matrix, so a finite negative
+      // value can only be iterative roundoff.  Repair only tolerance-scale undershoots,
+      // and preserve the volume-integrated group energy by rescaling positive cells.
+      constexpr Real positivity_tolerance_factor = 64.0;
+      const Real amplitude_scale = fmax(maximum_rhs, floor);
+      const Real undershoot_limit = positivity_tolerance_factor*
+          implicit_tolerance_*amplitude_scale;
+      const Real energy_limit = positivity_tolerance_factor*
+          implicit_tolerance_*positive_solution_energy;
+      if (-minimum_solution > undershoot_limit ||
+          negative_solution_energy > energy_limit ||
+          !(positive_solution_energy > negative_solution_energy)) {
+        if (global_variable::my_rank == 0) {
+          std::cerr << std::scientific << std::setprecision(17)
+                    << "# implicit radiation positivity diagnostic: group=" << g
+                    << " minimum=" << minimum_solution
+                    << " maximum_rhs=" << maximum_rhs
+                    << " negative_energy=" << negative_solution_energy
+                    << " positive_energy=" << positive_solution_energy
+                    << " undershoot_limit=" << undershoot_limit
+                    << " energy_limit=" << energy_limit << std::endl;
+        }
+        ImplicitRadiationError(
+            "Implicit radiation negativity exceeds the solver tolerance in group "+
+            std::to_string(g));
+      }
+      const Real positive_scale =
+          (positive_solution_energy-negative_solution_energy)/
+          positive_solution_energy;
+      par_for("thermal_rad_impl_project_positive", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        const Real value = solution(m, 0, k, j, i);
+        solution(m, 0, k, j, i) = value > 0.0 ? positive_scale*value : 0.0;
+      });
+
+      // Projection is accepted only when it remains a converged solution of the same
+      // frozen operator.  This prevents positivity cleanup from hiding a material
+      // transport error or silently changing the implicit equation.
+      ExchangeImplicitField(implicit_solution_, pbval, false);
+      ApplyImplicitOperator(implicit_solution_, implicit_operator_, dt);
+      par_for("thermal_rad_impl_projected_residual", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        residual(m, 0, k, j, i) =
+            old(m, 0, k, j, i)-applied(m, 0, k, j, i);
+      });
+      residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
+      relative_residual = sqrt(residual_norm/scale);
+      constexpr Real projection_residual_factor = 16.0;
+      if (!std::isfinite(relative_residual) ||
+          relative_residual > projection_residual_factor*implicit_tolerance_) {
+        ImplicitRadiationError(
+            "Implicit radiation positivity projection violates the residual tolerance "
+            "in group "+std::to_string(g));
+      }
+    }
+    implicit_residual_last_solve =
+        std::max(implicit_residual_last_solve, relative_residual);
+
+    // Refresh the converged ghosts once, both for the next conserved-state boundary
+    // fill and for a conservative boundary-loss diagnostic.  This is a rank-local
+    // surface integral; AthenaK's history writer performs the MPI sum.
+    ExchangeImplicitField(implicit_solution_, pbval, false);
+    const int impl_nx1 = indcs.nx1;
+    const int impl_nx2 = indcs.nx2;
+    const int impl_nx3 = indcs.nx3;
+    const int impl_nkji = impl_nx3*impl_nx2*impl_nx1;
+    const int impl_nji = impl_nx2*impl_nx1;
+    Real group_boundary_power = 0.0;
+    Kokkos::parallel_reduce("thermal_rad_impl_boundary_power",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+    KOKKOS_LAMBDA(const int idx, Real &power) {
+      const int m = idx/impl_nkji;
+      const int local = idx-m*impl_nkji;
+      const int k = local/impl_nji+ks;
+      const int j = (local-(k-ks)*impl_nji)/impl_nx1+js;
+      const int i = local-(k-ks)*impl_nji-(j-js)*impl_nx1+is;
+      const Real kc = coefficient(m, 0, k, j, i);
+      const Real dx1 = size.d_view(m).dx1;
+      const Real dx2 = size.d_view(m).dx2;
+      const Real dx3 = size.d_view(m).dx3;
+      if (i == is && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x1))) {
+        const Real kface = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j, i-1), b0 == 2,
+            vacuum_cap_coefficient*dx1);
+        power += dx2*dx3*kface*
+            (solution(m, 0, k, j, i)-solution(m, 0, k, j, i-1))/dx1;
+      }
+      if (i == ie && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x1))) {
+        const Real kface = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j, i+1), b1 == 2,
+            vacuum_cap_coefficient*dx1);
+        power += dx2*dx3*kface*
+            (solution(m, 0, k, j, i)-solution(m, 0, k, j, i+1))/dx1;
+      }
+      if (multi_d && j == js && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x2))) {
+        const Real kface = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j-1, i), b2 == 2,
+            vacuum_cap_coefficient*dx2);
+        power += dx1*dx3*kface*
+            (solution(m, 0, k, j, i)-solution(m, 0, k, j-1, i))/dx2;
+      }
+      if (multi_d && j == je && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x2))) {
+        const Real kface = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k, j+1, i), b3 == 2,
+            vacuum_cap_coefficient*dx2);
+        power += dx1*dx3*kface*
+            (solution(m, 0, k, j, i)-solution(m, 0, k, j+1, i))/dx2;
+      }
+      if (three_d && k == ks && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x3))) {
+        const Real kface = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k-1, j, i), b4 == 2,
+            vacuum_cap_coefficient*dx3);
+        power += dx1*dx2*kface*
+            (solution(m, 0, k, j, i)-solution(m, 0, k-1, j, i))/dx3;
+      }
+      if (three_d && k == ke && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x3))) {
+        const Real kface = ImplicitFrozenFaceCoefficient(
+            kc, coefficient(m, 0, k+1, j, i), b5 == 2,
+            vacuum_cap_coefficient*dx3);
+        power += dx1*dx2*kface*
+            (solution(m, 0, k, j, i)-solution(m, 0, k+1, j, i))/dx3;
+      }
+    }, group_boundary_power);
+    implicit_boundary_power += group_boundary_power;
+
+    par_for("thermal_rad_impl_commit", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real value = solution(m, 0, k, j, i);
+      cons(m, group_index, k, j, i) = value;
+      prim(m, group_index, k, j, i) = value/cons(m, IDN, k, j, i);
+    });
+  }
+
+  if (implicit_report_ && global_variable::my_rank == 0) {
+    std::cout << "# implicit thermal radiation: groups=" << ngroups
+              << " max_iterations=" << implicit_iterations_last_solve
+              << " max_relative_residual=" << implicit_residual_last_solve
+              << std::endl;
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -1039,6 +1996,8 @@ void ThermalRadiation::NewTimeStep(
 
   int nmb = pmy_pack_->nmb_thispack;
 
+  Real transport_dt = FLT_MAX;
+  if (!implicit_transport_) {
   // Each directional reduction finds the largest single-face contribution to the
   // diagonal update rate.  Multiplying their sum by two below accounts for the two
   // faces per cell and recovers dt <= [2 c D sum(dx_d^-2)]^-1 for constant diffusion.
@@ -1195,7 +2154,8 @@ void ThermalRadiation::NewTimeStep(
   }
 
   Real transport_rate = 2.0*chat*(max_rate1 + max_rate2 + max_rate3);
-  Real transport_dt = (transport_rate > 0.0) ? 1.0/transport_rate : FLT_MAX;
+  transport_dt = (transport_rate > 0.0) ? 1.0/transport_rate : FLT_MAX;
+  }
 
   // The source update is implicit and positivity preserving, but retain the configured
   // fractional electron-energy limit for accuracy.  It is reduced separately so source

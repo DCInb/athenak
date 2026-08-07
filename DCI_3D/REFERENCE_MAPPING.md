@@ -96,8 +96,9 @@ The Au sources are exactly the files the archived deck names (`eos_coneTableFile
 tabular ionization rather than the deck constant, so inverse-bremsstrahlung absorption in
 the cone follows the Au table instead of a CH surrogate.
 
-The two conservative passive scalars store `rho*Y_CH` and `rho*Y_Au`;
-`Y_He=1-Y_CH-Y_Au`. Mixed opacity uses partial material densities and additive extinction,
+Three conservative passive scalars explicitly store `rho*Y_CH`, `rho*Y_Au`, and
+`rho*Y_He`.  All nonnegative fractions are normalized before use; no material is an
+implicit remainder. Mixed opacity uses partial material densities and additive extinction,
 
 ```text
 kappa_mix(rho, Te, Y) = sum_s Y_s kappa_s(rho*Y_s, Te).
@@ -109,6 +110,15 @@ mixed cells can produce partial densities below a pure-material table.  Opacity 
 are clamped to the nearest endpoint.  EOS energy and ionization use the minimum-density
 surface, while trace-material pressure is scaled linearly from that surface to zero as the
 partial density vanishes; this is an explicit part of the AthenaK closure.
+
+The DCI inputs use the opt-in `flash-extrapolate` EOS bounds policy.  In-range IONMIX
+values are unchanged; positive pressure and caloric surfaces above the final temperature
+node follow the final log-log slope, with a continuous `T^1` fallback for a flat or
+decreasing endpoint, and ionization holds its endpoint value.  Forward and inverse mixed
+closures expand above the native maximum for every present component.  This mirrors
+FLASH's broader EOS inversion bracket and prevents a high conserved energy from being
+paired with an endpoint-clamped temperature; `clamp` and `error` retain their prior
+behavior for other decks.
 
 `generate_reference_tables.py` verifies the archive hash and converts the separate
 CH/Au/He ion-electron EOS surfaces plus all three opacity payloads into ignored local
@@ -126,14 +136,68 @@ The 20 reference photon boundaries are, in eV:
 
 The reference uses a harmonic flux limiter with coefficient one and vacuum conditions on
 all radiation faces.  The opacity tables provide Rosseland transport and Planck
-absorption/emission coefficients in cm2/g.  AthenaK uses its explicit
-asymptotic-preserving face flux and does not inflate opacity.  The production candidate
-uses the documented reduced value `c_hat=3.0e9 cm/s` (about `c/10`) so a 10 ns run is
-feasible.  Matched compact comparisons against `c_hat=10` and physical `c` are mandatory
-production gates.  Matter and laser changes are bounded directly; because the tiny
-radiation reservoir is not relatively converged, its absolute difference is normalized by
-deposited laser energy and bounded separately while its relative difference remains
-reported.
+absorption/emission coefficients in cm2/g; AthenaK does not inflate opacity.
+
+FLASH keeps physical `c`.  Its MGD equation (FLASH 4.8 guide, equations 25.3--25.7)
+evaluates opacity, emission, and flux-limiter coefficients at time level `n` and solves
+each group's diffusion operator backward implicitly for `u_g^(n+1)`.  The general
+diffusion solver's `theta=1` scheme is backward Euler (guide equation 19.2), and the
+archived decks set `dt_diff_factor=1.0e100` with the comment "Disable diffusion dt".
+Thus FLASH removes the diffusion stability restriction rather than replacing physical
+light speed.
+
+AthenaK maps the time integration to `transport_integrator=implicit`: it evaluates a
+harmonic-limited FLD coefficient from the old-state centered cell gradient.  Resolved
+gradients retain their physical coefficient; only roundoff-flat limited cells receive
+the grid-scale `D <= alpha*dx_min/2` regularization.  AthenaK exchanges the frozen
+coefficient halo before PCG so an MPI-shared face remains symmetric even after the
+preceding implicit-conduction solve changed only interior temperatures.  It then
+arithmetic-averages the coefficient to faces and advances the centered finite-volume
+operator with backward Euler while retaining `c_light=299.792458 mm/ns` in both
+transport and matter coupling.  A vacuum face additionally caps
+`D_face <= alpha*dx_normal/2`; the operator, Jacobi diagonal, and `rad_Pesc` diagnostic
+all use the identical capped value.  This is not the explicit AP/upwind face
+discretization.  The deck's
+`transport_discretization=asymptotic-preserving` and `ap_*` thresholds are retained only
+as explicit-mode fallback controls and are inactive in the implicit solve.  All six
+implicit boundaries are pinned to `vacuum`, matching the DCI zero-radiation ghost
+treatment instead of the solver's zero-gradient default.
+The archive also writes `rt_dtFactor=0.02`, but its
+`rt_computeDt` switch is absent and defaults false.  That FLASH control does not map
+directly to AthenaK's source-splitting guard: AthenaK time-lags its local emission source
+and does not perform FLASH's fully coupled nonlinear source solve.  DCI therefore keeps
+`source_cfl=0.1` as an independent source-accuracy limit.  It constrains source changes
+only; the implicit transport operator remains free of the explicit `c*dt/dx` restriction.
+The guard itself still scales with physical `c`: at initialization it lowers the DCI
+candidate timestep from `1.068285e-6 ns` with the guard disabled to
+`7.88743694e-7 ns`, approximately 26 percent.  Lower `--radiation-c-light` values are
+non-production sensitivity diagnostics, not the mechanism used to relax the transport
+timestep.
+
+The correspondence to FLASH is limited to physical `c`, time-lagged coefficients, and
+backward-Euler transport; it is not a claim of identical spatial discretization or a
+fully coupled nonlinear radiation/material solve.  AthenaK's current implicit solver is
+uniform-grid only and rejects SMR/AMR, advances groups sequentially with frozen
+coefficients, and uses Jacobi-preconditioned CG at the DCI-pinned tolerance `1e-10` and
+2000-iteration ceiling.  Recursive convergence is verified with the true `b-Ax`
+residual.  The incoming conserved radiation state must be finite and nonnegative.  Only
+finite tolerance-scale negative solver roundoff may undergo a globally
+volume-conservative positive rescaling, followed by another true-residual check; larger
+negativity and non-finite states abort.  Matter coupling remains a separate time-lagged
+local source under `source_cfl=0.1`.
+
+Focused dense-reference tests now cover constant periodic, harmonic-limited periodic,
+and harmonic-limited vacuum matrices.  Ten focused CPU tests, the CUDA/MPI build, and
+compact initialization validation passed.  The exact current-tree seven-GPU 50-cycle
+phase-1 smoke passed in 27.36 s to `t=6.542658936097e-05 ns`, with `eos_bad=0` and
+domain-integrated CH/Au/He fractions
+`0.07224481712971552/0.9276974187345620/5.776413572244726e-05`, whose sum is one within
+roundoff.  This is roughly 382 times short of the historical `0.025 ns` first-failure
+time and does not prove long-time removal of the DCI symptom.  Production-scale
+20-group Jacobi-PCG memory, convergence, and performance are also unproven; multigrid or
+a stronger preconditioner remains future work.  The DCI production gate must separately
+supply long-horizon, restart, energy-budget, and full-scale evidence for the exact hashed
+deck and binary.
 
 ## Laser drive adopted from the archive
 

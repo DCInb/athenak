@@ -447,6 +447,8 @@ TaskStatus Hydro::TwoTempExchange(Driver *pdrive, int stage) {
   if (pcond != nullptr && pcond->IsImplicit()) {
     pcond->SolveImplicit(pmy_pack->pmesh->dt, u0, w0, pbval_u, ptwo_temp);
   }
+  ptwo_temp->SolveImplicitRadiationTransport(
+      pmy_pack->pmesh->dt, u0, w0, pbval_u);
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
   return NewTimeStep(pdrive, pdrive->nexp_stages);

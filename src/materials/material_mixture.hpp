@@ -741,6 +741,39 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  bool AllPresentTablesExtrapolateHighTemperature(
+      const MaterialComposition &mix) const {
+    bool have_any = false;
+    for (int n = 0; n < mix.count; ++n) {
+      if (!(mix[n] > 0.0)) continue;
+      have_any = true;
+      if (SpeciesTable(n).extrapolate_high_temperature == 0) return false;
+    }
+    return have_any;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  bool AllPresentTablesExtrapolateHighTemperature(const Real y0) const {
+    return AllPresentTablesExtrapolateHighTemperature(CompositionFromY0(y0));
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real InitialElectronTemperature(
+      const Real ion_temperature, const Real electron_to_ion_temperature,
+      const Real minimum_temperature, const Real maximum_temperature,
+      const bool extrapolate_high_temperature) const {
+    const Real scaled_temperature =
+        electron_to_ion_temperature*ion_temperature;
+    if (!Kokkos::isfinite(scaled_temperature) ||
+        scaled_temperature < 0.0) {
+      Kokkos::abort("Initial electron temperature is not finite and non-negative.");
+    }
+    const Real lower_bounded = fmax(scaled_temperature, minimum_temperature);
+    return extrapolate_high_temperature
+        ? lower_bounded : fmin(lower_bounded, maximum_temperature);
+  }
+
+  KOKKOS_INLINE_FUNCTION
   ComponentAtTemperature MixtureComponentFromRhoSpecificEnergyCached(
       const IonmixComponent component, const Real density,
       const Real target_energy, const MaterialComposition &mix,
@@ -766,6 +799,7 @@ struct MaterialMixtureDevice {
     const bool error_bounds = AnyTableUsesErrorBounds(mix);
     const Real minimum_temperature = MinimumTemperatureForComposition(mix);
     const Real maximum_temperature = MaximumTemperatureForComposition(mix);
+    Real upper_temperature = maximum_temperature;
     ComponentAtTemperature minimum = MixtureComponentFromCachedDensity(
         component, density, minimum_temperature, mix, cache);
     ComponentAtTemperature maximum = MixtureComponentFromCachedDensity(
@@ -781,8 +815,31 @@ struct MaterialMixtureDevice {
       if (error_bounds) {
         Kokkos::abort("Mixed IONMIX inverse energy is above the table range.");
       }
-      maximum.query_flags |= energy_high_flag;
-      return maximum;
+      if (!AllPresentTablesExtrapolateHighTemperature(mix)) {
+        maximum.query_flags |= energy_high_flag;
+        return maximum;
+      }
+      // FLASH permits its caloric Newton solve to range above the last IONMIX node.
+      // Grow a logarithmic bracket on the continued mixed surface; unlike a pure table,
+      // a weighted sum of different endpoint slopes has no analytic inverse.
+      constexpr Real log_two = 0.693147180559945309417232121458176568;
+      Real log_upper = log(maximum_temperature);
+      bool bracketed = false;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        log_upper += log_two;
+        upper_temperature = exp(log_upper);
+        if (!Kokkos::isfinite(upper_temperature)) break;
+        maximum = MixtureComponentFromCachedDensity(
+            component, density, upper_temperature, mix, cache);
+        if (maximum.specific_internal_energy >= target_energy) {
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        Kokkos::abort(
+            "Mixed IONMIX high-temperature continuation could not bracket energy.");
+      }
     }
 
     // A mass-weighted sum of geometric surfaces is not itself geometric.  A short
@@ -797,7 +854,7 @@ struct MaterialMixtureDevice {
     if (target_energy == maximum.specific_internal_energy) return maximum;
     MixedEnergyIntervalCache energy_cache;
     Real log_low = log(minimum_temperature);
-    Real log_high = log(maximum_temperature);
+    Real log_high = log(upper_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real log_trial = 0.5*(log_low+log_high);
       const Real trial_energy = MixtureComponentEnergyFromCachedDensity(
@@ -875,6 +932,11 @@ struct MaterialMixtureDevice {
     } else if (target_energy > maximum.specific_internal_energy) {
       if (error_bounds) {
         Kokkos::abort("Mixed IONMIX inverse energy is above the table range.");
+      }
+      if (AllPresentTablesExtrapolateHighTemperature(mix)) {
+        constexpr int density_query_flags =
+            ionmix_density_below_table | ionmix_density_above_table;
+        return query_flags & density_query_flags;
       }
       const int forward_query_flags = MixtureTemperatureFromRhoTemperature(
           density, maximum.temperature, mix).query_flags;
@@ -1076,8 +1138,12 @@ struct MaterialMixtureDevice {
           ? ion_pressure : electron_pressure;
       const Real temperature_low = fmax(
           temperature*exp(-log_step), MinimumTemperatureForComposition(mix));
-      const Real temperature_high = fmin(
-          temperature*exp(log_step), MaximumTemperatureForComposition(mix));
+      const Real candidate_temperature_high = temperature*exp(log_step);
+      const Real temperature_high =
+          AllPresentTablesExtrapolateHighTemperature(mix)
+          ? candidate_temperature_high
+          : fmin(candidate_temperature_high,
+                 MaximumTemperatureForComposition(mix));
       const ComponentAtTemperature rho_low = MixtureComponentFromRhoTemperature(
           component, density_low, temperature, mix);
       const ComponentAtTemperature rho_high = MixtureComponentFromRhoTemperature(
@@ -1349,12 +1415,16 @@ struct MaterialMixtureDevice {
     constexpr Real log_step = 1.0e-3;
     const Real ti_low = fmax(
         ion_temperature*exp(-log_step), MinimumTemperatureForComposition(y0));
-    const Real ti_high = fmin(
-        ion_temperature*exp(log_step), MaximumTemperatureForComposition(y0));
+    const Real candidate_ti_high = ion_temperature*exp(log_step);
+    const Real ti_high = AllPresentTablesExtrapolateHighTemperature(y0)
+        ? candidate_ti_high
+        : fmin(candidate_ti_high, MaximumTemperatureForComposition(y0));
     const Real te_low = fmax(
         electron_temperature*exp(-log_step), MinimumTemperatureForComposition(y0));
-    const Real te_high = fmin(
-        electron_temperature*exp(log_step), MaximumTemperatureForComposition(y0));
+    const Real candidate_te_high = electron_temperature*exp(log_step);
+    const Real te_high = AllPresentTablesExtrapolateHighTemperature(y0)
+        ? candidate_te_high
+        : fmin(candidate_te_high, MaximumTemperatureForComposition(y0));
     const Real cvi = (MixtureComponentFromRhoTemperature(
         IonmixComponent::ion, density, ti_high, y0).specific_internal_energy-
         MixtureComponentFromRhoTemperature(
@@ -2017,18 +2087,23 @@ struct MaterialMixtureDevice {
     }
     const bool error_bounds = SpeciesTable(0).bounds_error != 0 ||
                               SpeciesTable(1).bounds_error != 0;
+    const bool extrapolate_high_temperature =
+        AllPresentTablesExtrapolateHighTemperature(y0);
     const Real minimum_temperature = MinimumTemperatureForComposition(y0);
     const Real maximum_temperature = MaximumTemperatureForComposition(y0);
-    const Real low_electron_temperature = fmin(fmax(
-        electron_to_ion_temperature*minimum_temperature, minimum_temperature),
-        maximum_temperature);
-    const Real high_electron_temperature = fmin(fmax(
-        electron_to_ion_temperature*maximum_temperature, minimum_temperature),
-        maximum_temperature);
+    Real upper_temperature = maximum_temperature;
+    const Real low_electron_temperature = InitialElectronTemperature(
+        minimum_temperature, electron_to_ion_temperature,
+        minimum_temperature, maximum_temperature,
+        extrapolate_high_temperature);
+    Real high_electron_temperature = InitialElectronTemperature(
+        upper_temperature, electron_to_ion_temperature,
+        minimum_temperature, maximum_temperature,
+        extrapolate_high_temperature);
     MaterialThermodynamicState low = TabularStateNoSound(
         density, minimum_temperature, low_electron_temperature, y0);
     MaterialThermodynamicState high = TabularStateNoSound(
-        density, maximum_temperature, high_electron_temperature, y0);
+        density, upper_temperature, high_electron_temperature, y0);
     const Real low_energy = low.ion_specific_internal_energy+
                             low.electron_specific_internal_energy;
     const Real high_energy = high.ion_specific_internal_energy+
@@ -2043,19 +2118,41 @@ struct MaterialMixtureDevice {
     }
     if (total_specific_energy > high_energy) {
       if (error_bounds) Kokkos::abort("Initial mixed IONMIX energy is above range.");
-      high.query_flags |= ionmix_energy_above_table;
-      high.sound_speed_squared = TabularSoundSpeedSquared(
-          density, high.ion_temperature, high.electron_temperature,
-          high.ion_pressure, high.electron_pressure, y0);
-      return high;
+      if (!extrapolate_high_temperature) {
+        high.query_flags |= ionmix_energy_above_table;
+        high.sound_speed_squared = TabularSoundSpeedSquared(
+            density, high.ion_temperature, high.electron_temperature,
+            high.ion_pressure, high.electron_pressure, y0);
+        return high;
+      }
+      bool bracketed = false;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        upper_temperature *= 2.0;
+        if (!Kokkos::isfinite(upper_temperature)) break;
+        high_electron_temperature = InitialElectronTemperature(
+            upper_temperature, electron_to_ion_temperature,
+            minimum_temperature, maximum_temperature, true);
+        high = TabularStateNoSound(
+            density, upper_temperature, high_electron_temperature, y0);
+        if (high.ion_specific_internal_energy+
+                high.electron_specific_internal_energy >=
+            total_specific_energy) {
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        Kokkos::abort(
+            "Initial mixed IONMIX continuation could not bracket energy.");
+      }
     }
     Real log_low = log(minimum_temperature);
-    Real log_high = log(maximum_temperature);
+    Real log_high = log(upper_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real ti = exp(0.5*(log_low+log_high));
-      const Real te = fmin(fmax(
-          electron_to_ion_temperature*ti, minimum_temperature),
-          maximum_temperature);
+      const Real te = InitialElectronTemperature(
+          ti, electron_to_ion_temperature, minimum_temperature,
+          maximum_temperature, extrapolate_high_temperature);
       const MaterialThermodynamicState trial = TabularStateNoSound(
           density, ti, te, y0);
       const Real energy = trial.ion_specific_internal_energy+
@@ -2067,9 +2164,9 @@ struct MaterialMixtureDevice {
       }
     }
     const Real ti = exp(0.5*(log_low+log_high));
-    const Real te = fmin(fmax(
-        electron_to_ion_temperature*ti, minimum_temperature),
-        maximum_temperature);
+    const Real te = InitialElectronTemperature(
+        ti, electron_to_ion_temperature, minimum_temperature,
+        maximum_temperature, extrapolate_high_temperature);
     return StateFromRhoTemperatures(density, ti, te, y0);
   }
 
@@ -2091,20 +2188,42 @@ struct MaterialMixtureDevice {
     const Real minimum_temperature =
         fmax(MinimumTemperatureForComposition(y0), temperature_floor);
     const Real maximum_temperature = MaximumTemperatureForComposition(y0);
+    const bool extrapolate_high_temperature =
+        AllPresentTablesExtrapolateHighTemperature(y0);
+    Real upper_temperature = extrapolate_high_temperature
+        ? fmax(minimum_temperature, maximum_temperature)
+        : maximum_temperature;
     MaterialThermodynamicState state = StateFromRhoTemperaturesNoSound(
         density, minimum_temperature, minimum_temperature, y0);
     if (state.ion_pressure+state.electron_pressure >= pressure_floor) return state;
     MaterialThermodynamicState maximum = StateFromRhoTemperaturesNoSound(
-        density, maximum_temperature, maximum_temperature, y0);
+        density, upper_temperature, upper_temperature, y0);
     if (maximum.ion_pressure+maximum.electron_pressure < pressure_floor) {
       if (SpeciesTable(0).bounds_error != 0 || SpeciesTable(1).bounds_error != 0) {
         Kokkos::abort("Mixed IONMIX pressure floor is above the table range.");
       }
-      maximum.query_flags |= ionmix_temperature_above_table;
-      return maximum;
+      if (!extrapolate_high_temperature) {
+        maximum.query_flags |= ionmix_temperature_above_table;
+        return maximum;
+      }
+      bool bracketed = false;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        upper_temperature *= 2.0;
+        if (!Kokkos::isfinite(upper_temperature)) break;
+        maximum = StateFromRhoTemperaturesNoSound(
+            density, upper_temperature, upper_temperature, y0);
+        if (maximum.ion_pressure+maximum.electron_pressure >= pressure_floor) {
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        Kokkos::abort(
+            "Mixed IONMIX continuation could not bracket pressure floor.");
+      }
     }
     Real log_low = log(minimum_temperature);
-    Real log_high = log(maximum_temperature);
+    Real log_high = log(upper_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real temperature = exp(0.5*(log_low+log_high));
       const MaterialThermodynamicState trial = TabularStateNoSound(
@@ -2143,20 +2262,42 @@ struct MaterialMixtureDevice {
     const bool use_native_minimum =
         minimum_temperature == native_minimum.temperature;
     const Real maximum_temperature = MaximumTemperatureForComposition(y0);
+    const bool extrapolate_high_temperature =
+        AllPresentTablesExtrapolateHighTemperature(y0);
+    Real upper_temperature = extrapolate_high_temperature
+        ? fmax(minimum_temperature, maximum_temperature)
+        : maximum_temperature;
     MaterialPressureEnergyState state = TabularPressureEnergyFromRhoNativeMinimum(
         density, minimum_temperature, y0, use_native_minimum);
     if (state.ion_pressure+state.electron_pressure >= pressure_floor) return state;
     MaterialPressureEnergyState maximum = TabularPressureEnergyFromRhoTemperature(
-        density, maximum_temperature, y0);
+        density, upper_temperature, y0);
     if (maximum.ion_pressure+maximum.electron_pressure < pressure_floor) {
       if (SpeciesTable(0).bounds_error != 0 || SpeciesTable(1).bounds_error != 0) {
         Kokkos::abort("Mixed IONMIX pressure floor is above the table range.");
       }
-      maximum.query_flags |= ionmix_temperature_above_table;
-      return maximum;
+      if (!extrapolate_high_temperature) {
+        maximum.query_flags |= ionmix_temperature_above_table;
+        return maximum;
+      }
+      bool bracketed = false;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        upper_temperature *= 2.0;
+        if (!Kokkos::isfinite(upper_temperature)) break;
+        maximum = TabularPressureEnergyFromRhoTemperature(
+            density, upper_temperature, y0);
+        if (maximum.ion_pressure+maximum.electron_pressure >= pressure_floor) {
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        Kokkos::abort(
+            "Mixed IONMIX continuation could not bracket pressure floor.");
+      }
     }
     Real log_low = log(minimum_temperature);
-    Real log_high = log(maximum_temperature);
+    Real log_high = log(upper_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real temperature = exp(0.5*(log_low+log_high));
       const MaterialPressureEnergyState trial =
@@ -2310,9 +2451,13 @@ struct MaterialMixtureDevice {
     const Real minimum = MinimumTemperatureForComposition(mix);
     const Real maximum = MaximumTemperatureForComposition(mix);
     const Real ti_low = fmax(ion_temperature*exp(-log_step), minimum);
-    const Real ti_high = fmin(ion_temperature*exp(log_step), maximum);
+    const Real candidate_ti_high = ion_temperature*exp(log_step);
+    const Real ti_high = AllPresentTablesExtrapolateHighTemperature(mix)
+        ? candidate_ti_high : fmin(candidate_ti_high, maximum);
     const Real te_low = fmax(electron_temperature*exp(-log_step), minimum);
-    const Real te_high = fmin(electron_temperature*exp(log_step), maximum);
+    const Real candidate_te_high = electron_temperature*exp(log_step);
+    const Real te_high = AllPresentTablesExtrapolateHighTemperature(mix)
+        ? candidate_te_high : fmin(candidate_te_high, maximum);
     const Real cvi = (MixtureComponentFromRhoTemperature(
         IonmixComponent::ion, density, ti_high, mix).specific_internal_energy-
         MixtureComponentFromRhoTemperature(
@@ -2484,18 +2629,23 @@ struct MaterialMixtureDevice {
           electron_fraction*total_specific_energy, mix);
     }
     const bool error_bounds = AnyTableUsesErrorBounds(mix);
+    const bool extrapolate_high_temperature =
+        AllPresentTablesExtrapolateHighTemperature(mix);
     const Real minimum_temperature = MinimumTemperatureForComposition(mix);
     const Real maximum_temperature = MaximumTemperatureForComposition(mix);
-    const Real low_electron_temperature = fmin(fmax(
-        electron_to_ion_temperature*minimum_temperature, minimum_temperature),
-        maximum_temperature);
-    const Real high_electron_temperature = fmin(fmax(
-        electron_to_ion_temperature*maximum_temperature, minimum_temperature),
-        maximum_temperature);
+    Real upper_temperature = maximum_temperature;
+    const Real low_electron_temperature = InitialElectronTemperature(
+        minimum_temperature, electron_to_ion_temperature,
+        minimum_temperature, maximum_temperature,
+        extrapolate_high_temperature);
+    Real high_electron_temperature = InitialElectronTemperature(
+        upper_temperature, electron_to_ion_temperature,
+        minimum_temperature, maximum_temperature,
+        extrapolate_high_temperature);
     MaterialThermodynamicState low = TabularStateNoSound(
         density, minimum_temperature, low_electron_temperature, mix);
     MaterialThermodynamicState high = TabularStateNoSound(
-        density, maximum_temperature, high_electron_temperature, mix);
+        density, upper_temperature, high_electron_temperature, mix);
     const Real low_energy = low.ion_specific_internal_energy+
                             low.electron_specific_internal_energy;
     const Real high_energy = high.ion_specific_internal_energy+
@@ -2510,19 +2660,41 @@ struct MaterialMixtureDevice {
     }
     if (total_specific_energy > high_energy) {
       if (error_bounds) Kokkos::abort("Initial mixed IONMIX energy is above range.");
-      high.query_flags |= ionmix_energy_above_table;
-      high.sound_speed_squared = TabularSoundSpeedSquared(
-          density, high.ion_temperature, high.electron_temperature,
-          high.ion_pressure, high.electron_pressure, mix);
-      return high;
+      if (!extrapolate_high_temperature) {
+        high.query_flags |= ionmix_energy_above_table;
+        high.sound_speed_squared = TabularSoundSpeedSquared(
+            density, high.ion_temperature, high.electron_temperature,
+            high.ion_pressure, high.electron_pressure, mix);
+        return high;
+      }
+      bool bracketed = false;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        upper_temperature *= 2.0;
+        if (!Kokkos::isfinite(upper_temperature)) break;
+        high_electron_temperature = InitialElectronTemperature(
+            upper_temperature, electron_to_ion_temperature,
+            minimum_temperature, maximum_temperature, true);
+        high = TabularStateNoSound(
+            density, upper_temperature, high_electron_temperature, mix);
+        if (high.ion_specific_internal_energy+
+                high.electron_specific_internal_energy >=
+            total_specific_energy) {
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        Kokkos::abort(
+            "Initial mixed IONMIX continuation could not bracket energy.");
+      }
     }
     Real log_low = log(minimum_temperature);
-    Real log_high = log(maximum_temperature);
+    Real log_high = log(upper_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real ti = exp(0.5*(log_low+log_high));
-      const Real te = fmin(fmax(
-          electron_to_ion_temperature*ti, minimum_temperature),
-          maximum_temperature);
+      const Real te = InitialElectronTemperature(
+          ti, electron_to_ion_temperature, minimum_temperature,
+          maximum_temperature, extrapolate_high_temperature);
       const MaterialThermodynamicState trial = TabularStateNoSound(
           density, ti, te, mix);
       const Real energy = trial.ion_specific_internal_energy+
@@ -2534,9 +2706,9 @@ struct MaterialMixtureDevice {
       }
     }
     const Real ti = exp(0.5*(log_low+log_high));
-    const Real te = fmin(fmax(
-        electron_to_ion_temperature*ti, minimum_temperature),
-        maximum_temperature);
+    const Real te = InitialElectronTemperature(
+        ti, electron_to_ion_temperature, minimum_temperature,
+        maximum_temperature, extrapolate_high_temperature);
     return StateFromRhoTemperatures(density, ti, te, mix);
   }
 
@@ -2564,20 +2736,42 @@ struct MaterialMixtureDevice {
     const bool use_native_minimum =
         minimum_temperature == native_minimum.temperature;
     const Real maximum_temperature = MaximumTemperatureForComposition(mix);
+    const bool extrapolate_high_temperature =
+        AllPresentTablesExtrapolateHighTemperature(mix);
+    Real upper_temperature = extrapolate_high_temperature
+        ? fmax(minimum_temperature, maximum_temperature)
+        : maximum_temperature;
     MaterialPressureEnergyState state = TabularPressureEnergyFromRhoNativeMinimum(
         density, minimum_temperature, mix, use_native_minimum);
     if (state.ion_pressure+state.electron_pressure >= pressure_floor) return state;
     MaterialPressureEnergyState maximum = TabularPressureEnergyFromRhoTemperature(
-        density, maximum_temperature, mix);
+        density, upper_temperature, mix);
     if (maximum.ion_pressure+maximum.electron_pressure < pressure_floor) {
       if (AnyTableUsesErrorBounds(mix)) {
         Kokkos::abort("Mixed IONMIX pressure floor is above the table range.");
       }
-      maximum.query_flags |= ionmix_temperature_above_table;
-      return maximum;
+      if (!extrapolate_high_temperature) {
+        maximum.query_flags |= ionmix_temperature_above_table;
+        return maximum;
+      }
+      bool bracketed = false;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        upper_temperature *= 2.0;
+        if (!Kokkos::isfinite(upper_temperature)) break;
+        maximum = TabularPressureEnergyFromRhoTemperature(
+            density, upper_temperature, mix);
+        if (maximum.ion_pressure+maximum.electron_pressure >= pressure_floor) {
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        Kokkos::abort(
+            "Mixed IONMIX continuation could not bracket pressure floor.");
+      }
     }
     Real log_low = log(minimum_temperature);
-    Real log_high = log(maximum_temperature);
+    Real log_high = log(upper_temperature);
     for (int iteration = 0; iteration < 48; ++iteration) {
       const Real temperature = exp(0.5*(log_low+log_high));
       const MaterialPressureEnergyState trial =

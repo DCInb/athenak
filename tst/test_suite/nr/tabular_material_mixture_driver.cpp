@@ -530,6 +530,13 @@ int main(int argc, char **argv) {
     options.bounds_policy = materials::IonmixBoundsPolicy::error;
     materials::IonmixTwoTemperatureTable ch(argv[1], options);
     materials::IonmixTwoTemperatureTable he(argv[2], options);
+    materials::IonmixTwoTemperatureTableOptions extrapolate_options = options;
+    extrapolate_options.bounds_policy =
+        materials::IonmixBoundsPolicy::flash_extrapolate;
+    materials::IonmixTwoTemperatureTable extrapolate_ch(
+        argv[1], extrapolate_options);
+    materials::IonmixTwoTemperatureTable extrapolate_he(
+        argv[2], extrapolate_options);
     options.geometric_interpolation = false;
     materials::IonmixTwoTemperatureTable nonlinear_ch(argv[1], options);
     materials::IonmixTwoTemperatureTable nonlinear_he(argv[2], options);
@@ -572,6 +579,24 @@ int main(int argc, char **argv) {
     SetMaterialTables(
         many_mixture, {ch_table, he_table, ch_table, he_table},
         "many-mixture-tables");
+    materials::MaterialMixtureDevice extrapolate_mixture =
+        CloneMixture(mixture, "extrapolate-mixture");
+    SetMaterialTables(
+        extrapolate_mixture,
+        {extrapolate_ch.DeviceData(), extrapolate_he.DeviceData()},
+        "extrapolate-mixture-tables");
+    materials::MaterialMixtureDevice extrapolate_single_mixture =
+        CloneMixture(single_mixture, "extrapolate-single-mixture");
+    SetMaterialTables(
+        extrapolate_single_mixture, {extrapolate_ch.DeviceData()},
+        "extrapolate-single-mixture-tables");
+    materials::MaterialMixtureDevice extrapolate_many_mixture =
+        CloneMixture(many_mixture, "extrapolate-many-mixture");
+    SetMaterialTables(
+        extrapolate_many_mixture,
+        {extrapolate_ch.DeviceData(), extrapolate_he.DeviceData(),
+         extrapolate_ch.DeviceData(), extrapolate_he.DeviceData()},
+        "extrapolate-many-mixture-tables");
     materials::MaterialMixtureDevice nonlinear_mixture =
         CloneMixture(mixture, "nonlinear-mixture");
     SetMaterialTables(
@@ -822,6 +847,143 @@ int main(int argc, char **argv) {
               !NearlyEqual(overshoot[3], 0.1) ||
               all_zero[0] != 0.0 || all_zero[1] != 0.0 ||
               all_zero[2] != 0.0 || all_zero[3] != 1.0) {
+            ++local_failures;
+          }
+
+          // FLASH-style continuation must retain conservative energy above the old
+          // common table endpoint for pure, mixed, and arbitrary-count compositions.
+          // Four times the old common endpoint also covers the 3.4x excess measured in
+          // the DCI laser-heated plume.
+          constexpr Real old_common_maximum_temperature = 1000.0;
+          constexpr Real continued_temperature = 4000.0;
+          const auto extrapolate_mix2 =
+              extrapolate_mixture.CompositionFromY0(ych);
+          const auto native1 = extrapolate_single_mixture.StateFromRhoTemperatures(
+              density, old_common_maximum_temperature,
+              old_common_maximum_temperature, mix1);
+          const auto continued1 =
+              extrapolate_single_mixture.StateFromRhoTemperatures(
+                  density, continued_temperature, continued_temperature, mix1);
+          const auto inverse_continued1 =
+              extrapolate_single_mixture.StateFromRhoSpecificEnergies(
+                  density, continued1.ion_specific_internal_energy,
+                  continued1.electron_specific_internal_energy, mix1);
+          const auto native2 = extrapolate_mixture.StateFromRhoTemperatures(
+              density, old_common_maximum_temperature,
+              old_common_maximum_temperature, extrapolate_mix2);
+          const auto continued2 = extrapolate_mixture.StateFromRhoTemperatures(
+              density, continued_temperature, continued_temperature,
+              extrapolate_mix2);
+          const auto inverse_continued2 =
+              extrapolate_mixture.StateFromRhoSpecificEnergies(
+                  density, continued2.ion_specific_internal_energy,
+                  continued2.electron_specific_internal_energy,
+                  extrapolate_mix2);
+          const auto continued4 =
+              extrapolate_many_mixture.StateFromRhoTemperatures(
+                  density, continued_temperature, continued_temperature, mix4);
+          const auto inverse_continued4 =
+              extrapolate_many_mixture.StateFromRhoSpecificEnergies(
+                  density, continued4.ion_specific_internal_energy,
+                  continued4.electron_specific_internal_energy, mix4);
+          const int continued_high_flags =
+              materials::ionmix_temperature_above_table |
+              materials::ionmix_energy_above_table;
+          const int energy_query_flags =
+              extrapolate_many_mixture.SpecificEnergiesQueryFlags(
+                  density, continued4.ion_specific_internal_energy,
+                  continued4.electron_specific_internal_energy, mix4);
+          const Real total2 = continued2.ion_specific_internal_energy+
+                              continued2.electron_specific_internal_energy;
+          const Real total4 = continued4.ion_specific_internal_energy+
+                              continued4.electron_specific_internal_energy;
+          const auto initial2 =
+              extrapolate_mixture.InitialStateFromTotalSpecificEnergy(
+                  density, total2, extrapolate_mix2, 1.0);
+          const auto initial4 =
+              extrapolate_many_mixture.InitialStateFromTotalSpecificEnergy(
+                  density, total4, mix4, 1.0);
+          const Real pressure_floor2 =
+              continued2.ion_pressure+continued2.electron_pressure;
+          const Real pressure_floor4 =
+              continued4.ion_pressure+continued4.electron_pressure;
+          const auto floor2 = extrapolate_mixture.MinimumPressureEnergyState(
+              density, ych, pressure_floor2);
+          const auto floor2_full = extrapolate_mixture.MinimumStateNoSound(
+              density, ych, pressure_floor2);
+          const auto floor4 =
+              extrapolate_many_mixture.MinimumPressureEnergyState(
+                  density, mix4, pressure_floor4);
+          const auto exchange_old =
+              extrapolate_mixture.StateFromRhoTemperaturesNoSound(
+                  density, 3000.0, 5000.0, extrapolate_mix2);
+          const Real continued_exchange_total =
+              exchange_old.ion_specific_internal_energy+
+              exchange_old.electron_specific_internal_energy;
+          const auto continued_exchange =
+              extrapolate_mixture.StateFromRhoTotalEnergyTemperatureDifference(
+                  density, exchange_old.ion_specific_internal_energy,
+                  exchange_old.electron_specific_internal_energy,
+                  exchange_old.ion_temperature,
+                  exchange_old.electron_temperature, 1000.0,
+                  extrapolate_mix2);
+          if (mix1.count != 1 || extrapolate_mix2.count != 2 || mix4.count != 4 ||
+              !(continued1.ion_specific_internal_energy >
+                3.0*native1.ion_specific_internal_energy) ||
+              !(continued1.electron_specific_internal_energy >
+                3.0*native1.electron_specific_internal_energy) ||
+              !(continued2.ion_specific_internal_energy >
+                3.0*native2.ion_specific_internal_energy) ||
+              !(continued2.electron_specific_internal_energy >
+                3.0*native2.electron_specific_internal_energy) ||
+              (continued1.query_flags & continued_high_flags) != 0 ||
+              (continued2.query_flags & continued_high_flags) != 0 ||
+              (continued4.query_flags & continued_high_flags) != 0 ||
+              (inverse_continued1.query_flags & continued_high_flags) != 0 ||
+              (inverse_continued2.query_flags & continued_high_flags) != 0 ||
+              (inverse_continued4.query_flags & continued_high_flags) != 0 ||
+              (energy_query_flags & continued_high_flags) != 0 ||
+              !NearlyEqual(inverse_continued1.ion_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(inverse_continued1.electron_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(inverse_continued2.ion_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(inverse_continued2.electron_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(inverse_continued4.ion_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(inverse_continued4.electron_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(initial2.ion_temperature, continued_temperature) ||
+              !NearlyEqual(initial2.electron_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(initial4.ion_temperature, continued_temperature) ||
+              !NearlyEqual(initial4.electron_temperature,
+                           continued_temperature) ||
+              !NearlyEqual(floor2.ion_pressure+floor2.electron_pressure,
+                           pressure_floor2) ||
+              !NearlyEqual(floor2_full.ion_pressure+
+                               floor2_full.electron_pressure,
+                           pressure_floor2) ||
+              !NearlyEqual(floor4.ion_pressure+floor4.electron_pressure,
+                           pressure_floor4) ||
+              (floor2.query_flags & continued_high_flags) != 0 ||
+              (floor2_full.query_flags & continued_high_flags) != 0 ||
+              (floor4.query_flags & continued_high_flags) != 0 ||
+              !Kokkos::isfinite(continued1.sound_speed_squared) ||
+              !Kokkos::isfinite(continued2.sound_speed_squared) ||
+              !Kokkos::isfinite(continued4.sound_speed_squared) ||
+              !(continued1.sound_speed_squared > 0.0) ||
+              !(continued2.sound_speed_squared > 0.0) ||
+              !(continued4.sound_speed_squared > 0.0) ||
+              continued_exchange.used_fallback != 0 ||
+              (continued_exchange.thermodynamics.query_flags &
+               continued_high_flags) != 0 ||
+              !NearlyEqual(
+                  continued_exchange.ion_specific_internal_energy+
+                      continued_exchange.electron_specific_internal_energy,
+                  continued_exchange_total)) {
             ++local_failures;
           }
 

@@ -128,7 +128,7 @@ material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tabl
 material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au.2t_eos
 material2_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
-eos_table_bounds = clamp
+eos_table_bounds = flash-extrapolate
 eos_table_interpolation = geometric
 
 material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
@@ -163,16 +163,28 @@ material2_opacity_emission_scale = 1.1e-1
 enabled = true
 n_groups = 20
 arad = 6.265030089603521e2
-# Reduced light speed: 3.0e9 cm/s (about c/10).  Production requires matched
-# c_hat=10 and physical-c sensitivity gates.
-c_light = 3.0e1
+# Physical light speed in mm/ns.  Frozen-coefficient backward-Euler FLD removes the
+# explicit dx/c transport restriction without changing emission or absorption rates.
+c_light = 2.99792458e2
 initial_radiation_temperature = 6.680606376612690e-5
 flux_limiter = harmonic
 flux_limit_coefficient = 1.0
 transport_discretization = asymptotic-preserving
+transport_integrator = implicit
+implicit_tolerance = 1.0e-10
+implicit_max_iterations = 2000
+implicit_report = false
+implicit_x1_inner_boundary = vacuum
+implicit_x1_outer_boundary = vacuum
+implicit_x2_inner_boundary = vacuum
+implicit_x2_outer_boundary = vacuum
+implicit_x3_inner_boundary = vacuum
+implicit_x3_outer_boundary = vacuum
 ap_streaming_threshold = 5.0e-1
 ap_optical_depth_threshold = 1.0
-source_cfl = 1.0e-1
+# Only the explicit c*dt/dx transport restriction is disabled.  AthenaK time-lags its
+# local emission source, so retain an independent 10% source-splitting accuracy guard.
+source_cfl = 0.1
 couple_matter = true
 opacity_model = mixed-table
 group_bound_0 = 6.679753382762794e-5

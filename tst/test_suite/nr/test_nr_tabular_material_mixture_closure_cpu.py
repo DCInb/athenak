@@ -149,10 +149,10 @@ def test_cached_flux_and_exchange_sources():
     assert table_temperature_source.count(
         "const AxisLocation density = Locate(") == 1
     assert table_temperature_source.count(
-        "const AxisLocation temperature = Locate(") == 1
+        "const AxisLocation temperature = LocateTemperature(") == 1
     assert table_temperature_source.index(
         "const AxisLocation density = Locate(") < table_temperature_source.index(
-            "const AxisLocation temperature = Locate(")
+            "const AxisLocation temperature = LocateTemperature(")
     table_pressure_energy_source = ionmix_source.split(
         "IonmixPressureEnergyState PressureEnergyFromRhoTemperature(",
         1)[1].split(
@@ -160,12 +160,12 @@ def test_cached_flux_and_exchange_sources():
     assert table_pressure_energy_source.count(
         "const AxisLocation density = Locate(") == 1
     assert table_pressure_energy_source.count(
-        "const AxisLocation temperature = Locate(") == 1
+        "const AxisLocation temperature = LocateTemperature(") == 1
     assert table_pressure_energy_source.count("EvaluateWithLocations(") == 4
     assert "bounded_log_coordinate" not in table_pressure_energy_source
     table_pressure_energy_order = [
         "const AxisLocation density = Locate(",
-        "const AxisLocation temperature = Locate(",
+        "const AxisLocation temperature = LocateTemperature(",
         "EvaluateWithLocations(ion_pressure",
         "EvaluateWithLocations(ion_specific_internal_energy",
         "EvaluateWithLocations(electron_pressure",
@@ -250,7 +250,7 @@ def test_cached_flux_and_exchange_sources():
     cached_signature = cached_inverse_source.split("{", 1)[0]
     assert "MixedDensityCache &cache" in cached_signature
     assert cached_inverse_source.count(
-        "MixtureComponentFromCachedDensity(") == 3
+        "MixtureComponentFromCachedDensity(") == 4
     assert cached_inverse_source.count(
         "MixtureComponentEnergyFromCachedDensity(") == 1
     assert "MixedEnergyIntervalCache energy_cache;" in cached_inverse_source
@@ -285,7 +285,7 @@ def test_cached_flux_and_exchange_sources():
         "MaterialPressureEnergyState MinimumPressureEnergyState(",
         1)[1].split("MaterialThermodynamicState MinimumState(", 1)[0]
     assert floor_pressure_energy_source.count(
-        "TabularPressureEnergyFromRhoTemperature(") == 3
+        "TabularPressureEnergyFromRhoTemperature(") == 4
     assert floor_pressure_energy_source.count(
         "TabularPressureEnergyFromRhoNativeMinimum(") == 1
     assert "TabularPressureEnergyFromRhoTemperatures(" not in (

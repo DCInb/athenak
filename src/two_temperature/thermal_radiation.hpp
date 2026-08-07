@@ -12,6 +12,7 @@
 #include "materials/material_mixture.hpp"
 
 class MeshBlockPack;
+class MeshBoundaryValuesCC;
 class ParameterInput;
 
 namespace two_temperature {
@@ -21,13 +22,14 @@ class MixedOpacityTable;
 
 //----------------------------------------------------------------------------------------
 //! \class ThermalRadiation
-//! \brief Evolves comoving radiation-group energy densities with explicit FLD.
+//! \brief Evolves comoving radiation-group energy densities with FLD.
 //!
 //! Radiation groups are stored as advected fluid scalars after the ion and electron
-//! energies.  Diffusive group fluxes are added to the finite-volume fluid fluxes, so
-//! existing boundary communication, flux correction, AMR, and restart support apply.
-//! Absorption and Planck emission are operator split and exchange energy only with the
-//! electron component.
+//! energies.  The default explicit integrator adds diffusive group fluxes to the
+//! finite-volume fluid fluxes.  The optional FLASH-like integrator advances diffusion
+//! with a centered, time-lagged backward-Euler solve; it does not use the explicit
+//! asymptotic-preserving upwind correction.  Absorption and Planck emission are operator
+//! split and exchange energy only with the electron component.
 
 class ThermalRadiation {
  public:
@@ -40,6 +42,10 @@ class ThermalRadiation {
   int ngroups;
   int ifirst;
   Real dtnew;
+  int implicit_iterations_last_solve = 0;
+  Real implicit_residual_last_solve = 0.0;
+  // Rank-local, step-averaged outward diffusive power through physical boundaries.
+  Real implicit_boundary_power = 0.0;
 
   // component 0 = total specific radiation energy, component 1 = radiation temperature
   DvceArray5D<Real> diagnostics;
@@ -55,6 +61,11 @@ class ThermalRadiation {
               DvceArray5D<Real> &temperature,
               Real material_pressure_floor, Real material_temperature_floor,
               int il, int iu, int jl, int ju, int kl, int ku);
+  bool IsImplicit() const { return implicit_transport_; }
+  void SolveImplicitTransport(Real dt, DvceArray5D<Real> &cons,
+                              DvceArray5D<Real> &prim,
+                              const DvceArray5D<Real> &temperature,
+                              MeshBoundaryValuesCC *pbval);
   void NewTimeStep(const DvceArray5D<Real> &prim,
                    const DvceArray5D<Real> &temperature);
 
@@ -77,6 +88,14 @@ class ThermalRadiation {
   int initial_profile_mode_;
   bool couple_matter_;
   bool use_ap_transport_;
+  bool implicit_transport_ = false;
+  bool implicit_report_ = false;
+  Real implicit_tolerance_ = 1.0e-10;
+  int implicit_max_iterations_ = 400;
+  // 0=zero-gradient (Neumann), 1=fixed face value (Dirichlet), 2=zero ghost
+  // value (the vacuum convention used by the existing explicit DCI boundary).
+  int implicit_boundary_type_[6] = {0, 0, 0, 0, 0, 0};
+  Real implicit_boundary_value_[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool use_material_mixture_ = false;
   materials::MaterialMixtureDevice material_mixture_;
   bool use_opacity_table_ = false;
@@ -88,6 +107,31 @@ class ThermalRadiation {
   DualArray1D<Real> kappa_transport_;
   DualArray1D<Real> kappa_absorption_;
   DualArray1D<Real> kappa_emission_;
+
+  // One component is solved at a time so the storage cost does not scale with ngroups.
+  DvceArray5D<Real> implicit_old_;
+  DvceArray5D<Real> implicit_solution_;
+  DvceArray5D<Real> implicit_coefficient_;
+  DvceArray5D<Real> implicit_residual_;
+  DvceArray5D<Real> implicit_direction_;
+  DvceArray5D<Real> implicit_preconditioned_;
+  DvceArray5D<Real> implicit_operator_;
+  DvceArray5D<Real> implicit_coarse_scratch_;
+
+ public:
+  // Public because nvcc requires any member enclosing an extended device lambda to have
+  // public access.  These remain implementation details of SolveImplicitTransport().
+  void ApplyImplicitPhysicalBoundaries(DvceArray5D<Real> &field,
+                                       bool homogeneous_boundary,
+                                       bool coefficient_field = false);
+  void ExchangeImplicitField(DvceArray5D<Real> &field,
+                             MeshBoundaryValuesCC *pbval,
+                             bool homogeneous_boundary,
+                             bool coefficient_field = false);
+  void ApplyImplicitOperator(const DvceArray5D<Real> &field,
+                             DvceArray5D<Real> &result, Real dt);
+  Real ImplicitGlobalDot(const DvceArray5D<Real> &lhs,
+                         const DvceArray5D<Real> &rhs) const;
 };
 
 } // namespace two_temperature

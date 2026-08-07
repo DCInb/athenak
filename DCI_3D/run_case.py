@@ -106,7 +106,7 @@ GPU_LOCK_ROOT = Path(
 OUTPUT_BLOCKS = range(1, 12)
 DEFAULT_PRODUCTION_GATE = CASE_DIR / "production_gate.json"
 PRODUCTION_GATE_SCHEMA = 8
-PRODUCTION_RADIATION_C_LIGHT = 30.0
+PHYSICAL_RADIATION_C_LIGHT = 299.792458
 CALIBRATION_CYCLES = 22
 PRODUCTION_STATUS_SCHEMA = 2
 PRODUCTION_PHASE1_TARGET = 5.0
@@ -223,10 +223,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--radiation-c-light",
         type=float,
-        choices=(10.0, 30.0, 299.792458),
+        choices=(10.0, 30.0, PHYSICAL_RADIATION_C_LIGHT),
         help=(
-            "non-production RSLA sensitivity value in code units; default smoke "
-            "cycle count scales from the c_hat=30 production baseline"
+            "non-production radiation-coupling diagnostic in code units; implicit "
+            "transport is not subject to an explicit light-crossing CFL"
         ),
     )
     parser.add_argument(
@@ -1264,12 +1264,10 @@ def production_output_cadences(path: Path = PRODUCTION_INPUT) -> dict[str, float
 
 
 def default_smoke_cycles(c_light: float | None, compact_scale: int) -> int:
-    value = PRODUCTION_RADIATION_C_LIGHT if c_light is None else c_light
-    # c_hat=10 and 30 are not transport-CFL limited in the measured compact case,
-    # while the physical-c comparison is.  Never shorten the 50-cycle baseline;
-    # scale only faster-light comparisons and doubled spatial resolution upward.
-    speed_scale = max(1.0, value/PRODUCTION_RADIATION_C_LIGHT)
-    return int(round(50.0*speed_scale*compact_scale))
+    # Backward-Euler FLD has no explicit c*dt/dx restriction.  Keep matched diagnostic
+    # runs at the same cycle count regardless of their non-production c_light override.
+    del c_light
+    return 50*compact_scale
 
 
 def nonproduction_overrides(
@@ -1350,13 +1348,7 @@ def smoke_restart_overrides(
     laser_reflection_hysteresis: float | None = None,
 ) -> list[str]:
     first_cycles = default_smoke_cycles(radiation_c_light, compact_scale)
-    value = (
-        PRODUCTION_RADIATION_C_LIGHT
-        if radiation_c_light is None else radiation_c_light
-    )
-    extra_cycles = int(round(
-        10.0*max(1.0, value/PRODUCTION_RADIATION_C_LIGHT)*compact_scale
-    ))
+    extra_cycles = 10*compact_scale
     overrides = [
         f"time/nlim={first_cycles+extra_cycles}",
         "time/tlim=1.0",
