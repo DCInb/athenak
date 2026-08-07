@@ -27,8 +27,8 @@ cone axis `+z` to `+x1` (`x -> x2`, `y -> x3`) and cm to the `0.1 cm` code lengt
   `1 eV`).
 - Zero initial magnetic field, dual-energy MHD, Biermann battery, and Spitzer
   electron-ion exchange.
-- Two conservative user scalars store `rho*Y_CH` and `rho*Y_Au`; helium is the
-  remainder, `Y_He = 1-Y_CH-Y_Au`.
+- Three conservative user scalars explicitly store `rho*Y_CH`, `rho*Y_Au`, and
+  `rho*Y_He`.
 
 Where the cap and cone meet along the shared conical surface, the cone's volume fraction
 has the cap's subtracted from it so solid mass is not double counted.  The interfaces are
@@ -104,10 +104,10 @@ additive extinction,
 kappa_mix = sum_s Y_s kappa_s(rho_s,Te).
 ```
 
-`MaterialMixture` carries composition as a fixed-capacity `MaterialComposition` vector, so
-each mixing rule is written once for any component count.  With `nmaterials=2` every rule
-reduces to the original `y0`/`1-y0` arithmetic, including its floating-point association
-order, which keeps existing two-material results bit-identical.
+`MaterialMixture` carries composition through a runtime-sized device accessor, so each
+mixing rule is written once for any positive component count without a compile-time
+material cap. Every component has its own explicitly advected fraction; nonnegative
+fractions are normalized before the closure is evaluated.
 
 Table coordinates and positive values are geometrically interpolated.  Partial densities
 created by a smoothed or numerically mixed interface can fall below a pure-material table

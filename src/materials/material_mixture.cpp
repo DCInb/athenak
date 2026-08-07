@@ -8,11 +8,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "athena.hpp"
 #include "materials/material_mixture.hpp"
@@ -75,19 +77,18 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
                                  units::Units *unit_system) {
   const int number_of_materials =
       pin->GetOrAddInteger("materials", "nmaterials", 2);
-  if (number_of_materials < 2 || number_of_materials > kMaxMaterials) {
-    MaterialInputError("nmaterials must be between 2 and " +
-                       std::to_string(kMaxMaterials));
+  if (number_of_materials < 1) {
+    MaterialInputError("nmaterials must be a positive integer");
   }
   data_.nmaterials = number_of_materials;
-  // The closure advects nmaterials-1 mass fractions; the last component is the
-  // remainder.  scalar_index names the first of a contiguous run.
+  // Every material has an explicit mass fraction. scalar_index names the first of a
+  // contiguous run of nmaterials passive scalars.
   const int relative_scalar =
       pin->GetOrAddInteger("materials", "scalar_index", 0);
-  if (relative_scalar < 0 ||
-      relative_scalar+number_of_materials-1 > nuser_scalars) {
+  if (relative_scalar < 0 || relative_scalar > nuser_scalars ||
+      number_of_materials > nuser_scalars-relative_scalar) {
     MaterialInputError("scalar_index must select " +
-                       std::to_string(number_of_materials-1) +
+                       std::to_string(number_of_materials) +
                        " user passive scalars in <" + block + ">");
   }
   constexpr Real monatomic_gamma = 5.0/3.0;
@@ -101,15 +102,27 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
   if (!std::isfinite(default_exchange_time)) {
     MaterialInputError("the default <" + block + ">/t_ei must be finite");
   }
-  data_.material0 = ReadMaterial(pin, 0, default_exchange_time);
-  data_.material1 = ReadMaterial(pin, 1, default_exchange_time);
-  for (int n = 2; n < number_of_materials; ++n) {
-    data_.extra_material[n-2] = ReadMaterial(pin, n, default_exchange_time);
+  std::vector<SpeciesProperties> host_species(number_of_materials);
+  for (int n = 0; n < number_of_materials; ++n) {
+    host_species[n] = ReadMaterial(pin, n, default_exchange_time);
   }
+  data_.species = DvceArray1D<SpeciesProperties>(
+      "material_species", number_of_materials);
+  auto species_host = Kokkos::create_mirror_view(data_.species);
+  for (int n = 0; n < number_of_materials; ++n) {
+    species_host(n) = host_species[n];
+  }
+  Kokkos::deep_copy(data_.species, species_host);
+
   data_.scalar_index = first_user_scalar+relative_scalar;
-  for (int n = 0; n < number_of_materials-1; ++n) {
-    data_.scalar_indices[n] = first_user_scalar+relative_scalar+n;
+  data_.scalar_indices = DvceArray1D<int>(
+      "material_scalar_indices", number_of_materials);
+  auto scalar_indices_host = Kokkos::create_mirror_view(data_.scalar_indices);
+  for (int n = 0; n < number_of_materials; ++n) {
+    scalar_indices_host(n) = first_user_scalar+relative_scalar+n;
   }
+  Kokkos::deep_copy(data_.scalar_indices, scalar_indices_host);
+
   data_.gamma_minus_one = gamma-1.0;
 
   for (int n = 0; n < number_of_materials; ++n) {
@@ -132,7 +145,8 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     return;
   }
   if (unit_system == nullptr) {
-    MaterialInputError("tabular multi-material two-temperature EOS requires a <units> block");
+    MaterialInputError(
+        "tabular multi-material two-temperature EOS requires a <units> block");
   }
 
   const std::string mixing_rule = pin->GetOrAddString(
@@ -181,13 +195,13 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     MaterialInputError("eos_wave_speed_safety must be finite and at least one");
   }
 
+  tables_.resize(number_of_materials);
+  std::vector<IonmixTwoTemperatureTableDevice> host_material_tables(
+      number_of_materials);
   for (int n = 0; n < number_of_materials; ++n) {
     const std::string file = pin->GetString("materials", Key(n, "eos_table_file"));
     tables_[n] = std::make_unique<IonmixTwoTemperatureTable>(file, options);
-    const SpeciesProperties &species =
-        (n == 0) ? data_.material0
-                 : ((n == 1) ? data_.material1 : data_.extra_material[n-2]);
-    CheckAbar(n, species, tables_[n]->Metadata());
+    CheckAbar(n, host_species[n], tables_[n]->Metadata());
     const std::string fingerprint = pin->GetOrAddString(
         "materials", Key(n, "eos_table_fingerprint"),
         tables_[n]->Metadata().file_fingerprint);
@@ -195,14 +209,20 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
       MaterialInputError(
           Key(n, "eos_table_fingerprint")+" does not match the loaded file");
     }
-    if (n == 0) {
-      data_.material0_table = tables_[n]->DeviceData();
-    } else if (n == 1) {
-      data_.material1_table = tables_[n]->DeviceData();
-    } else {
-      data_.extra_material_table[n-2] = tables_[n]->DeviceData();
-    }
+    host_material_tables[n] = tables_[n]->DeviceData();
   }
+  const std::size_t table_bytes =
+      number_of_materials*sizeof(IonmixTwoTemperatureTableDevice);
+  HostArray1D<unsigned char> host_table_storage(
+      "material-eos-table-host-storage", table_bytes);
+  std::memcpy(
+      host_table_storage.data(), host_material_tables.data(), table_bytes);
+  data_.material_table_storage = DvceArray1D<unsigned char>(
+      "material-eos-table-storage", table_bytes);
+  Kokkos::deep_copy(data_.material_table_storage, host_table_storage);
+  data_.material_tables =
+      reinterpret_cast<const IonmixTwoTemperatureTableDevice *>(
+          data_.material_table_storage.data());
   data_.density_to_cgs = options.density_to_cgs;
   data_.temperature_to_kelvin = options.temperature_to_kelvin;
   data_.use_tabular_eos = true;

@@ -76,9 +76,9 @@ The newest laser/Biermann reference is `3d_zb/ParDir/1l_4beam_BB.par` together w
 - the run ends at 10 ns;
 - CH, gold, and helium use IONMIX material tables.
 
-The archived Au cone is now included: `MaterialMixture` was generalized from a fixed two
-material closure to `nmaterials` components, and the deck advects two mass fractions
-(`rho*Y_CH`, `rho*Y_Au`) with helium as the remainder.  Electron conduction
+The archived Au cone is now included: `MaterialMixture` accepts any positive
+`nmaterials`, and the deck explicitly advects all three mass fractions
+(`rho*Y_CH`, `rho*Y_Au`, and `rho*Y_He`).  Electron conduction
 is a reference feature (SpitzerHighZ with Larsen limiter 0.06) but is not an explicit
 first-version acceptance requirement; any omission must remain documented until a
 material-aware conduction model is implemented and tested.

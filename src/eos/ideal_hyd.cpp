@@ -138,8 +138,8 @@ void IdealHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
       for (int n=nhyd; n<(nhyd+nscal); ++n) {
         bool is_material_fraction = false;
         if (use_materials) {
-          for (int q=0; q<material_mixture.nmaterials-1; ++q) {
-            if (n == material_mixture.scalar_indices[q]) is_material_fraction = true;
+          for (int q=0; q<material_mixture.nmaterials; ++q) {
+            if (n == material_mixture.scalar_indices(q)) is_material_fraction = true;
           }
         }
         if (is_material_fraction) {
@@ -153,22 +153,26 @@ void IdealHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
         }
         prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
       }
-      // If independently advected fractions overshoot a unit sum, preserve their ratio
-      // and leave zero remainder. The two-material path has only one fraction and never
-      // enters this normalization, retaining its original arithmetic exactly.
-      if (use_materials && material_mixture.nmaterials > 2) {
-        Real assigned_density = 0.0;
-        for (int q=0; q<material_mixture.nmaterials-1; ++q) {
-          assigned_density += cons(
-              m, material_mixture.scalar_indices[q], k, j, i);
+      // All material densities are explicit. Normalize them to the bulk density after
+      // clamping; an all-zero state deterministically becomes the final material.
+      if (use_materials) {
+        Real material_density_sum = 0.0;
+        for (int q=0; q<material_mixture.nmaterials; ++q) {
+          material_density_sum += cons(
+              m, material_mixture.scalar_indices(q), k, j, i);
         }
-        if (assigned_density > u.d) {
-          const Real scale = u.d/assigned_density;
-          for (int q=0; q<material_mixture.nmaterials-1; ++q) {
-            const int n = material_mixture.scalar_indices[q];
+        if (material_density_sum > 0.0) {
+          const Real scale = u.d/material_density_sum;
+          for (int q=0; q<material_mixture.nmaterials; ++q) {
+            const int n = material_mixture.scalar_indices(q);
             cons(m,n,k,j,i) *= scale;
             prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
           }
+        } else {
+          const int n = material_mixture.scalar_indices(
+              material_mixture.nmaterials-1);
+          cons(m,n,k,j,i) = u.d;
+          prim(m,n,k,j,i) = 1.0;
         }
       }
     }
@@ -226,19 +230,14 @@ void IdealHydro::PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &co
 
     // convert scalars (if any)
     for (int n=nhyd; n<(nhyd+nscal); ++n) {
-      if (use_materials && n == material_mixture.scalar_index) {
-        cons(m,n,k,j,i) = u.d*material_mixture.ClampMassFraction(
-            prim(m,n,k,j,i));
-      } else {
-        cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
-      }
+      cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
     }
-    if (use_materials && material_mixture.nmaterials > 2) {
+    if (use_materials) {
       const materials::MaterialComposition composition =
           material_mixture.CompositionFromPrimitive(prim, m, k, j, i);
-      for (int q=0; q<material_mixture.nmaterials-1; ++q) {
-        cons(m,material_mixture.scalar_indices[q],k,j,i) =
-            u.d*composition.y[q];
+      for (int q=0; q<material_mixture.nmaterials; ++q) {
+        cons(m,material_mixture.scalar_indices(q),k,j,i) =
+            u.d*composition[q];
       }
     }
   });

@@ -21,6 +21,7 @@
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
 #include "hydro/hydro.hpp"
+#include "materials/material_mixture.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
@@ -124,6 +125,11 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
 
     auto &w0 = pmbp->phydro->w0;
     auto &nscal = pmbp->phydro->nscalars;
+    const bool use_materials = pmbp->phydro->pmaterials != nullptr;
+    materials::MaterialMixtureDevice material_mixture;
+    if (use_materials) {
+      material_mixture = pmbp->phydro->pmaterials->DeviceData();
+    }
     auto shk_dir_ = shk_dir;
     par_for("pgen_shock1", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m,int k, int j, int i) {
@@ -155,6 +161,18 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yl;
         }
+        if (use_materials) {
+          for (int n=0; n<material_mixture.nmaterials; ++n) {
+            w0(m,material_mixture.scalar_indices(n),k,j,i) = 0.0;
+          }
+          if (material_mixture.nmaterials == 1) {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = 1.0;
+          } else {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = yl;
+            w0(m,material_mixture.scalar_indices(
+                material_mixture.nmaterials-1),k,j,i) = 1.0-yl;
+          }
+        }
       } else {
         w0(m,IDN,k,j,i) = wr.d;
         w0(m,ivx,k,j,i) = wr.vx*u0r;
@@ -163,6 +181,18 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         w0(m,IEN,k,j,i) = wr.e;
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yr;
+        }
+        if (use_materials) {
+          for (int n=0; n<material_mixture.nmaterials; ++n) {
+            w0(m,material_mixture.scalar_indices(n),k,j,i) = 0.0;
+          }
+          if (material_mixture.nmaterials == 1) {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = 1.0;
+          } else {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = yr;
+            w0(m,material_mixture.scalar_indices(
+                material_mixture.nmaterials-1),k,j,i) = 1.0-yr;
+          }
         }
       }
     });
@@ -224,6 +254,11 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     auto &b0 = pmbp->pmhd->b0;
     auto &bcc0 = pmbp->pmhd->bcc0;
     auto &nscal = pmbp->pmhd->nscalars;
+    const bool use_materials = pmbp->pmhd->pmaterials != nullptr;
+    materials::MaterialMixtureDevice material_mixture;
+    if (use_materials) {
+      material_mixture = pmbp->pmhd->pmaterials->DeviceData();
+    }
     auto shk_dir_ = shk_dir;
     par_for("pgen_shock1", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m,int k, int j, int i) {
@@ -261,6 +296,18 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yl;
         }
+        if (use_materials) {
+          for (int n=0; n<material_mixture.nmaterials; ++n) {
+            w0(m,material_mixture.scalar_indices(n),k,j,i) = 0.0;
+          }
+          if (material_mixture.nmaterials == 1) {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = 1.0;
+          } else {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = yl;
+            w0(m,material_mixture.scalar_indices(
+                material_mixture.nmaterials-1),k,j,i) = 1.0-yl;
+          }
+        }
         b0.x1f(m,k,j,i) = bxl;
         b0.x2f(m,k,j,i) = byl;
         b0.x3f(m,k,j,i) = bzl;
@@ -278,6 +325,18 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         w0(m,IEN,k,j,i) = wr.e;
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yr;
+        }
+        if (use_materials) {
+          for (int n=0; n<material_mixture.nmaterials; ++n) {
+            w0(m,material_mixture.scalar_indices(n),k,j,i) = 0.0;
+          }
+          if (material_mixture.nmaterials == 1) {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = 1.0;
+          } else {
+            w0(m,material_mixture.scalar_indices(0),k,j,i) = yr;
+            w0(m,material_mixture.scalar_indices(
+                material_mixture.nmaterials-1),k,j,i) = 1.0-yr;
+          }
         }
         b0.x1f(m,k,j,i) = bxr;
         b0.x2f(m,k,j,i) = byr;

@@ -216,9 +216,15 @@ def test_cached_flux_and_exchange_sources():
     assert transient_location_source.count(
         "MixtureTemperatureFromRhoTemperature(") == 2
     assert "MixtureComponentFromRhoTemperature(" not in transient_location_source
-    # The mixed inverse reuses each material's prepared density location across all
-    # bisection probes and then across the paired ion/electron inversions.
-    assert "struct SpeciesDensityCache" in material_source
+    # Runtime device views remove every fixed material-count array. The inverse retains
+    # only the bulk density and performs direct per-material table queries.
+    assert "kMaxMaterials" not in material_source
+    assert "DvceArray1D<SpeciesProperties> species" in material_source
+    assert "DvceArray1D<unsigned char> material_table_storage" in material_source
+    assert "const IonmixTwoTemperatureTableDevice *material_tables" in (
+        material_source)
+    assert "DvceArray1D<int> scalar_indices" in material_source
+    assert "struct SpeciesDensityCache" not in material_source
     assert "struct MixedDensityCache" in material_source
     prepared_table_source = ionmix_source.split(
         "IonmixComponentState ComponentFromPreparedDensityTemperature(",
@@ -227,30 +233,14 @@ def test_cached_flux_and_exchange_sources():
         prepared_table_source)
     assert "const Real density_fraction" not in prepared_table_source
 
-    species_cached_source = material_source.split(
-        "ComponentAtTemperature SpeciesComponentFromCachedDensity(",
-        1)[1].split(
-            "ComponentAtTemperature MixtureComponentFromCachedDensity(",
-            1)[0]
-    assert species_cached_source.count("PrepareDensityLocation(") == 1
-    assert species_cached_source.count("if (cache.status == 0)") == 1
-    assert species_cached_source.count("if (cache.status == 1)") == 1
-    assert species_cached_source.count("if (cache.status == 3)") == 2
-    assert species_cached_source.count(
-        "table.ComponentFromPreparedDensityTemperature(") == 1
-
     mixture_cached_source = material_source.split(
         "ComponentAtTemperature MixtureComponentFromCachedDensity(",
         1)[1].split(
             "ComponentTemperatureState SpeciesTemperatureFromRhoTemperature(",
             1)[0]
-    # The mixture now loops over its components instead of unrolling two materials, so
-    # one guarded call inside the loop covers every species in ascending index order.
-    assert mixture_cached_source.count(
-        "SpeciesComponentFromCachedDensity(") == 1
-    assert "for (int n = 0; n < mix.count; ++n)" in mixture_cached_source
-    assert "SpeciesTable(n)" in mixture_cached_source
-    assert "cache.material[n]" in mixture_cached_source
+    assert "cache.density = density" in mixture_cached_source
+    assert "MixtureComponentFromRhoTemperature(" in mixture_cached_source
+    assert "cache.material" not in mixture_cached_source
 
     cached_inverse_source = material_source.split(
         "ComponentAtTemperature MixtureComponentFromRhoSpecificEnergyCached(",
@@ -337,13 +327,15 @@ def test_cached_flux_and_exchange_sources():
         "MaterialPressureEnergyState TabularPressureEnergyFromRhoNativeMinimum(",
         1)[1].split("MaterialPressureEnergyState IdealPressureEnergy", 1)[0]
     # One native/non-native branch pair inside the component loop, plus the scalar-y0
-    # forwarding overload; the per-component mask bit selects the native surface.
+    # forwarding overload; ownership is recomputed without a fixed-width bit mask.
     assert native_mixture_source.count(
         "SpeciesPressureEnergyFromRhoMinimumTemperature(") == 1
     assert native_mixture_source.count(
         "SpeciesPressureEnergyFromRhoTemperature(") == 1
     assert "for (int n = 0; n < mix.count; ++n)" in native_mixture_source
-    assert "native_material_mask & (1 << n)" in native_mixture_source
+    assert "SpeciesTable(n).MinimumTemperatureCode() == temperature" in (
+        native_mixture_source)
+    assert "1 << n" not in native_mixture_source
     # The prepared token is forward-only; pure endpoints retain the direct inverse API.
     assert "PreparedDensitySpecificEnergy" not in ionmix_source
     assert "SpecificEnergyFromPreparedDensity" not in ionmix_source

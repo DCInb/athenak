@@ -3,8 +3,11 @@
 //! \brief Unequal-grid mixed IONMIX closure and material-LLF checks.
 
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <string>
+#include <vector>
 
 #include "athena.hpp"
 #include "materials/ionmix_two_temperature_table.hpp"
@@ -12,6 +15,36 @@
 #include "mhd/rsolvers/material_llf_mhd.hpp"
 
 namespace {
+
+materials::MaterialMixtureDevice CloneMixture(
+    const materials::MaterialMixtureDevice &source, const std::string &label) {
+  materials::MaterialMixtureDevice result = source;
+  result.species = DvceArray1D<materials::SpeciesProperties>(
+      label+"-species", source.nmaterials);
+  Kokkos::deep_copy(result.species, source.species);
+  if (source.scalar_indices.extent_int(0) > 0) {
+    result.scalar_indices = DvceArray1D<int>(
+        label+"-scalar-indices", source.scalar_indices.extent_int(0));
+    Kokkos::deep_copy(result.scalar_indices, source.scalar_indices);
+  }
+  return result;
+}
+
+void SetMaterialTables(
+    materials::MaterialMixtureDevice &mixture,
+    const std::vector<materials::IonmixTwoTemperatureTableDevice> &tables,
+    const std::string &label) {
+  const std::size_t bytes =
+      tables.size()*sizeof(materials::IonmixTwoTemperatureTableDevice);
+  HostArray1D<unsigned char> host_storage(label+"-host", bytes);
+  std::memcpy(host_storage.data(), tables.data(), bytes);
+  mixture.material_table_storage =
+      DvceArray1D<unsigned char>(label+"-device", bytes);
+  Kokkos::deep_copy(mixture.material_table_storage, host_storage);
+  mixture.material_tables =
+      reinterpret_cast<const materials::IonmixTwoTemperatureTableDevice *>(
+          mixture.material_table_storage.data());
+}
 
 KOKKOS_INLINE_FUNCTION
 bool NearlyEqual(const Real actual, const Real expected,
@@ -102,9 +135,9 @@ UncachedComponentAtTemperature UncachedMixtureComponentFromRhoTemperature(
   const Real y0 = mixture.ClampMassFraction(y0_in);
   const Real y1 = 1.0-y0;
   const auto state0 = UncachedSpeciesComponent(
-      mixture.material0_table, component, density*y0, temperature);
+      mixture.SpeciesTable(0), component, density*y0, temperature);
   const auto state1 = UncachedSpeciesComponent(
-      mixture.material1_table, component, density*y1, temperature);
+      mixture.SpeciesTable(1), component, density*y1, temperature);
   UncachedComponentAtTemperature result;
   result.temperature = (y0 > 0.0) ? state0.temperature : state1.temperature;
   result.pressure = state0.pressure+state1.pressure;
@@ -136,23 +169,23 @@ UncachedComponentAtTemperature UncachedMixtureComponentFromRhoSpecificEnergy(
   const Real y0 = mixture.ClampMassFraction(y0_in);
   if (y0 >= 1.0) {
     return CopyTableComponent(
-        mixture.material0_table.ComponentFromRhoSpecificEnergy(
+        mixture.SpeciesTable(0).ComponentFromRhoSpecificEnergy(
             component, density, target_energy));
   }
   if (y0 <= 0.0) {
     return CopyTableComponent(
-        mixture.material1_table.ComponentFromRhoSpecificEnergy(
+        mixture.SpeciesTable(1).ComponentFromRhoSpecificEnergy(
             component, density, target_energy));
   }
 
-  const bool error_bounds = mixture.material0_table.bounds_error != 0 ||
-                            mixture.material1_table.bounds_error != 0;
+  const bool error_bounds = mixture.SpeciesTable(0).bounds_error != 0 ||
+                            mixture.SpeciesTable(1).bounds_error != 0;
   const Real minimum_temperature = fmax(
-      mixture.material0_table.MinimumTemperatureCode(),
-      mixture.material1_table.MinimumTemperatureCode());
+      mixture.SpeciesTable(0).MinimumTemperatureCode(),
+      mixture.SpeciesTable(1).MinimumTemperatureCode());
   const Real maximum_temperature = fmin(
-      mixture.material0_table.MaximumTemperatureCode(),
-      mixture.material1_table.MaximumTemperatureCode());
+      mixture.SpeciesTable(0).MaximumTemperatureCode(),
+      mixture.SpeciesTable(1).MaximumTemperatureCode());
   auto minimum = UncachedMixtureComponentFromRhoTemperature(
       mixture, component, density, minimum_temperature, y0);
   auto maximum = UncachedMixtureComponentFromRhoTemperature(
@@ -502,48 +535,77 @@ int main(int argc, char **argv) {
     materials::IonmixTwoTemperatureTable nonlinear_he(argv[2], options);
 
     materials::MaterialMixtureDevice mixture;
-    mixture.material0.abar = 6.5;
-    mixture.material0.zbar = 2.0;
-    mixture.material0.zeff = 6.0;
-    mixture.material1.abar = 4.0;
-    mixture.material1.zbar = 4.0;
-    mixture.material1.zeff = 8.0;
-    mixture.material0_table = ch.DeviceData();
-    mixture.material1_table = he.DeviceData();
+    mixture.nmaterials = 2;
+    mixture.species = DvceArray1D<materials::SpeciesProperties>(
+        "base-mixture-species", 2);
+    mixture.Species(0).abar = 6.5;
+    mixture.Species(0).zbar = 2.0;
+    mixture.Species(0).zeff = 6.0;
+    mixture.Species(1).abar = 4.0;
+    mixture.Species(1).zbar = 4.0;
+    mixture.Species(1).zeff = 8.0;
+    const auto ch_table = ch.DeviceData();
+    const auto he_table = he.DeviceData();
+    SetMaterialTables(mixture, {ch_table, he_table}, "base-mixture-tables");
     mixture.use_tabular_eos = true;
     mixture.density_to_cgs = 1.0;
     mixture.temperature_to_kelvin = 1.0;
     mixture.wave_speed_safety = 1.05;
-    materials::MaterialMixtureDevice three_mixture = mixture;
-    three_mixture.nmaterials = 3;
-    three_mixture.extra_material[0].abar = 12.0;
-    three_mixture.extra_material[0].zbar = 1.5;
-    three_mixture.extra_material[0].zeff = 3.0;
-    three_mixture.extra_material_table[0] = ch.DeviceData();
-    materials::MaterialMixtureDevice nonlinear_mixture = mixture;
-    nonlinear_mixture.material0_table = nonlinear_ch.DeviceData();
-    nonlinear_mixture.material1_table = nonlinear_he.DeviceData();
-    materials::MaterialMixtureDevice clamped_mixture = mixture;
-    clamped_mixture.material0_table.bounds_error = 0;
-    clamped_mixture.material1_table.bounds_error = 0;
-    materials::MaterialMixtureDevice ideal_mixture;
-    ideal_mixture.material0 = mixture.material0;
-    ideal_mixture.material1 = mixture.material1;
+    materials::MaterialMixtureDevice single_mixture = mixture;
+    single_mixture.nmaterials = 1;
+    single_mixture.species = DvceArray1D<materials::SpeciesProperties>(
+        "single-mixture-species", 1);
+    single_mixture.Species(0) = mixture.Species(0);
+    SetMaterialTables(single_mixture, {ch_table}, "single-mixture-tables");
+    materials::MaterialMixtureDevice many_mixture = mixture;
+    many_mixture.nmaterials = 4;
+    many_mixture.species = DvceArray1D<materials::SpeciesProperties>(
+        "many-mixture-species", 4);
+    many_mixture.Species(0) = mixture.Species(0);
+    many_mixture.Species(1) = mixture.Species(1);
+    many_mixture.Species(2).abar = 12.0;
+    many_mixture.Species(2).zbar = 1.5;
+    many_mixture.Species(2).zeff = 3.0;
+    many_mixture.Species(3).abar = 20.0;
+    many_mixture.Species(3).zbar = 5.0;
+    many_mixture.Species(3).zeff = 7.0;
+    SetMaterialTables(
+        many_mixture, {ch_table, he_table, ch_table, he_table},
+        "many-mixture-tables");
+    materials::MaterialMixtureDevice nonlinear_mixture =
+        CloneMixture(mixture, "nonlinear-mixture");
+    SetMaterialTables(
+        nonlinear_mixture,
+        {nonlinear_ch.DeviceData(), nonlinear_he.DeviceData()},
+        "nonlinear-mixture-tables");
+    materials::MaterialMixtureDevice clamped_mixture =
+        CloneMixture(mixture, "clamped-mixture");
+    auto clamped_ch_table = ch_table;
+    auto clamped_he_table = he_table;
+    clamped_ch_table.bounds_error = 0;
+    clamped_he_table.bounds_error = 0;
+    SetMaterialTables(
+        clamped_mixture, {clamped_ch_table, clamped_he_table},
+        "clamped-mixture-tables");
+    materials::MaterialMixtureDevice ideal_mixture =
+        CloneMixture(mixture, "ideal-mixture");
     ideal_mixture.use_tabular_eos = false;
     ideal_mixture.gamma_minus_one = 2.0/3.0;
-    materials::MaterialMixtureDevice ideal_three_mixture = ideal_mixture;
-    ideal_three_mixture.nmaterials = 3;
-    ideal_three_mixture.extra_material[0] = three_mixture.extra_material[0];
+    materials::MaterialMixtureDevice ideal_many_mixture =
+        CloneMixture(many_mixture, "ideal-many-mixture");
+    ideal_many_mixture.use_tabular_eos = false;
+    ideal_many_mixture.gamma_minus_one = 2.0/3.0;
 
     // Clone the paired value/log-value views, then make both component-energy surfaces
     // vary with density. The primary fixtures intentionally use density-independent
     // energies, which cannot expose a wrong prepared-density interpolation token in
     // Exchange.
-    materials::MaterialMixtureDevice density_dependent_mixture = mixture;
-    const int ch_density_count = mixture.material0_table.ndensity;
-    const int ch_temperature_count = mixture.material0_table.ntemperature;
-    const int he_density_count = mixture.material1_table.ndensity;
-    const int he_temperature_count = mixture.material1_table.ntemperature;
+    materials::MaterialMixtureDevice density_dependent_mixture =
+        CloneMixture(mixture, "density-dependent-mixture");
+    const int ch_density_count = mixture.SpeciesTable(0).ndensity;
+    const int ch_temperature_count = mixture.SpeciesTable(0).ntemperature;
+    const int he_density_count = mixture.SpeciesTable(1).ndensity;
+    const int he_temperature_count = mixture.SpeciesTable(1).ntemperature;
     DvceArray3D<Real> density_dependent_ch_values(
         "density-dependent-ch-values",
         materials::IonmixTwoTemperatureTableDevice::nfields,
@@ -561,9 +623,9 @@ int main(int argc, char **argv) {
         materials::IonmixTwoTemperatureTableDevice::nfields,
         he_density_count, he_temperature_count);
     Kokkos::deep_copy(
-        density_dependent_ch_values, mixture.material0_table.values);
+        density_dependent_ch_values, mixture.SpeciesTable(0).values);
     Kokkos::deep_copy(
-        density_dependent_he_values, mixture.material1_table.values);
+        density_dependent_he_values, mixture.SpeciesTable(1).values);
     const int ch_value_count =
         materials::IonmixTwoTemperatureTableDevice::nfields*
         ch_density_count*ch_temperature_count;
@@ -614,14 +676,16 @@ int main(int argc, char **argv) {
               (value > 0.0) ? log(value) : 0.0;
         });
     Kokkos::fence();
-    density_dependent_mixture.material0_table.values =
-        density_dependent_ch_values;
-    density_dependent_mixture.material1_table.values =
-        density_dependent_he_values;
-    density_dependent_mixture.material0_table.log_values =
-        density_dependent_ch_log_values;
-    density_dependent_mixture.material1_table.log_values =
-        density_dependent_he_log_values;
+    auto density_dependent_ch_table = ch_table;
+    auto density_dependent_he_table = he_table;
+    density_dependent_ch_table.values = density_dependent_ch_values;
+    density_dependent_he_table.values = density_dependent_he_values;
+    density_dependent_ch_table.log_values = density_dependent_ch_log_values;
+    density_dependent_he_table.log_values = density_dependent_he_log_values;
+    SetMaterialTables(
+        density_dependent_mixture,
+        {density_dependent_ch_table, density_dependent_he_table},
+        "density-dependent-mixture-tables");
 
     int failures = 0;
     Kokkos::parallel_reduce(
@@ -649,80 +713,115 @@ int main(int argc, char **argv) {
             ++local_failures;
           }
 
-          // Exercise the actual three-component path rather than only checking that the
-          // generalized source loops exist. The third component deliberately reuses a
-          // table with distinct species weights so both table and ideal mixing are tested.
-          Real three_fractions[2] = {0.2, 0.3};
-          const materials::MaterialComposition mix3 =
-              three_mixture.CompositionFromFractions(three_fractions);
-          materials::MaterialComposition pure[3];
-          for (int n = 0; n < 3; ++n) {
-            pure[n].count = 3;
-            for (int q = 0; q < 3; ++q) pure[n].y[q] = 0.0;
-            pure[n].y[n] = 1.0;
+          // A single material is a valid explicit composition. Any positive fraction
+          // and the deterministic all-zero fallback both normalize to that material.
+          Real single_fraction[1] = {0.25};
+          Real single_zero_fraction[1] = {0.0};
+          const auto mix1 =
+              single_mixture.CompositionFromFractions(single_fraction);
+          const auto zero1 =
+              single_mixture.CompositionFromFractions(single_zero_fraction);
+          const auto state1 = single_mixture.StateFromRhoTemperatures(
+              density, 100.0, 100.0, mix1);
+          const auto inverse1 = single_mixture.StateFromRhoSpecificEnergies(
+              density, state1.ion_specific_internal_energy,
+              state1.electron_specific_internal_energy, mix1);
+          const auto pure_ch = mixture.StateFromRhoTemperatures(
+              density, 100.0, 100.0, 1.0);
+          if (mix1.count != 1 || mix1[0] != 1.0 || zero1[0] != 1.0 ||
+              !NearlyEqual(state1.ion_specific_internal_energy,
+                           pure_ch.ion_specific_internal_energy) ||
+              !NearlyEqual(state1.electron_specific_internal_energy,
+                           pure_ch.electron_specific_internal_energy) ||
+              !NearlyEqual(state1.ion_pressure, pure_ch.ion_pressure) ||
+              !NearlyEqual(state1.electron_pressure,
+                           pure_ch.electron_pressure) ||
+              !NearlyEqual(inverse1.ion_temperature, 100.0) ||
+              !NearlyEqual(inverse1.electron_temperature, 100.0)) {
+            ++local_failures;
           }
-          materials::MaterialThermodynamicState component[3];
-          for (int n = 0; n < 3; ++n) {
-            component[n] = three_mixture.StateFromRhoTemperaturesNoSound(
-                density*mix3.y[n], 100.0, 100.0, pure[n]);
+
+          // Four components exercise a runtime count above the former compile-time cap.
+          // The tail components reuse the two tables with distinct species weights so
+          // both table and ideal mixing are covered.
+          Real many_fractions[4] = {0.1, 0.2, 0.3, 0.4};
+          const materials::MaterialComposition mix4 =
+              many_mixture.CompositionFromFractions(many_fractions);
+          Real pure_fractions[4][4] = {};
+          materials::MaterialComposition pure[4];
+          for (int n = 0; n < 4; ++n) {
+            pure_fractions[n][n] = 1.0;
+            pure[n] = many_mixture.CompositionFromFractions(pure_fractions[n]);
           }
-          const auto mixed3 = three_mixture.StateFromRhoTemperatures(
-              density, 100.0, 100.0, mix3);
+          materials::MaterialThermodynamicState component[4];
+          for (int n = 0; n < 4; ++n) {
+            component[n] = many_mixture.StateFromRhoTemperaturesNoSound(
+                density*mix4[n], 100.0, 100.0, pure[n]);
+          }
+          const auto mixed4 = many_mixture.StateFromRhoTemperatures(
+              density, 100.0, 100.0, mix4);
           Real expected_ion_energy = 0.0;
           Real expected_electron_energy = 0.0;
           Real expected_ion_pressure = 0.0;
           Real expected_electron_pressure = 0.0;
           Real expected_electron_density = 0.0;
           int expected_flags = materials::ionmix_query_in_bounds;
-          for (int n = 0; n < 3; ++n) {
+          for (int n = 0; n < 4; ++n) {
             expected_ion_energy +=
-                mix3.y[n]*component[n].ion_specific_internal_energy;
+                mix4[n]*component[n].ion_specific_internal_energy;
             expected_electron_energy +=
-                mix3.y[n]*component[n].electron_specific_internal_energy;
+                mix4[n]*component[n].electron_specific_internal_energy;
             expected_ion_pressure += component[n].ion_pressure;
             expected_electron_pressure += component[n].electron_pressure;
             expected_electron_density += component[n].electron_number_density_cgs;
             expected_flags |= component[n].query_flags;
           }
-          const auto inverse3 = three_mixture.StateFromRhoSpecificEnergies(
-              density, mixed3.ion_specific_internal_energy,
-              mixed3.electron_specific_internal_energy, mix3);
-          const auto electron3 = three_mixture.ElectronStateFromRhoSpecificEnergy(
-              density, mixed3.electron_specific_internal_energy, mix3);
-          const auto ideal3 = ideal_three_mixture.StateFromRhoTemperaturesNoSound(
-              density, 2.5, 1.5, mix3);
-          Real overshoot_fractions[2] = {0.8, 0.7};
+          const auto inverse4 = many_mixture.StateFromRhoSpecificEnergies(
+              density, mixed4.ion_specific_internal_energy,
+              mixed4.electron_specific_internal_energy, mix4);
+          const auto electron4 = many_mixture.ElectronStateFromRhoSpecificEnergy(
+              density, mixed4.electron_specific_internal_energy, mix4);
+          const auto ideal4 = ideal_many_mixture.StateFromRhoTemperaturesNoSound(
+              density, 2.5, 1.5, mix4);
+          Real overshoot_fractions[4] = {0.8, 0.7, 0.3, 0.2};
           const auto overshoot =
-              three_mixture.CompositionFromFractions(overshoot_fractions);
-          if (!NearlyEqual(mix3.y[0], 0.2) ||
-              !NearlyEqual(mix3.y[1], 0.3) ||
-              !NearlyEqual(mix3.y[2], 0.5) ||
-              !NearlyEqual(mixed3.ion_specific_internal_energy,
+              many_mixture.CompositionFromFractions(overshoot_fractions);
+          Real zero_fractions[4] = {};
+          const auto all_zero =
+              many_mixture.CompositionFromFractions(zero_fractions);
+          if (!NearlyEqual(mix4[0], 0.1) ||
+              !NearlyEqual(mix4[1], 0.2) ||
+              !NearlyEqual(mix4[2], 0.3) ||
+              !NearlyEqual(mix4[3], 0.4) ||
+              !NearlyEqual(mixed4.ion_specific_internal_energy,
                            expected_ion_energy) ||
-              !NearlyEqual(mixed3.electron_specific_internal_energy,
+              !NearlyEqual(mixed4.electron_specific_internal_energy,
                            expected_electron_energy) ||
-              !NearlyEqual(mixed3.ion_pressure, expected_ion_pressure) ||
-              !NearlyEqual(mixed3.electron_pressure,
+              !NearlyEqual(mixed4.ion_pressure, expected_ion_pressure) ||
+              !NearlyEqual(mixed4.electron_pressure,
                            expected_electron_pressure) ||
-              !NearlyEqual(mixed3.electron_number_density_cgs,
+              !NearlyEqual(mixed4.electron_number_density_cgs,
                            expected_electron_density) ||
-              mixed3.query_flags != expected_flags ||
-              !(mixed3.sound_speed_squared > 0.0) ||
-              !NearlyEqual(inverse3.ion_temperature, 100.0) ||
-              !NearlyEqual(inverse3.electron_temperature, 100.0) ||
-              !NearlyEqual(electron3.electron_temperature, 100.0) ||
-              !NearlyEqual(electron3.electron_pressure,
-                           mixed3.electron_pressure) ||
-              !NearlyEqual(electron3.electron_number_density_cgs,
-                           mixed3.electron_number_density_cgs) ||
-              !NearlyEqual(ideal_three_mixture.ElectronTemperature(
+              mixed4.query_flags != expected_flags ||
+              !(mixed4.sound_speed_squared > 0.0) ||
+              !NearlyEqual(inverse4.ion_temperature, 100.0) ||
+              !NearlyEqual(inverse4.electron_temperature, 100.0) ||
+              !NearlyEqual(electron4.electron_temperature, 100.0) ||
+              !NearlyEqual(electron4.electron_pressure,
+                           mixed4.electron_pressure) ||
+              !NearlyEqual(electron4.electron_number_density_cgs,
+                           mixed4.electron_number_density_cgs) ||
+              !NearlyEqual(ideal_many_mixture.ElectronTemperature(
                                density,
-                               ideal3.electron_specific_internal_energy,
-                               mix3),
+                               ideal4.electron_specific_internal_energy,
+                               mix4),
                            1.5) ||
-              !NearlyEqual(overshoot.y[0], 0.8/1.5) ||
-              !NearlyEqual(overshoot.y[1], 0.7/1.5) ||
-              overshoot.y[2] != 0.0) {
+              !NearlyEqual(overshoot[0], 0.4) ||
+              !NearlyEqual(overshoot[1], 0.35) ||
+              !NearlyEqual(overshoot[2], 0.15) ||
+              !NearlyEqual(overshoot[3], 0.1) ||
+              all_zero[0] != 0.0 || all_zero[1] != 0.0 ||
+              all_zero[2] != 0.0 || all_zero[3] != 1.0) {
             ++local_failures;
           }
 
@@ -1137,28 +1236,28 @@ int main(int argc, char **argv) {
           const Real sensitive_density1 =
               sensitive_density*(1.0-sensitive_fraction);
           const auto wrong_location0 =
-              density_dependent_mixture.material0_table.
+              density_dependent_mixture.SpeciesTable(0).
                   PrepareDensityLocation(2.0*sensitive_density0);
           const auto wrong_location1 =
-              density_dependent_mixture.material1_table.
+              density_dependent_mixture.SpeciesTable(1).
                   PrepareDensityLocation(2.0*sensitive_density1);
           const auto wrong_ion0 =
-              density_dependent_mixture.material0_table.
+              density_dependent_mixture.SpeciesTable(0).
                   ComponentFromPreparedDensityTemperature(
                       materials::IonmixComponent::ion, wrong_location0,
                       sensitive_old.ion_temperature);
           const auto wrong_electron0 =
-              density_dependent_mixture.material0_table.
+              density_dependent_mixture.SpeciesTable(0).
                   ComponentFromPreparedDensityTemperature(
                       materials::IonmixComponent::electron, wrong_location0,
                       sensitive_old.electron_temperature);
           const auto wrong_ion1 =
-              density_dependent_mixture.material1_table.
+              density_dependent_mixture.SpeciesTable(1).
                   ComponentFromPreparedDensityTemperature(
                       materials::IonmixComponent::ion, wrong_location1,
                       sensitive_old.ion_temperature);
           const auto wrong_electron1 =
-              density_dependent_mixture.material1_table.
+              density_dependent_mixture.SpeciesTable(1).
                   ComponentFromPreparedDensityTemperature(
                       materials::IonmixComponent::electron, wrong_location1,
                       sensitive_old.electron_temperature);
@@ -1262,7 +1361,7 @@ int main(int argc, char **argv) {
                   active_only_old.electron_temperature,
                   active_only_target, active_only_fraction);
           if (!(active_only_old.ion_temperature >
-                    mixture.material0_table.MaximumTemperatureCode()) ||
+                    mixture.SpeciesTable(0).MaximumTemperatureCode()) ||
               active_only_old.query_flags != materials::ionmix_query_in_bounds ||
               !ExactMaterialExchangeMatch(
                   active_only_exchange, uncached_active_only_exchange) ||

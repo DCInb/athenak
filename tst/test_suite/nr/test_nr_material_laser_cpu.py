@@ -16,7 +16,7 @@ source_dt = 1.0e-6
 
 def write_material_input():
     text = base_input.read_text(encoding="ascii")
-    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 1\n", 1)
+    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 2\n", 1)
     text = text.replace(
         "temperature_scale_cgs = 1.0\n",
         "temperature_scale_cgs = 1.0\n"

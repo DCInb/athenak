@@ -217,23 +217,19 @@ class OpacityTable {
 //! kappa_mix = sum_s Y_s kappa_s(rho Y_s, Te), which recovers every pure-material limit.
 
 struct MixedOpacityTableLocation {
-  OpacityTableLocation material[materials::kMaxMaterials];
-  Real mass_fraction[materials::kMaxMaterials] = {};
-  int count = 2;
+  Real density = 0.0;
+  Real temperature = 0.0;
+  materials::MaterialComposition composition;
 };
 
 struct MixedOpacityTableDevice {
-  // The first two remain named for the two-material call sites; index 2 onward follow.
-  OpacityTableDevice material0;
-  OpacityTableDevice material1;
-  OpacityTableDevice extra_material[materials::kMaxMaterials-2];
-  int nmaterials = 2;
+  DvceArray1D<unsigned char> material_table_storage;
+  const OpacityTableDevice *material_tables = nullptr;
+  int nmaterials = 1;
 
   KOKKOS_INLINE_FUNCTION
   const OpacityTableDevice &Material(const int index) const {
-    if (index == 0) return material0;
-    if (index == 1) return material1;
-    return extra_material[index-2];
+    return material_tables[index];
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -241,13 +237,9 @@ struct MixedOpacityTableDevice {
       Real density, Real temperature,
       const materials::MaterialComposition &mix) const {
     MixedOpacityTableLocation location;
-    location.count = mix.count;
-    for (int n = 0; n < mix.count; ++n) {
-      location.mass_fraction[n] = mix.y[n];
-      if (mix.y[n] > 0.0) {
-        location.material[n] = Material(n).Locate(density*mix.y[n], temperature);
-      }
-    }
+    location.density = density;
+    location.temperature = temperature;
+    location.composition = mix;
     return location;
   }
 
@@ -255,26 +247,25 @@ struct MixedOpacityTableDevice {
   MixedOpacityTableLocation Locate(
       Real density, Real temperature, Real y0_in) const {
     MixedOpacityTableLocation location;
-    location.count = 2;
-    const Real y0 = fmin(fmax(y0_in, 0.0), 1.0);
-    location.mass_fraction[0] = y0;
-    location.mass_fraction[1] = 1.0-y0;
-    if (y0 > 0.0) {
-      location.material[0] = material0.Locate(density*y0, temperature);
-    }
-    if (y0 < 1.0) {
-      location.material[1] = material1.Locate(density*(1.0-y0), temperature);
-    }
+    location.density = density;
+    location.temperature = temperature;
+    materials::MaterialComposition mix;
+    mix.count = 2;
+    mix.source = materials::MaterialComposition::legacy_two_material;
+    mix.legacy_y0 = fmin(fmax(y0_in, 0.0), 1.0);
+    mix.inverse_sum = 1.0;
+    location.composition = mix;
     return location;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real Get(int kind, int group, const MixedOpacityTableLocation &location) const {
     Real result = 0.0;
-    for (int n = 0; n < location.count; ++n) {
-      if (location.mass_fraction[n] > 0.0) {
-        result += location.mass_fraction[n]*
-                  Material(n).Get(kind, group, location.material[n]);
+    for (int n = 0; n < location.composition.count; ++n) {
+      const Real fraction = location.composition[n];
+      if (fraction > 0.0) {
+        result += fraction*Material(n).Get(
+            kind, group, location.density*fraction, location.temperature);
       }
     }
     return result;
@@ -304,6 +295,8 @@ class MixedOpacityTable {
  private:
   int nmaterials_ = 2;
   std::vector<std::unique_ptr<OpacityTable>> tables_;
+  DvceArray1D<unsigned char> device_table_storage_;
+  const OpacityTableDevice *device_tables_ = nullptr;
 };
 
 } // namespace two_temperature

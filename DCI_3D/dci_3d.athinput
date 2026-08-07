@@ -80,7 +80,7 @@ gamma = 1.6666666666666667
 dfloor = 1.0e-8
 pfloor = 1.0e-14
 tfloor = 1.0e-12
-nscalars = 2
+nscalars = 3
 two_temperature = true
 dual_energy = true
 dual_energy_eta1 = 1.0e-3
@@ -102,9 +102,8 @@ biermann_subcycle_cfl = 0.15
 biermann_subcycle_max_steps = 100000
 biermann_reduced_closure = true
 
-# Three components: the CH shell, the archived Au cone, and the He ambient.  The closure
-# advects nmaterials-1 = 2 mass fractions (rho*Y_CH and rho*Y_Au) starting at
-# scalar_index; helium is the remainder Y_He = 1-Y_CH-Y_Au.
+# Three components: the CH shell, the archived Au cone, and the He ambient. The closure
+# explicitly advects all three mass fractions starting at scalar_index.
 <materials>
 nmaterials = 3
 scalar_index = 0

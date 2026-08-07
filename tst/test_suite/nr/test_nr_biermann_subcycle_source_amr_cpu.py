@@ -30,7 +30,7 @@ ALL_BASENAMES = ACTIVE_BASENAMES + NULL_BASENAMES
 def write_input():
     """Add mixed CH/He exchange to the smooth Biermann test problem."""
     text = BASE_INPUT.read_text(encoding="ascii")
-    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 1\n", 1)
+    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 2\n", 1)
     text = text.replace(
         "initial_electron_temperature_ratio = 1.0\n",
         "initial_electron_temperature_ratio = 0.25\n"

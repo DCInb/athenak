@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "athena.hpp"
 #include "materials/ionmix_two_temperature_table.hpp"
@@ -27,21 +28,112 @@ struct SpeciesProperties {
   Real t_ei = -1.0; //!< Ion-electron exchange time; negative disables exchange.
 };
 
-//! Largest supported component count.  Raising this costs device registers in every
-//! mixed-cell kernel, so it is deliberately the smallest value the decks require.
-constexpr int kMaxMaterials = 3;
-
 //----------------------------------------------------------------------------------------
 //! \struct MaterialComposition
 //! \brief Mass fractions of the active components, normalized to sum to one.
 //!
-//! The closure carries composition as this small fixed-capacity vector so that mixing
-//! rules are written once for any component count.  `count == 2` reproduces the original
-//! two-material scalar interface exactly, including floating-point association order.
+//! A composition is a lazy accessor over either an explicitly supplied fraction array or
+//! the passive-scalar fields of one or two cells.  It therefore has a fixed device-side
+//! footprint while the number of materials remains a runtime value.  Negative and
+//! over-unity inputs are clamped, then all explicit fractions are normalized.  If every
+//! input is zero, the final material is selected as the deterministic fallback.
 
 struct MaterialComposition {
-  Real y[kMaxMaterials] = {1.0, 0.0, 0.0};
+  enum Source : int {
+    fallback = 0,
+    direct_fractions = 1,
+    legacy_two_material = 2,
+    primitive_cell = 3,
+    conserved_cell = 4,
+    primitive_pair = 5,
+    conserved_restriction = 6
+  };
+
+  DvceArray5D<Real> state;
+  DvceArray1D<int> scalar_indices;
+  const Real *direct = nullptr;
+  Real inverse_sum = 0.0;
+  Real direct_scale = 1.0;
+  Real legacy_y0 = 1.0;
+  Real density = 0.0;
+  Real weight0 = 0.5;
+  Real weight1 = 0.5;
+  Real source0_inverse_sum = 0.0;
+  Real source1_inverse_sum = 0.0;
   int count = 1;
+  int source = fallback;
+  int m0 = 0;
+  int k0 = 0;
+  int j0 = 0;
+  int i0 = 0;
+  int m1 = 0;
+  int k1 = 0;
+  int j1 = 0;
+  int i1 = 0;
+  int restriction_nk = 1;
+  Real restriction_weight = 1.0;
+
+  KOKKOS_INLINE_FUNCTION
+  static Real Clamp(const Real value) {
+    return fmin(fmax(value, 0.0), 1.0);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real PrimitiveFraction(const int material, const int m, const int k,
+                         const int j, const int i,
+                         const Real source_inverse_sum) const {
+    if (!(source_inverse_sum > 0.0)) {
+      return (material == count-1) ? 1.0 : 0.0;
+    }
+    return Clamp(state(m, scalar_indices(material), k, j, i))*
+           source_inverse_sum;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real RawFraction(const int material) const {
+    if (source == direct_fractions) {
+      return Clamp(direct[material]*direct_scale);
+    }
+    if (source == legacy_two_material) {
+      return (material == 0) ? legacy_y0 : 1.0-legacy_y0;
+    }
+    if (source == primitive_cell) {
+      return Clamp(state(m0, scalar_indices(material), k0, j0, i0));
+    }
+    if (source == conserved_cell) {
+      return (density > 0.0)
+          ? Clamp(state(m0, scalar_indices(material), k0, j0, i0)/density)
+          : 0.0;
+    }
+    if (source == primitive_pair) {
+      return Clamp(
+          weight0*PrimitiveFraction(
+              material, m0, k0, j0, i0, source0_inverse_sum)+
+          weight1*PrimitiveFraction(
+              material, m1, k1, j1, i1, source1_inverse_sum));
+    }
+    if (source == conserved_restriction) {
+      if (!(density > 0.0)) return 0.0;
+      Real partial_density = 0.0;
+      for (int dk = 0; dk < restriction_nk; ++dk) {
+        for (int dj = 0; dj < 2; ++dj) {
+          for (int di = 0; di < 2; ++di) {
+            partial_density += restriction_weight*state(
+                m0, scalar_indices(material), k0+dk, j0+dj, i0+di);
+          }
+        }
+      }
+      return Clamp(partial_density/density);
+    }
+    return 0.0;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real operator[](const int material) const {
+    if (material < 0 || material >= count) return 0.0;
+    if (!(inverse_sum > 0.0)) return (material == count-1) ? 1.0 : 0.0;
+    return RawFraction(material)*inverse_sum;
+  }
 };
 
 struct MaterialThermodynamicState {
@@ -109,7 +201,7 @@ struct MaterialTransientExchangeState {
 
 //----------------------------------------------------------------------------------------
 //! \struct MaterialMixtureDevice
-//! \brief Device-copyable closure represented by nmaterials-1 advected mass fractions.
+//! \brief Device-copyable closure represented by nmaterials advected mass fractions.
 //!
 //! In tabular mode a mixed cell has one bulk velocity, one shared ion temperature, and
 //! one shared electron temperature.  The selected, explicit mixing rule is
@@ -124,18 +216,15 @@ struct MaterialTransientExchangeState {
 //! finite pressure for an absent material.
 
 struct MaterialMixtureDevice {
-  // material0/material1 remain named members so the two-material call sites and their
-  // exact arithmetic are untouched; index 2 onward live in the array below.
-  SpeciesProperties material0;
-  SpeciesProperties material1;
-  IonmixTwoTemperatureTableDevice material0_table;
-  IonmixTwoTemperatureTableDevice material1_table;
-  SpeciesProperties extra_material[kMaxMaterials-2];
-  IonmixTwoTemperatureTableDevice extra_material_table[kMaxMaterials-2];
-  //! Number of active components. Two selects the original scalar-composition paths.
-  int nmaterials = 2;
-  //! Absolute indices of the nmaterials-1 advected mass-fraction scalars.
-  int scalar_indices[kMaxMaterials-1] = {-1, -1};
+  DvceArray1D<SpeciesProperties> species;
+  // Table-device structs themselves contain Kokkos views. Store their bytewise device
+  // representation rather than nesting them in another typed view, which would invoke
+  // host reference-count operations while copying the outer collection.
+  DvceArray1D<unsigned char> material_table_storage;
+  const IonmixTwoTemperatureTableDevice *material_tables = nullptr;
+  DvceArray1D<int> scalar_indices;
+  //! Number of active components. Every component owns one passive scalar.
+  int nmaterials = 1;
   int scalar_index = -1;  //!< Absolute primitive/conserved variable index.
   bool use_tabular_eos = false;
   Real gamma_minus_one = 2.0/3.0;
@@ -148,38 +237,46 @@ struct MaterialMixtureDevice {
   //! Uniform indexed access to the named first two components and the array tail.
   KOKKOS_INLINE_FUNCTION
   const SpeciesProperties &Species(const int index) const {
-    if (index == 0) return material0;
-    if (index == 1) return material1;
-    return extra_material[index-2];
+    return species(index);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  SpeciesProperties &Species(const int index) {
+    return species(index);
   }
 
   KOKKOS_INLINE_FUNCTION
   const IonmixTwoTemperatureTableDevice &SpeciesTable(const int index) const {
-    if (index == 0) return material0_table;
-    if (index == 1) return material1_table;
-    return extra_material_table[index-2];
+    return material_tables[index];
   }
 
-  //! Composition from the nmaterials-1 advected fractions; the final component is the
-  //! remainder.  Clamping each fraction and renormalizing keeps every mixing rule a
-  //! convex combination even where advection overshoots slightly.
+  //! Composition from all explicitly advected fractions.  The caller-owned array must
+  //! remain live while the returned accessor is used.
   KOKKOS_INLINE_FUNCTION
   MaterialComposition CompositionFromFractions(const Real *fractions) const {
     MaterialComposition result;
     result.count = nmaterials;
-    Real assigned = 0.0;
-    for (int n = 0; n < nmaterials-1; ++n) {
-      const Real value = fmin(fmax(fractions[n], 0.0), 1.0);
-      result.y[n] = value;
-      assigned += value;
-    }
-    result.y[nmaterials-1] = 1.0-assigned;
-    if (!(result.y[nmaterials-1] >= 0.0)) {
-      // Overshoot: renormalize the supplied fractions and leave no remainder.
-      result.y[nmaterials-1] = 0.0;
-      const Real inverse = (assigned > 0.0) ? 1.0/assigned : 0.0;
-      for (int n = 0; n < nmaterials-1; ++n) result.y[n] *= inverse;
-    }
+    result.source = MaterialComposition::direct_fractions;
+    result.direct = fractions;
+    Real sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) sum += result.RawFraction(n);
+    result.inverse_sum = (sum > 0.0) ? 1.0/sum : 0.0;
+    return result;
+  }
+
+  //! Composition from partial material densities, used by small local AMR stencils.
+  //! The density array follows the same lifetime rule as CompositionFromFractions.
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromPartialDensities(
+      const Real *partial_densities, const Real density) const {
+    MaterialComposition result;
+    result.count = nmaterials;
+    result.source = MaterialComposition::direct_fractions;
+    result.direct = partial_densities;
+    result.direct_scale = (density > 0.0) ? 1.0/density : 0.0;
+    Real sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) sum += result.RawFraction(n);
+    result.inverse_sum = (sum > 0.0) ? 1.0/sum : 0.0;
     return result;
   }
 
@@ -188,8 +285,9 @@ struct MaterialMixtureDevice {
   MaterialComposition CompositionFromY0(const Real y0_in) const {
     MaterialComposition result;
     result.count = 2;
-    result.y[0] = ClampMassFraction(y0_in);
-    result.y[1] = 1.0-result.y[0];
+    result.source = MaterialComposition::legacy_two_material;
+    result.legacy_y0 = ClampMassFraction(y0_in);
+    result.inverse_sum = 1.0;
     return result;
   }
 
@@ -206,20 +304,11 @@ struct MaterialMixtureDevice {
     int query_flags = ionmix_query_in_bounds;
   };
 
-  struct SpeciesDensityCache {
-    IonmixDensityLocation location;
-    Real pressure_scale = 1.0;
-    // 0 = unprepared, 1 = absent, 2 = active, 3 = active below minimum density.
-    int status = 0;
-  };
-
   struct MixedDensityCache {
-    SpeciesDensityCache material[kMaxMaterials];
+    Real density = 0.0;
   };
 
-  struct MixedEnergyIntervalCache {
-    IonmixEnergyIntervalCache material[kMaxMaterials];
-  };
+  struct MixedEnergyIntervalCache {};
 
   struct ComponentPairAtTemperature {
     ComponentAtTemperature ion;
@@ -228,8 +317,6 @@ struct MaterialMixtureDevice {
 
   struct NativeMinimumTemperatureState {
     Real temperature = 0.0;
-    // Bit n marks material n.
-    int material_mask = 0;
   };
 
   KOKKOS_INLINE_FUNCTION
@@ -271,13 +358,13 @@ struct MaterialMixtureDevice {
     bool have_representative = false;
     for (int n = 0; n < mix.count; ++n) {
       const ComponentAtTemperature state = SpeciesComponent(
-          SpeciesTable(n), component, density*mix.y[n], temperature);
+          SpeciesTable(n), component, density*mix[n], temperature);
       pressure += state.pressure;
-      specific_internal_energy += mix.y[n]*state.specific_internal_energy;
+      specific_internal_energy += mix[n]*state.specific_internal_energy;
       query_flags |= state.query_flags;
       // The canonical temperature is that of the first present component; a component
       // with zero mass fraction reports the requested temperature unchanged.
-      if (!have_representative && (mix.y[n] > 0.0 || n == mix.count-1)) {
+      if (!have_representative && (mix[n] > 0.0 || n == mix.count-1)) {
         representative_temperature = state.temperature;
         have_representative = true;
       }
@@ -298,73 +385,13 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
-  ComponentAtTemperature SpeciesComponentFromCachedDensity(
-      const IonmixTwoTemperatureTableDevice &table,
-      const IonmixComponent component, const Real partial_density,
-      const Real temperature, SpeciesDensityCache &cache) const {
-    if (cache.status == 0) {
-      if (partial_density > 0.0) {
-        const Real minimum_density = table.MinimumDensityCode();
-        const Real query_density = fmax(partial_density, minimum_density);
-        cache.location = table.PrepareDensityLocation(query_density);
-        cache.status = 2;
-        if (partial_density < minimum_density) {
-          cache.pressure_scale = partial_density/minimum_density;
-          cache.status = 3;
-        }
-      } else {
-        cache.status = 1;
-      }
-    }
-    ComponentAtTemperature result;
-    if (cache.status == 1) {
-      result.temperature = temperature;
-      return result;
-    }
-    const IonmixComponentState state =
-        table.ComponentFromPreparedDensityTemperature(
-            component, cache.location, temperature);
-    result.temperature = state.temperature;
-    result.pressure = state.pressure;
-    if (cache.status == 3) {
-      result.pressure *= cache.pressure_scale;
-    }
-    result.specific_internal_energy = state.specific_internal_energy;
-    result.query_flags = state.query_flags;
-    if (cache.status == 3) {
-      result.query_flags |= ionmix_density_below_table;
-    }
-    return result;
-  }
-
-  KOKKOS_INLINE_FUNCTION
   ComponentAtTemperature MixtureComponentFromCachedDensity(
       const IonmixComponent component, const Real density,
       const Real temperature, const MaterialComposition &mix,
       MixedDensityCache &cache) const {
-    ComponentAtTemperature result;
-    Real pressure = 0.0;
-    Real specific_internal_energy = 0.0;
-    int query_flags = ionmix_query_in_bounds;
-    Real representative_temperature = 0.0;
-    bool have_representative = false;
-    for (int n = 0; n < mix.count; ++n) {
-      const ComponentAtTemperature state = SpeciesComponentFromCachedDensity(
-          SpeciesTable(n), component, density*mix.y[n], temperature,
-          cache.material[n]);
-      pressure += state.pressure;
-      specific_internal_energy += mix.y[n]*state.specific_internal_energy;
-      query_flags |= state.query_flags;
-      if (!have_representative && (mix.y[n] > 0.0 || n == mix.count-1)) {
-        representative_temperature = state.temperature;
-        have_representative = true;
-      }
-    }
-    result.temperature = representative_temperature;
-    result.pressure = pressure;
-    result.specific_internal_energy = specific_internal_energy;
-    result.query_flags = query_flags;
-    return result;
+    cache.density = density;
+    return MixtureComponentFromRhoTemperature(
+        component, density, temperature, mix);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -376,31 +403,16 @@ struct MaterialMixtureDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
-  Real SpeciesComponentEnergyFromCachedDensity(
-      const IonmixTwoTemperatureTableDevice &table,
-      const IonmixComponent component, const Real temperature,
-      const Real log_temperature,
-      const SpeciesDensityCache &density_cache,
-      IonmixEnergyIntervalCache &energy_cache) const {
-    if (density_cache.status == 1) return 0.0;
-    return table.ComponentEnergyFromPreparedDensityTemperature(
-        component, density_cache.location, temperature, log_temperature,
-        energy_cache);
-  }
-
-  KOKKOS_INLINE_FUNCTION
   Real MixtureComponentEnergyFromCachedDensity(
       const IonmixComponent component, const Real temperature,
       const MaterialComposition &mix, const MixedDensityCache &density_cache,
       MixedEnergyIntervalCache &energy_cache) const {
-    // Every material table receives the same rounded exp(log_trial).  Evaluate its
-    // logarithm once while preserving the legacy exp-then-log inverse trajectory.
-    const Real log_temperature = log(temperature);
+    (void)energy_cache;
     Real energy = 0.0;
     for (int n = 0; n < mix.count; ++n) {
-      energy += mix.y[n]*SpeciesComponentEnergyFromCachedDensity(
-          SpeciesTable(n), component, temperature, log_temperature,
-          density_cache.material[n], energy_cache.material[n]);
+      energy += mix[n]*SpeciesComponent(
+          SpeciesTable(n), component, density_cache.density*mix[n],
+          temperature).specific_internal_energy;
     }
     return energy;
   }
@@ -437,9 +449,9 @@ struct MaterialMixtureDevice {
     for (int n = 0; n < mix.count; ++n) {
       const ComponentTemperatureState state =
           SpeciesTemperatureFromRhoTemperature(
-              SpeciesTable(n), density*mix.y[n], temperature);
+              SpeciesTable(n), density*mix[n], temperature);
       query_flags |= state.query_flags;
-      if (!have_representative && (mix.y[n] > 0.0 || n == mix.count-1)) {
+      if (!have_representative && (mix[n] > 0.0 || n == mix.count-1)) {
         representative_temperature = state.temperature;
         have_representative = true;
       }
@@ -491,13 +503,13 @@ struct MaterialMixtureDevice {
     for (int n = 0; n < mix.count; ++n) {
       const MaterialPressureEnergyState state =
           SpeciesPressureEnergyFromRhoTemperature(
-              SpeciesTable(n), density*mix.y[n], temperature);
+              SpeciesTable(n), density*mix[n], temperature);
       result.ion_pressure += state.ion_pressure;
       result.electron_pressure += state.electron_pressure;
       result.ion_specific_internal_energy +=
-          mix.y[n]*state.ion_specific_internal_energy;
+          mix[n]*state.ion_specific_internal_energy;
       result.electron_specific_internal_energy +=
-          mix.y[n]*state.electron_specific_internal_energy;
+          mix[n]*state.electron_specific_internal_energy;
       result.query_flags |= state.query_flags;
     }
     return result;
@@ -557,21 +569,22 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   MaterialPressureEnergyState TabularPressureEnergyFromRhoNativeMinimum(
       const Real density, const Real temperature, const MaterialComposition &mix,
-      const int native_material_mask) const {
+      const bool use_native_minimum) const {
     MaterialPressureEnergyState result;
     for (int n = 0; n < mix.count; ++n) {
       const MaterialPressureEnergyState state =
-          ((native_material_mask & (1 << n)) != 0)
+          (use_native_minimum && mix[n] > 0.0 &&
+           SpeciesTable(n).MinimumTemperatureCode() == temperature)
           ? SpeciesPressureEnergyFromRhoMinimumTemperature(
-                SpeciesTable(n), density*mix.y[n])
+                SpeciesTable(n), density*mix[n])
           : SpeciesPressureEnergyFromRhoTemperature(
-                SpeciesTable(n), density*mix.y[n], temperature);
+                SpeciesTable(n), density*mix[n], temperature);
       result.ion_pressure += state.ion_pressure;
       result.electron_pressure += state.electron_pressure;
       result.ion_specific_internal_energy +=
-          mix.y[n]*state.ion_specific_internal_energy;
+          mix[n]*state.ion_specific_internal_energy;
       result.electron_specific_internal_energy +=
-          mix.y[n]*state.electron_specific_internal_energy;
+          mix[n]*state.electron_specific_internal_energy;
       result.query_flags |= state.query_flags;
     }
     return result;
@@ -580,9 +593,9 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   MaterialPressureEnergyState TabularPressureEnergyFromRhoNativeMinimum(
       const Real density, const Real temperature, const Real y0_in,
-      const int native_material_mask) const {
+      const bool use_native_minimum) const {
     return TabularPressureEnergyFromRhoNativeMinimum(
-        density, temperature, CompositionFromY0(y0_in), native_material_mask);
+        density, temperature, CompositionFromY0(y0_in), use_native_minimum);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -658,7 +671,7 @@ struct MaterialMixtureDevice {
     Real result = 0.0;
     bool have_any = false;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       const Real value = SpeciesTable(n).MinimumTemperatureCode();
       result = have_any ? fmax(result, value) : value;
       have_any = true;
@@ -671,23 +684,13 @@ struct MaterialMixtureDevice {
     return MinimumTemperatureForComposition(CompositionFromY0(y0_in));
   }
 
-  //! Mark every present component whose own table minimum equals the shared minimum, so
-  //! the caller can evaluate those on their native minimum-temperature surface.
+  //! Return the shared minimum; native-table ownership is recomputed per material when
+  //! evaluating the floor, avoiding a fixed-width bit mask.
   KOKKOS_INLINE_FUNCTION
   NativeMinimumTemperatureState NativeMinimumTemperatureForComposition(
       const MaterialComposition &mix) const {
     NativeMinimumTemperatureState result;
     result.temperature = MinimumTemperatureForComposition(mix);
-    bool any_present = false;
-    for (int n = 0; n < mix.count; ++n) {
-      if (mix.y[n] > 0.0) any_present = true;
-    }
-    for (int n = 0; n < mix.count; ++n) {
-      if (any_present && !(mix.y[n] > 0.0)) continue;
-      if (SpeciesTable(n).MinimumTemperatureCode() == result.temperature) {
-        result.material_mask |= (1 << n);
-      }
-    }
     return result;
   }
 
@@ -702,7 +705,7 @@ struct MaterialMixtureDevice {
     Real result = 0.0;
     bool have_any = false;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       const Real value = SpeciesTable(n).MaximumTemperatureCode();
       result = have_any ? fmin(result, value) : value;
       have_any = true;
@@ -720,7 +723,7 @@ struct MaterialMixtureDevice {
   int PureComponentIndex(const MaterialComposition &mix) const {
     int found = -1;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       if (found >= 0) return -1;
       found = n;
     }
@@ -948,10 +951,10 @@ struct MaterialMixtureDevice {
       const MaterialComposition &mix) const {
     Real result = 0.0;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       const IonmixTwoTemperatureTableDevice &table = SpeciesTable(n);
-      const Real rho = fmax(density*mix.y[n], table.MinimumDensityCode());
-      result += mix.y[n]*table.MeanIonizationFromRhoTemperature(
+      const Real rho = fmax(density*mix[n], table.MinimumDensityCode());
+      result += mix[n]*table.MeanIonizationFromRhoTemperature(
                     rho, electron_temperature)/Species(n).abar;
     }
     return result;
@@ -972,13 +975,13 @@ struct MaterialMixtureDevice {
     Real electron_weight = 0.0;
     Real charge_weight = 0.0;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       const IonmixTwoTemperatureTableDevice &table = SpeciesTable(n);
       const SpeciesProperties &species = Species(n);
-      const Real rho = fmax(density*mix.y[n], table.MinimumDensityCode());
+      const Real rho = fmax(density*mix[n], table.MinimumDensityCode());
       const Real zbar = table.MeanIonizationFromRhoTemperature(
           rho, electron_temperature);
-      const Real ne = mix.y[n]*zbar/species.abar;
+      const Real ne = mix[n]*zbar/species.abar;
       electron_weight += ne;
       charge_weight += ne*(species.zeff/species.zbar)*zbar;
     }
@@ -1011,15 +1014,15 @@ struct MaterialMixtureDevice {
     Real ion_weight = 0.0;
     Real effective_charge_weight = 0.0;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       const IonmixTwoTemperatureTableDevice &table = SpeciesTable(n);
       const SpeciesProperties &species = Species(n);
-      const Real rho = fmax(density*mix.y[n], table.MinimumDensityCode());
+      const Real rho = fmax(density*mix[n], table.MinimumDensityCode());
       const Real zbar = table.MeanIonizationFromRhoTemperature(
           rho, electron.temperature);
-      const Real component_electron_weight = mix.y[n]*zbar/species.abar;
+      const Real component_electron_weight = mix[n]*zbar/species.abar;
       electron_weight += component_electron_weight;
-      ion_weight += mix.y[n]/species.abar;
+      ion_weight += mix[n]/species.abar;
       effective_charge_weight += component_electron_weight*
           (species.zeff/species.zbar)*zbar;
     }
@@ -1052,9 +1055,9 @@ struct MaterialMixtureDevice {
     Real density_high = density*exp(log_step);
     Real maximum_density = Kokkos::Experimental::infinity<Real>::value;
     for (int n = 0; n < mix.count; ++n) {
-      if (!(mix.y[n] > 0.0)) continue;
+      if (!(mix[n] > 0.0)) continue;
       maximum_density = fmin(
-          maximum_density, SpeciesTable(n).MaximumDensityCode()/mix.y[n]);
+          maximum_density, SpeciesTable(n).MaximumDensityCode()/mix[n]);
     }
     density_high = fmin(density_high, maximum_density);
 
@@ -1158,7 +1161,7 @@ struct MaterialMixtureDevice {
   bool IsMixed(const MaterialComposition &mix) const {
     int present = 0;
     for (int n = 0; n < mix.count; ++n) {
-      if (mix.y[n] > 0.0) ++present;
+      if (mix[n] > 0.0) ++present;
     }
     return present > 1;
   }
@@ -1167,7 +1170,7 @@ struct MaterialMixtureDevice {
   Real Material0MassFractionFromPrimitive(const DvceArray5D<Real> &prim,
                                            const int m, const int k,
                                            const int j, const int i) const {
-    return ClampMassFraction(prim(m, scalar_index, k, j, i));
+    return CompositionFromPrimitive(prim, m, k, j, i)[0];
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1175,22 +1178,27 @@ struct MaterialMixtureDevice {
                                           const int m, const int k,
                                           const int j, const int i,
                                           const Real density_floor = 0.0) const {
-    const Real density = fmax(cons(m, IDN, k, j, i), density_floor);
-    if (!(density > 0.0)) return 0.0;
-    return ClampMassFraction(cons(m, scalar_index, k, j, i)/density);
+    return CompositionFromConserved(cons, m, k, j, i, density_floor)[0];
   }
 
-  //! Full composition from the advected mass fractions.  With nmaterials=2 this is
-  //! exactly CompositionFromY0 of the single scalar.
+  //! Full composition from all advected mass fractions.
   KOKKOS_INLINE_FUNCTION
   MaterialComposition CompositionFromPrimitive(const DvceArray5D<Real> &prim,
                                                const int m, const int k,
                                                const int j, const int i) const {
-    Real fractions[kMaxMaterials-1];
-    for (int n = 0; n < nmaterials-1; ++n) {
-      fractions[n] = prim(m, scalar_indices[n], k, j, i);
-    }
-    return CompositionFromFractions(fractions);
+    MaterialComposition result;
+    result.state = prim;
+    result.scalar_indices = scalar_indices;
+    result.count = nmaterials;
+    result.source = MaterialComposition::primitive_cell;
+    result.m0 = m;
+    result.k0 = k;
+    result.j0 = j;
+    result.i0 = i;
+    Real sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) sum += result.RawFraction(n);
+    result.inverse_sum = (sum > 0.0) ? 1.0/sum : 0.0;
+    return result;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1198,33 +1206,107 @@ struct MaterialMixtureDevice {
                                                const int m, const int k,
                                                const int j, const int i,
                                                const Real density_floor = 0.0) const {
-    const Real density = fmax(cons(m, IDN, k, j, i), density_floor);
-    Real fractions[kMaxMaterials-1];
-    for (int n = 0; n < nmaterials-1; ++n) {
-      fractions[n] = (density > 0.0)
-          ? cons(m, scalar_indices[n], k, j, i)/density : 0.0;
+    MaterialComposition result;
+    result.state = cons;
+    result.scalar_indices = scalar_indices;
+    result.count = nmaterials;
+    result.source = MaterialComposition::conserved_cell;
+    result.m0 = m;
+    result.k0 = k;
+    result.j0 = j;
+    result.i0 = i;
+    result.density = fmax(cons(m, IDN, k, j, i), density_floor);
+    Real sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) sum += result.RawFraction(n);
+    result.inverse_sum = (sum > 0.0) ? 1.0/sum : 0.0;
+    return result;
+  }
+
+  //! Composition of a regular 2x2x(nk) conservative restriction stencil.
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromConservedRestriction(
+      const DvceArray5D<Real> &cons, const int m,
+      const int k, const int j, const int i, const int nk,
+      const Real weight, const Real density) const {
+    MaterialComposition result;
+    result.state = cons;
+    result.scalar_indices = scalar_indices;
+    result.count = nmaterials;
+    result.source = MaterialComposition::conserved_restriction;
+    result.m0 = m;
+    result.k0 = k;
+    result.j0 = j;
+    result.i0 = i;
+    result.restriction_nk = nk;
+    result.restriction_weight = weight;
+    result.density = density;
+    Real sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) sum += result.RawFraction(n);
+    result.inverse_sum = (sum > 0.0) ? 1.0/sum : 0.0;
+    return result;
+  }
+
+  //! Density-weighted composition of two primitive cells, used at radiation faces.
+  KOKKOS_INLINE_FUNCTION
+  MaterialComposition CompositionFromPrimitivePair(
+      const DvceArray5D<Real> &prim,
+      const int m0, const int k0, const int j0, const int i0,
+      const int m1, const int k1, const int j1, const int i1,
+      const Real raw_weight0, const Real raw_weight1) const {
+    MaterialComposition result;
+    result.state = prim;
+    result.scalar_indices = scalar_indices;
+    result.count = nmaterials;
+    result.source = MaterialComposition::primitive_pair;
+    result.m0 = m0;
+    result.k0 = k0;
+    result.j0 = j0;
+    result.i0 = i0;
+    result.m1 = m1;
+    result.k1 = k1;
+    result.j1 = j1;
+    result.i1 = i1;
+    Real source0_sum = 0.0;
+    Real source1_sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) {
+      source0_sum += MaterialComposition::Clamp(
+          prim(m0, scalar_indices(n), k0, j0, i0));
+      source1_sum += MaterialComposition::Clamp(
+          prim(m1, scalar_indices(n), k1, j1, i1));
     }
-    return CompositionFromFractions(fractions);
+    result.source0_inverse_sum =
+        (source0_sum > 0.0) ? 1.0/source0_sum : 0.0;
+    result.source1_inverse_sum =
+        (source1_sum > 0.0) ? 1.0/source1_sum : 0.0;
+    const Real weight_sum = raw_weight0+raw_weight1;
+    if (weight_sum > 0.0) {
+      result.weight0 = raw_weight0/weight_sum;
+      result.weight1 = raw_weight1/weight_sum;
+    }
+    Real sum = 0.0;
+    for (int n = 0; n < nmaterials; ++n) sum += result.RawFraction(n);
+    result.inverse_sum = (sum > 0.0) ? 1.0/sum : 0.0;
+    return result;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real IonNumberPerAtomicMass(const MaterialComposition &mix) const {
     Real result = 0.0;
-    for (int n = 0; n < mix.count; ++n) result += mix.y[n]/Species(n).abar;
+    for (int n = 0; n < mix.count; ++n) result += mix[n]/Species(n).abar;
     return result;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real IonNumberPerAtomicMass(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
-    return y0/material0.abar+(1.0-y0)/material1.abar;
+    return y0/Species(0).abar+(1.0-y0)/Species(1).abar;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real ElectronNumberPerAtomicMass(const MaterialComposition &mix) const {
     Real result = 0.0;
     for (int n = 0; n < mix.count; ++n) {
-      result += mix.y[n]*Species(n).zbar/Species(n).abar;
+      result += mix[n]*Species(n).zbar/Species(n).abar;
     }
     return result;
   }
@@ -1232,8 +1314,8 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   Real ElectronNumberPerAtomicMass(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
-    return y0*material0.zbar/material0.abar+
-           (1.0-y0)*material1.zbar/material1.abar;
+    return y0*Species(0).zbar/Species(0).abar+
+           (1.0-y0)*Species(1).zbar/Species(1).abar;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1344,7 +1426,7 @@ struct MaterialMixtureDevice {
     Real largest_zeff = 0.0;
     for (int n = 0; n < mix.count; ++n) {
       const SpeciesProperties &species = Species(n);
-      const Real ne = mix.y[n]*species.zbar/species.abar;
+      const Real ne = mix[n]*species.zbar/species.abar;
       electron_weight += ne;
       charge_weight += ne*species.zeff;
       largest_zeff = fmax(largest_zeff, species.zeff);
@@ -1355,11 +1437,11 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   Real EffectiveCharge(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
-    const Real ne0 = y0*material0.zbar/material0.abar;
-    const Real ne1 = (1.0-y0)*material1.zbar/material1.abar;
+    const Real ne0 = y0*Species(0).zbar/Species(0).abar;
+    const Real ne1 = (1.0-y0)*Species(1).zbar/Species(1).abar;
     return (ne0+ne1 > 0.0)
-               ? (ne0*material0.zeff+ne1*material1.zeff)/(ne0+ne1)
-               : fmax(material0.zeff, material1.zeff);
+               ? (ne0*Species(0).zeff+ne1*Species(1).zeff)/(ne0+ne1)
+               : fmax(Species(0).zeff, Species(1).zeff);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -1933,8 +2015,8 @@ struct MaterialMixtureDevice {
           density, (1.0-electron_fraction)*total_specific_energy,
           electron_fraction*total_specific_energy, y0);
     }
-    const bool error_bounds = material0_table.bounds_error != 0 ||
-                              material1_table.bounds_error != 0;
+    const bool error_bounds = SpeciesTable(0).bounds_error != 0 ||
+                              SpeciesTable(1).bounds_error != 0;
     const Real minimum_temperature = MinimumTemperatureForComposition(y0);
     const Real maximum_temperature = MaximumTemperatureForComposition(y0);
     const Real low_electron_temperature = fmin(fmax(
@@ -2015,7 +2097,7 @@ struct MaterialMixtureDevice {
     MaterialThermodynamicState maximum = StateFromRhoTemperaturesNoSound(
         density, maximum_temperature, maximum_temperature, y0);
     if (maximum.ion_pressure+maximum.electron_pressure < pressure_floor) {
-      if (material0_table.bounds_error != 0 || material1_table.bounds_error != 0) {
+      if (SpeciesTable(0).bounds_error != 0 || SpeciesTable(1).bounds_error != 0) {
         Kokkos::abort("Mixed IONMIX pressure floor is above the table range.");
       }
       maximum.query_flags |= ionmix_temperature_above_table;
@@ -2058,17 +2140,16 @@ struct MaterialMixtureDevice {
         NativeMinimumTemperatureForComposition(y0);
     const Real minimum_temperature =
         fmax(native_minimum.temperature, temperature_floor);
-    const int native_material_mask =
-        (minimum_temperature == native_minimum.temperature)
-        ? native_minimum.material_mask : 0;
+    const bool use_native_minimum =
+        minimum_temperature == native_minimum.temperature;
     const Real maximum_temperature = MaximumTemperatureForComposition(y0);
     MaterialPressureEnergyState state = TabularPressureEnergyFromRhoNativeMinimum(
-        density, minimum_temperature, y0, native_material_mask);
+        density, minimum_temperature, y0, use_native_minimum);
     if (state.ion_pressure+state.electron_pressure >= pressure_floor) return state;
     MaterialPressureEnergyState maximum = TabularPressureEnergyFromRhoTemperature(
         density, maximum_temperature, y0);
     if (maximum.ion_pressure+maximum.electron_pressure < pressure_floor) {
-      if (material0_table.bounds_error != 0 || material1_table.bounds_error != 0) {
+      if (SpeciesTable(0).bounds_error != 0 || SpeciesTable(1).bounds_error != 0) {
         Kokkos::abort("Mixed IONMIX pressure floor is above the table range.");
       }
       maximum.query_flags |= ionmix_temperature_above_table;
@@ -2166,7 +2247,7 @@ struct MaterialMixtureDevice {
     Real rate = 0.0;
     for (int n = 0; n < mix.count; ++n) {
       const SpeciesProperties &species = Species(n);
-      const Real ne = mix.y[n]*species.zbar/species.abar;
+      const Real ne = mix[n]*species.zbar/species.abar;
       // A present component asking for instantaneous exchange wins outright.
       if (ne > 0.0 && species.t_ei == 0.0) return 0.0;
       electron_weight += ne;
@@ -2178,13 +2259,13 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   Real ExchangeTime(const Real y0_in) const {
     const Real y0 = ClampMassFraction(y0_in);
-    const Real ne0 = y0*material0.zbar/material0.abar;
-    const Real ne1 = (1.0-y0)*material1.zbar/material1.abar;
-    if ((ne0 > 0.0 && material0.t_ei == 0.0) ||
-        (ne1 > 0.0 && material1.t_ei == 0.0)) return 0.0;
+    const Real ne0 = y0*Species(0).zbar/Species(0).abar;
+    const Real ne1 = (1.0-y0)*Species(1).zbar/Species(1).abar;
+    if ((ne0 > 0.0 && Species(0).t_ei == 0.0) ||
+        (ne1 > 0.0 && Species(1).t_ei == 0.0)) return 0.0;
     Real rate = 0.0;
-    if (material0.t_ei > 0.0) rate += ne0/material0.t_ei;
-    if (material1.t_ei > 0.0) rate += ne1/material1.t_ei;
+    if (Species(0).t_ei > 0.0) rate += ne0/Species(0).t_ei;
+    if (Species(1).t_ei > 0.0) rate += ne1/Species(1).t_ei;
     return (rate > 0.0) ? (ne0+ne1)/rate : -1.0;
   }
 
@@ -2480,12 +2561,11 @@ struct MaterialMixtureDevice {
         NativeMinimumTemperatureForComposition(mix);
     const Real minimum_temperature =
         fmax(native_minimum.temperature, temperature_floor);
-    const int native_material_mask =
-        (minimum_temperature == native_minimum.temperature)
-        ? native_minimum.material_mask : 0;
+    const bool use_native_minimum =
+        minimum_temperature == native_minimum.temperature;
     const Real maximum_temperature = MaximumTemperatureForComposition(mix);
     MaterialPressureEnergyState state = TabularPressureEnergyFromRhoNativeMinimum(
-        density, minimum_temperature, mix, native_material_mask);
+        density, minimum_temperature, mix, use_native_minimum);
     if (state.ion_pressure+state.electron_pressure >= pressure_floor) return state;
     MaterialPressureEnergyState maximum = TabularPressureEnergyFromRhoTemperature(
         density, maximum_temperature, mix);
@@ -2552,7 +2632,7 @@ class MaterialMixture {
 
  private:
   MaterialMixtureDevice data_;
-  std::unique_ptr<IonmixTwoTemperatureTable> tables_[kMaxMaterials];
+  std::vector<std::unique_ptr<IonmixTwoTemperatureTable>> tables_;
 };
 
 } // namespace materials

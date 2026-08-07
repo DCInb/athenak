@@ -74,7 +74,7 @@ def write_table(kind):
 
 def write_input():
     text = BASE_INPUT.read_text(encoding="ascii")
-    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 1\n", 1)
+    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 2\n", 1)
     text = text.replace(
         "gamma = 1.6666666666666667\n",
         "gamma = 1.6666666666666667\npfloor = 0.0\ntfloor = 0.0\n", 1)

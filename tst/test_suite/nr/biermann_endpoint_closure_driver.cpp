@@ -31,6 +31,20 @@ int main(int argc, char **argv) {
   Kokkos::initialize(argc, argv);
   int failures = 0;
   {
+    materials::MaterialMixtureDevice test_mixture;
+    test_mixture.nmaterials = 2;
+    test_mixture.species = DvceArray1D<materials::SpeciesProperties>(
+        "biermann-endpoint-species", 2);
+    auto host_species = Kokkos::create_mirror_view(test_mixture.species);
+    host_species(0).abar = 6.5;
+    host_species(0).zbar = 3.5;
+    host_species(0).zeff = 3.5;
+    host_species(1).abar = 4.0;
+    host_species(1).zbar = 2.0;
+    host_species(1).zeff = 2.0;
+    Kokkos::deep_copy(test_mixture.species, host_species);
+    test_mixture.gamma_minus_one = 2.0/3.0;
+    test_mixture.use_tabular_eos = false;
     Kokkos::parallel_reduce(
         "biermann_endpoint_closure_regression", Kokkos::RangePolicy<>(0, 5),
         KOKKOS_LAMBDA(const int test, int &failed) {
@@ -80,15 +94,7 @@ int main(int argc, char **argv) {
                 !NearlyEqual(state.electron_energy, 0.5)) ++failed;
           } else {
             // The shared selected-state closure uses mixed-material floors and composition.
-            materials::MaterialMixtureDevice mixture;
-            mixture.material0.abar = 6.5;
-            mixture.material0.zbar = 3.5;
-            mixture.material0.zeff = 3.5;
-            mixture.material1.abar = 4.0;
-            mixture.material1.zbar = 2.0;
-            mixture.material1.zeff = 2.0;
-            mixture.gamma_minus_one = 2.0/3.0;
-            mixture.use_tabular_eos = false;
+            const auto mixture = test_mixture;
             closure.mixture = mixture;
             closure.use_materials = true;
             closure.pressure_floor = 1.0;

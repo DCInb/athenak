@@ -122,9 +122,10 @@ PRODUCTION_MESH_SHAPE = (315, 315, 315)
 PRODUCTION_BLOCK_SHAPE = (45, 45, 45)
 PRODUCTION_MESHBLOCKS = 343
 PRODUCTION_ROOT_LEVEL = 3
-# Double-precision restart payload for one 45^3 MHD MeshBlock with two user
-# composition scalars, two-temperature energies, and 20 radiation groups.
-PRODUCTION_RESTART_DATA_SIZE = 30_175_768
+# Double-precision restart payload for one 45^3 MeshBlock with three explicit user
+# composition scalars, two-temperature energies, and 20 radiation groups. Restart data
+# include two ghost zones, so the added helium scalar contributes 49^3*8 bytes.
+PRODUCTION_RESTART_DATA_SIZE = 31_116_960
 REQUIRED_PRODUCTION_CHECKS = (
     "compact_20group_50step",
     "compact_output_and_restart",

@@ -62,7 +62,7 @@ struct BiermannEndpointClosure {
       const materials::MaterialComposition &mix) const {
     BiermannClosedState result;
     result.density = density;
-    result.material0_mass_fraction = use_materials ? mix.y[0] : 0.0;
+    result.material0_mass_fraction = use_materials ? mix[0] : 0.0;
     result.composition = mix;
     result.query_flags = 0;
 
@@ -137,8 +137,42 @@ struct BiermannEndpointClosure {
     return result;
   }
 
-  //! Composition form: `raw_material_densities` holds the nmaterials-1 advected
+  //! Composition form: `raw_material_densities` holds all nmaterials advected
   //! rho*Y_s values, so the closure can floor a genuinely multi-material cell.
+  KOKKOS_INLINE_FUNCTION
+  BiermannClosedState CloseConserved(
+      const Real raw_density,
+      const Real momentum1, const Real momentum2, const Real momentum3,
+      const Real total_energy, const Real raw_ion_energy,
+      const Real raw_electron_energy,
+      const materials::MaterialComposition &mix,
+      const Real bcc1, const Real bcc2, const Real bcc3) const {
+    const Real magnetic_squared = SQR(bcc1)+SQR(bcc2)+SQR(bcc3);
+    const Real effective_density = fmax(
+        raw_density, fmax(density_floor, magnetic_squared/sigma_max));
+    const Real kinetic_energy = 0.5*(
+        SQR(momentum1)+SQR(momentum2)+SQR(momentum3))/effective_density;
+    const Real conservative_internal =
+        total_energy-kinetic_energy-0.5*magnetic_squared;
+
+    Real selected_internal = conservative_internal;
+    if (use_dual_energy) {
+      const Real auxiliary_internal =
+          fmax(raw_ion_energy, 0.0)+fmax(raw_electron_energy, 0.0);
+      const bool use_conservative =
+          conservative_internal > 0.0 &&
+          (dual_energy_eta1 <= 0.0 ||
+           conservative_internal >
+               dual_energy_eta1*fmax(total_energy, 1.0e-18));
+      selected_internal = use_conservative
+          ? conservative_internal : auxiliary_internal;
+    }
+    selected_internal = fmax(
+        selected_internal, InternalEnergyFloor(effective_density));
+    return CloseSelected(
+        effective_density, selected_internal, raw_electron_energy, mix);
+  }
+
   KOKKOS_INLINE_FUNCTION
   BiermannClosedState CloseConserved(
       const Real raw_density,
@@ -171,11 +205,8 @@ struct BiermannEndpointClosure {
 
     materials::MaterialComposition mix;
     if (use_materials) {
-      Real fractions[materials::kMaxMaterials-1];
-      for (int n = 0; n < mixture.nmaterials-1; ++n) {
-        fractions[n] = raw_material_densities[n]/effective_density;
-      }
-      mix = mixture.CompositionFromFractions(fractions);
+      mix = mixture.CompositionFromPartialDensities(
+          raw_material_densities, effective_density);
     }
     return CloseSelected(
         effective_density, selected_internal, raw_electron_energy, mix);

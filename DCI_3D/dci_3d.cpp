@@ -152,9 +152,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (!pmy_mesh_->three_d) {
     ProblemError("dci_3d requires a three-dimensional Cartesian mesh");
   }
-  // Two advected scalars carry rho*Y_CH and rho*Y_Au; helium is the remainder.
-  if (fluid.nuser_scalars != 2) {
-    ProblemError("dci_3d requires exactly two user scalars for rho*Y_CH and rho*Y_Au");
+  // Each material is explicit: rho*Y_CH, rho*Y_Au, and rho*Y_He are all advected.
+  if (fluid.nuser_scalars != 3) {
+    ProblemError("dci_3d requires exactly three user scalars for CH, Au, and He");
   }
   if (fluid.pmaterials == nullptr) {
     ProblemError("dci_3d requires the three-material CH/Au/He closure");
@@ -326,6 +326,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int nmb1 = pmbp->nmb_thispack - 1;
   const int scalar_index = fluid.pmaterials->ScalarIndex();
   const int cone_scalar_index = scalar_index+1;
+  const int helium_scalar_index = scalar_index+2;
   const auto material_mixture = fluid.pmaterials->DeviceData();
   const Real code_temperature =
       material_mixture.CodeTemperatureFromKelvin(temperature_kelvin);
@@ -394,7 +395,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
         ch_partial_density + cone_partial_density + ambient_partial_density;
     const Real ch_mass_fraction = ch_partial_density/density;
     const Real cone_mass_fraction = cone_partial_density/density;
-    Real fractions[2] = {ch_mass_fraction, cone_mass_fraction};
+    const Real helium_mass_fraction = ambient_partial_density/density;
+    Real fractions[3] = {
+        ch_mass_fraction, cone_mass_fraction, helium_mass_fraction};
     const auto composition = material_mixture.CompositionFromFractions(fractions);
     const auto thermo = material_mixture.StateFromRhoTemperatures(
         density, code_temperature, code_temperature, composition);
@@ -408,6 +411,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     w0(m, IEN, k, j, i) = internal_energy;
     w0(m, scalar_index, k, j, i) = ch_mass_fraction;
     w0(m, cone_scalar_index, k, j, i) = cone_mass_fraction;
+    w0(m, helium_scalar_index, k, j, i) = helium_mass_fraction;
   });
 
   if (fluid.is_mhd) {

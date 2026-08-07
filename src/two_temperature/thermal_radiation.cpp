@@ -253,29 +253,9 @@ FLDFaceMaterialState X1FaceMaterialState(
   state.density = 0.5*(density_left+density_right);
   state.material0_mass_fraction = 0.0;
   if (use_materials) {
-    const Real y_left = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i-1);
-    const Real y_right = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i);
-    const Real density_sum = density_left+density_right;
-    state.material0_mass_fraction = (density_sum > 0.0)
-        ? (density_left*y_left+density_right*y_right)/density_sum
-        : 0.5*(y_left+y_right);
-    // Average every advected fraction with the same density weighting, then let the
-    // closure normalize; this keeps the nmaterials=2 result bit-identical.
-    {
-      const materials::MaterialComposition left =
-          mixture.CompositionFromPrimitive(w, m, k, j, i-1);
-      const materials::MaterialComposition right =
-          mixture.CompositionFromPrimitive(w, m, k, j, i);
-      Real fractions[materials::kMaxMaterials-1];
-      for (int n = 0; n < mixture.nmaterials-1; ++n) {
-        fractions[n] = (density_sum > 0.0)
-            ? (density_left*left.y[n]+density_right*right.y[n])/density_sum
-            : 0.5*(left.y[n]+right.y[n]);
-      }
-      state.composition = mixture.CompositionFromFractions(fractions);
-    }
+    state.composition = mixture.CompositionFromPrimitivePair(
+        w, m, k, j, i-1, m, k, j, i, density_left, density_right);
+    state.material0_mass_fraction = state.composition[0];
     state.electron_temperature = 0.5*(
         temperature(m, 1, k, j, i-1)+temperature(m, 1, k, j, i));
   } else {
@@ -296,29 +276,9 @@ FLDFaceMaterialState X2FaceMaterialState(
   state.density = 0.5*(density_left+density_right);
   state.material0_mass_fraction = 0.0;
   if (use_materials) {
-    const Real y_left = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j-1, i);
-    const Real y_right = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i);
-    const Real density_sum = density_left+density_right;
-    state.material0_mass_fraction = (density_sum > 0.0)
-        ? (density_left*y_left+density_right*y_right)/density_sum
-        : 0.5*(y_left+y_right);
-    // Average every advected fraction with the same density weighting, then let the
-    // closure normalize; this keeps the nmaterials=2 result bit-identical.
-    {
-      const materials::MaterialComposition left =
-          mixture.CompositionFromPrimitive(w, m, k, j-1, i);
-      const materials::MaterialComposition right =
-          mixture.CompositionFromPrimitive(w, m, k, j, i);
-      Real fractions[materials::kMaxMaterials-1];
-      for (int n = 0; n < mixture.nmaterials-1; ++n) {
-        fractions[n] = (density_sum > 0.0)
-            ? (density_left*left.y[n]+density_right*right.y[n])/density_sum
-            : 0.5*(left.y[n]+right.y[n]);
-      }
-      state.composition = mixture.CompositionFromFractions(fractions);
-    }
+    state.composition = mixture.CompositionFromPrimitivePair(
+        w, m, k, j-1, i, m, k, j, i, density_left, density_right);
+    state.material0_mass_fraction = state.composition[0];
     state.electron_temperature = 0.5*(
         temperature(m, 1, k, j-1, i)+temperature(m, 1, k, j, i));
   } else {
@@ -339,29 +299,9 @@ FLDFaceMaterialState X3FaceMaterialState(
   state.density = 0.5*(density_left+density_right);
   state.material0_mass_fraction = 0.0;
   if (use_materials) {
-    const Real y_left = mixture.Material0MassFractionFromPrimitive(
-        w, m, k-1, j, i);
-    const Real y_right = mixture.Material0MassFractionFromPrimitive(
-        w, m, k, j, i);
-    const Real density_sum = density_left+density_right;
-    state.material0_mass_fraction = (density_sum > 0.0)
-        ? (density_left*y_left+density_right*y_right)/density_sum
-        : 0.5*(y_left+y_right);
-    // Average every advected fraction with the same density weighting, then let the
-    // closure normalize; this keeps the nmaterials=2 result bit-identical.
-    {
-      const materials::MaterialComposition left =
-          mixture.CompositionFromPrimitive(w, m, k-1, j, i);
-      const materials::MaterialComposition right =
-          mixture.CompositionFromPrimitive(w, m, k, j, i);
-      Real fractions[materials::kMaxMaterials-1];
-      for (int n = 0; n < mixture.nmaterials-1; ++n) {
-        fractions[n] = (density_sum > 0.0)
-            ? (density_left*left.y[n]+density_right*right.y[n])/density_sum
-            : 0.5*(left.y[n]+right.y[n]);
-      }
-      state.composition = mixture.CompositionFromFractions(fractions);
-    }
+    state.composition = mixture.CompositionFromPrimitivePair(
+        w, m, k-1, j, i, m, k, j, i, density_left, density_right);
+    state.material0_mass_fraction = state.composition[0];
     state.electron_temperature = 0.5*(
         temperature(m, 1, k-1, j, i)+temperature(m, 1, k, j, i));
   } else {
@@ -619,11 +559,11 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
         use_material_mixture_ ? material_mixture->NumberOfMaterials() : 2;
     const bool material0_table = pin->DoesParameterExist(
         "materials", "material0_opacity_table_file");
-    bool material1_table = material0_table;
+    bool all_material_tables = material0_table;
     for (int n = 1; n < opacity_materials; ++n) {
       const bool present = pin->DoesParameterExist(
           "materials", "material"+std::to_string(n)+"_opacity_table_file");
-      if (n == 1) material1_table = present;
+      all_material_tables = all_material_tables && present;
       if (present != material0_table) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "Mixed opacity requires a "
@@ -634,14 +574,14 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
     }
     const bool explicitly_mixed =
         (opacity_model == "mixed-table" || opacity_model == "mixed_tabulated");
-    if (explicitly_mixed && !(material0_table && material1_table)) {
+    if (explicitly_mixed && !all_material_tables) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<thermal_radiation>/opacity_model="
-                << opacity_model << " requires both material opacity tables"
+                << opacity_model << " requires every material opacity table"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (material0_table && material1_table) {
+    if (all_material_tables) {
       if (!use_material_mixture_) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "Mixed material opacity tables require an active "
