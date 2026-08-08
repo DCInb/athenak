@@ -120,6 +120,18 @@ FLASH's broader EOS inversion bracket and prevents a high conserved energy from 
 paired with an endpoint-clamped temperature; `clamp` and `error` retain their prior
 behavior for other decks.
 
+The preserved legacy CH/He restart provides a bounded same-state check of that mapping.
+It is fixed by SHA-256, `t=1 ns`, and cycle 48420.  A read-only current-tree scan of all
+`33554432` active cells finds `1688558` cells currently above a native ion/electron
+energy endpoint under `clamp`, with a maximum target/endpoint ratio of `8.016194089`.
+With `flash-extrapolate`, all scanned states are finite and positive, no high-energy bit
+remains, the maximum recovered electron temperature is `9.541060299e8 K`, and the
+volume-integrated component energies agree with the stored values below `1e-15`
+relative.  The scanner and JSON evidence pin the restart and table hashes and verify that
+the restart is unchanged before and after the scan.  This does not replay the historical
+trajectory or validate the current three-material restart layout.  The exact historical
+producer executable and the first offending `0.025 ns` cell state were not preserved.
+
 `generate_reference_tables.py` verifies the archive hash and converts the separate
 CH/Au/He ion-electron EOS surfaces plus all three opacity payloads into ignored local
 AthenaK tables.
@@ -155,8 +167,8 @@ preceding implicit-conduction solve changed only interior temperatures.  It then
 arithmetic-averages the coefficient to faces and advances the centered finite-volume
 operator with backward Euler while retaining `c_light=299.792458 mm/ns` in both
 transport and matter coupling.  A vacuum face additionally caps
-`D_face <= alpha*dx_normal/2`; the operator, Jacobi diagonal, and `rad_Pesc` diagnostic
-all use the identical capped value.  This is not the explicit AP/upwind face
+`D_face <= alpha*dx_normal/2`; the operator, preconditioner diagonals, and `rad_Pesc`
+diagnostic all use the identical capped value.  This is not the explicit AP/upwind face
 discretization.  The deck's
 `transport_discretization=asymptotic-preserving` and `ap_*` thresholds are retained only
 as explicit-mode fallback controls and are inactive in the implicit solve.  All six
@@ -177,27 +189,42 @@ timestep.
 The correspondence to FLASH is limited to physical `c`, time-lagged coefficients, and
 backward-Euler transport; it is not a claim of identical spatial discretization or a
 fully coupled nonlinear radiation/material solve.  AthenaK's current implicit solver is
-uniform-grid only and rejects SMR/AMR, advances groups sequentially with frozen
-coefficients, and uses Jacobi-preconditioned CG at the DCI-pinned tolerance `1e-10` and
-2000-iteration ceiling.  Recursive convergence is verified with the true `b-Ax`
-residual.  The incoming conserved radiation state must be finite and nonnegative.  Only
-finite tolerance-scale negative solver roundoff may undergo a globally
-volume-conservative positive rescaling, followed by another true-residual check; larger
-negativity and non-finite states abort.  Matter coupling remains a separate time-lagged
-local source under `source_cfl=0.1`.
+uniform-grid only, rejects SMR/AMR and shear-periodic boundaries, and advances groups
+sequentially with frozen coefficients.  DCI uses CG at the pinned tolerance `1e-10` and
+2000-iteration ceiling with a fixed global Galerkin V-cycle:
+`45^3 -> 15^3 -> 5^3 -> one value/MeshBlock`.  Exact-sum restriction, MPI face halos,
+transpose red/black sweeps, and an exact replicated 343-root Cholesky solve preserve the
+SPD preconditioner required by ordinary PCG.  A compatible hierarchy rejects odd
+periodic graphs; `jacobi` remains the default for decks that do not select
+`block-coarse`.  Recursive convergence is verified with the true `b-Ax` residual.  The
+incoming conserved radiation state must be finite and nonnegative.  Only finite
+tolerance-scale negative solver roundoff may undergo a globally volume-conservative
+positive rescaling, followed by another true-residual check; larger negativity and
+non-finite states abort.  Matter coupling remains a separate time-lagged local source
+under `source_cfl=0.1`.
 
-Focused dense-reference tests now cover constant periodic, harmonic-limited periodic,
-and harmonic-limited vacuum matrices.  Ten focused CPU tests, the CUDA/MPI build, and
-compact initialization validation passed.  The exact current-tree seven-GPU 50-cycle
-phase-1 smoke passed in 27.36 s to `t=6.542658936097e-05 ns`, with `eos_bad=0` and
-domain-integrated CH/Au/He fractions
-`0.07224481712971552/0.9276974187345620/5.776413572244726e-05`, whose sum is one within
-roundoff.  This is roughly 382 times short of the historical `0.025 ns` first-failure
-time and does not prove long-time removal of the DCI symptom.  Production-scale
-20-group Jacobi-PCG memory, convergence, and performance are also unproven; multigrid or
-a stronger preconditioner remains future work.  The DCI production gate must separately
-supply long-horizon, restart, energy-budget, and full-scale evidence for the exact hashed
-deck and binary.
+Focused dense-reference tests cover constant periodic, harmonic-limited periodic, and
+harmonic-limited vacuum matrices.  Separate comparisons cover the 9-cubed hierarchy
+against Jacobi, the incompatible-block fallback, and the dense-root allocation cap.
+The one-rank/two-rank MPI decomposition result agrees across the ownership boundary;
+focused CPU material/EOS tests and CPU/CUDA-MPI builds pass.  The exact final-source
+seven-GPU smoke advanced 50 cycles in 28.06 s, restarted for 10 more in 6.49 s, and
+ended at `t=7.389676454491e-05 ns` with `eos_bad=0`.  Its domain-integrated CH/Au/He
+fractions are
+`0.07224481712967802/0.9276974187345620/5.776413575991410e-05`, whose sum is one within
+roundoff.  Its compact incompatible MeshBlocks exercise the Jacobi fallback rather than
+the global hierarchy; the tracked record is `evidence/smoke_final_20260808.json`.  Binary
+`0e3513e15354cf12f17105b417ea30e34f84c003dc9e7f357659d7dbbf80a6c0` passed the
+315-cubed/twenty-group two-cycle probe in 25.05 s under the memory monitor and peaked at
+12620--12622 MiB per V100.  A separate report-enabled repeat of the same binary/input
+recorded at most 67 and 149 PCG iterations and maximum true residuals of
+`9.782791e-11` and `1.181642e-10`, within the guarded recursive-to-true-residual drift
+allowance.  The tracked probe record is
+`evidence/radiation_final_probe_20260808.json`; full run artifacts remain in an ignored
+local run tree.  The restarted smoke is still roughly 338 times short of the historical
+`0.025 ns` first-failure time, so neither check proves long-time removal of the DCI
+symptom.  The production gate must separately supply long-horizon, restart,
+energy-budget, and sustained-performance evidence for the exact hashed deck and binary.
 
 ## Laser drive adopted from the archive
 

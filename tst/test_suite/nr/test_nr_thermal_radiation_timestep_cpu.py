@@ -288,21 +288,70 @@ def test_run():
         assert "Implicit radiation tolerance must be finite" in (
             invalid_tolerance.stdout + invalid_tolerance.stderr)
 
+        invalid_preconditioner_input = input_variant(
+            diffusion_input, variants, "invalid_implicit_preconditioner",
+            {"thermal_radiation": {
+                "transport_integrator": "implicit",
+                "implicit_preconditioner": "not-a-preconditioner",
+            }})
+        invalid_preconditioner = subprocess.run(
+            ["./athena", "-i", invalid_preconditioner_input],
+            text=True, capture_output=True, timeout=60.0, check=False)
+        assert invalid_preconditioner.returncode != 0
+        assert "Unknown <thermal_radiation>/implicit_preconditioner" in (
+            invalid_preconditioner.stdout + invalid_preconditioner.stderr)
+
+        # An incompatible block size must select Jacobi before constructing the dense
+        # MeshBlock-root system.  Use 1,025 blocks to prove that this fallback bypasses
+        # both the root allocation and its explicit 1,024-block safety cap.
+        cap_bypass = transport_flags(
+            "fld_implicit_root_cap_bypass", resolution=4100, nlim=0)
+        cap_bypass.extend([
+            "meshblock/nx1=4",
+            "thermal_radiation/transport_integrator=implicit",
+            "thermal_radiation/implicit_preconditioner=block-coarse",
+            "output1/dt=-1.0",
+        ])
+        assert math.isfinite(run_case(diffusion_input, cap_bypass)[0])
+
+        # Conversely, a compatible hierarchy really does allocate the dense root and
+        # must retain the cap.  Outflow faces avoid the independent odd-periodic-graph
+        # rejection so this assertion identifies the intended constructor guard.
+        cap_guard = transport_flags(
+            "fld_implicit_root_cap_guard", resolution=9225, nlim=0)
+        cap_guard.extend([
+            "meshblock/nx1=9",
+            "mesh/ix1_bc=outflow", "mesh/ox1_bc=outflow",
+            "thermal_radiation/transport_integrator=implicit",
+            "thermal_radiation/implicit_preconditioner=block-coarse",
+            "output1/dt=-1.0",
+        ])
+        cap_guard_result = subprocess.run(
+            ["./athena", "-i", diffusion_input, *cap_guard],
+            text=True, capture_output=True, timeout=60.0, check=False)
+        assert cap_guard_result.returncode != 0
+        assert "supports at most 1024 MeshBlocks" in (
+            cap_guard_result.stdout + cap_guard_result.stderr)
+
         # The transport solve still uses physical c.  Compare a fixed macro step at two
         # light speeds against the exact periodic backward-Euler finite-volume stencil.
         implicit_results = {}
         implicit_step = 1.0e-3
         implicit_opacity = 100.0
-        implicit_resolution = 64
+        # Two 45-cell MeshBlocks exercise the production factor-three Galerkin
+        # hierarchy (45 -> 15 -> 5 -> 1) and its periodic global root coupling.
+        implicit_resolution = 90
         for light_speed in (1.0, 2.0):
             basename = f"fld_implicit_c{light_speed:g}"
             flags = transport_flags(
                 basename, resolution=implicit_resolution,
                 opacity=implicit_opacity, nlim=1)
             flags.extend([
+                "meshblock/nx1=45",
                 f"time/tlim={implicit_step}",
                 f"output1/dt={implicit_step}",
                 "thermal_radiation/transport_integrator=implicit",
+                "thermal_radiation/implicit_preconditioner=block-coarse",
                 "thermal_radiation/source_cfl=0",
                 "thermal_radiation/flux_limiter=none",
                 f"thermal_radiation/c_light={light_speed}",
@@ -338,6 +387,9 @@ def test_run():
         limited_step = 5.0e-4
         for resolution in (32, 64):
             basename = f"fld_implicit_harmonic_{resolution}"
+            # Keep an evolving dense-reference solve on the compatibility Jacobi
+            # path while the other resolution exercises the block-coarse fallback.
+            preconditioner = "jacobi" if resolution == 32 else "block-coarse"
             flags = transport_flags(
                 basename, resolution=resolution,
                 opacity=limited_opacity, nlim=1)
@@ -345,6 +397,7 @@ def test_run():
                 f"time/tlim={limited_step}",
                 f"output1/dt={limited_step}",
                 "thermal_radiation/transport_integrator=implicit",
+                f"thermal_radiation/implicit_preconditioner={preconditioner}",
                 "thermal_radiation/source_cfl=0",
                 "thermal_radiation/flux_limiter=harmonic",
                 "thermal_radiation/c_light=1.0",
@@ -363,6 +416,93 @@ def test_run():
                 assert min(final[group]) >= 0.0
                 assert sum(final[group]) == pytest.approx(
                     sum(initial[group]), rel=5.0e-10, abs=5.0e-11)
+
+        # Exercise every active dimension of the smallest supported factor-three
+        # hierarchy (9 -> 3 -> 1) at physical Neumann and Dirichlet faces.  The
+        # nonperiodic odd-sized grid is bipartite, unlike an odd periodic cycle.
+        hierarchy_step = 1.0e-3
+        hierarchy_common = transport_flags(
+            "unused_hierarchy_name", resolution=9, opacity=100.0, nlim=1)
+        hierarchy_common.extend([
+            "mesh/nx2=9", "mesh/nx3=9",
+            "meshblock/nx1=9", "meshblock/nx2=9", "meshblock/nx3=9",
+            "mesh/ix1_bc=outflow", "mesh/ox1_bc=outflow",
+            "mesh/ix2_bc=outflow", "mesh/ox2_bc=outflow",
+            "mesh/ix3_bc=outflow", "mesh/ox3_bc=outflow",
+            f"time/tlim={hierarchy_step}", f"output1/dt={hierarchy_step}",
+            "thermal_radiation/transport_integrator=implicit",
+            "thermal_radiation/implicit_preconditioner=block-coarse",
+            "thermal_radiation/source_cfl=0",
+            "thermal_radiation/flux_limiter=none",
+        ])
+        neumann_basename = "fld_implicit_hierarchy_9_neumann"
+        neumann_flags = [
+            (f"job/basename={neumann_basename}"
+             if flag.startswith("job/basename=") else flag)
+            for flag in hierarchy_common
+        ]
+        assert run_case(diffusion_input, neumann_flags)[0] == pytest.approx(
+            hierarchy_step)
+        neumann_initial = read_tab(
+            f"tab/{neumann_basename}.hydro_3t.00000.tab")
+        neumann_final = read_tab(
+            f"tab/{neumann_basename}.hydro_3t.00001.tab")
+        for group in ("erad00", "erad01"):
+            assert all(math.isfinite(value) for value in neumann_final[group])
+            assert min(neumann_final[group]) >= 0.0
+            assert sum(neumann_final[group]) == pytest.approx(
+                sum(neumann_initial[group]), rel=5.0e-10, abs=5.0e-11)
+            assert neumann_final[group] != pytest.approx(
+                neumann_initial[group], rel=1.0e-12, abs=1.0e-12)
+
+        jacobi_basename = "fld_implicit_hierarchy_9_jacobi"
+        jacobi_flags = [
+            (f"job/basename={jacobi_basename}"
+             if flag.startswith("job/basename=") else
+             "thermal_radiation/implicit_preconditioner=jacobi"
+             if flag.startswith("thermal_radiation/implicit_preconditioner=")
+             else flag)
+            for flag in hierarchy_common
+        ]
+        assert run_case(diffusion_input, jacobi_flags)[0] == pytest.approx(
+            hierarchy_step)
+        jacobi_final = read_tab(
+            f"tab/{jacobi_basename}.hydro_3t.00001.tab")
+        for group in ("erad00", "erad01"):
+            assert neumann_final[group] == pytest.approx(
+                jacobi_final[group], rel=3.0e-9, abs=3.0e-11)
+
+        dirichlet_input = input_variant(
+            diffusion_input, variants, "implicit_hierarchy_9_dirichlet",
+            {"thermal_radiation": {
+                "implicit_x2_inner_boundary": "dirichlet",
+                "implicit_x2_outer_boundary": "dirichlet",
+                "implicit_x2_inner_value": "0.0",
+                "implicit_x2_outer_value": "0.0",
+                "implicit_x3_inner_boundary": "dirichlet",
+                "implicit_x3_outer_boundary": "dirichlet",
+                "implicit_x3_inner_value": "0.0",
+                "implicit_x3_outer_value": "0.0",
+            }})
+        dirichlet_basename = "fld_implicit_hierarchy_9_dirichlet"
+        dirichlet_flags = [
+            (f"job/basename={dirichlet_basename}"
+             if flag.startswith("job/basename=") else flag)
+            for flag in hierarchy_common
+        ]
+        # Inspect the first x2 cell so the fixed-zero face produces a resolvable
+        # energy loss in the tabular slice at this short step.
+        dirichlet_flags.append("output1/slice_x2=-0.4444444444444444")
+        assert run_case(dirichlet_input, dirichlet_flags)[0] == pytest.approx(
+            hierarchy_step)
+        dirichlet_final = read_tab(
+            f"tab/{dirichlet_basename}.hydro_3t.00001.tab")
+        dirichlet_initial = read_tab(
+            f"tab/{dirichlet_basename}.hydro_3t.00000.tab")
+        for group in ("erad00", "erad01"):
+            assert all(math.isfinite(value) for value in dirichlet_final[group])
+            assert min(dirichlet_final[group]) >= 0.0
+            assert sum(dirichlet_final[group]) < sum(dirichlet_initial[group])
 
         # A vacuum face uses a zero-radiation ghost, but its frozen harmonic coefficient
         # must still enforce |F|<=alpha*c*E_face.  The cell-centered boundary gradient
@@ -387,6 +527,7 @@ def test_run():
             f"output1/dt={vacuum_step}",
             "mesh/ix1_bc=outflow", "mesh/ox1_bc=outflow",
             "thermal_radiation/initial_profile=uniform",
+            "thermal_radiation/implicit_preconditioner=block-coarse",
             "thermal_radiation/source_cfl=0",
             "thermal_radiation/flux_limiter=harmonic",
             "thermal_radiation/c_light=1.0",

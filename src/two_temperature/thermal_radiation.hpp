@@ -8,6 +8,8 @@
 //! \file thermal_radiation.hpp
 //! \brief Multigroup flux-limited diffusion coupled to two-temperature electrons.
 
+#include <vector>
+
 #include "athena.hpp"
 #include "materials/material_mixture.hpp"
 
@@ -92,6 +94,15 @@ class ThermalRadiation {
   bool implicit_report_ = false;
   Real implicit_tolerance_ = 1.0e-10;
   int implicit_max_iterations_ = 400;
+  // 0=point Jacobi, 1=factor-three global Galerkin V-cycle with symmetric red/black
+  // Gauss-Seidel smoothing and an exact global MeshBlock-root solve.  Incompatible
+  // MeshBlock sizes fall back to point Jacobi.
+  int implicit_preconditioner_mode_ = 0;
+  bool implicit_multilevel_enabled_ = false;
+  int implicit_multilevel_nx1_[2] = {0, 0};
+  int implicit_multilevel_nx2_[2] = {0, 0};
+  int implicit_multilevel_nx3_[2] = {0, 0};
+  int implicit_multilevel_offset_[2] = {0, 0};
   // 0=zero-gradient (Neumann), 1=fixed face value (Dirichlet), 2=zero ghost
   // value (the vacuum convention used by the existing explicit DCI boundary).
   int implicit_boundary_type_[6] = {0, 0, 0, 0, 0, 0};
@@ -118,6 +129,27 @@ class ThermalRadiation {
   DvceArray5D<Real> implicit_operator_;
   DvceArray5D<Real> implicit_coarse_scratch_;
 
+  // The multilevel preconditioner packs the 15^3 and 5^3 Galerkin diagonals into one
+  // allocation.  For a 45^3 MeshBlock this is (15^3+5^3)/45^3 = 3.84% of one fine
+  // field.  Existing fine solver arrays are reused for coarse right-hand sides/solutions.
+  DvceArray2D<Real> implicit_multilevel_vector_;
+  DvceArray3D<Real> implicit_multilevel_send_faces_;
+  DvceArray3D<Real> implicit_multilevel_recv_faces_;
+  DualArray2D<int> implicit_coarse_neighbor_gid_device_;
+  DualArray2D<int> implicit_coarse_neighbor_rank_device_;
+  DualArray2D<int> implicit_multilevel_block_parity_;
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm implicit_multilevel_comm_ = MPI_COMM_NULL;
+#endif
+
+  // Six root-face sums and one scalar are stored per global MeshBlock.  The dense root
+  // Cholesky factor is host-only and is rebuilt for each frozen group operator.
+  DualArray2D<Real> implicit_coarse_faces_;
+  DualArray1D<Real> implicit_coarse_vector_;
+  std::vector<int> implicit_coarse_neighbor_gid_;
+  std::vector<Real> implicit_coarse_scaling_;
+  std::vector<Real> implicit_coarse_cholesky_;
+
  public:
   // Public because nvcc requires any member enclosing an extended device lambda to have
   // public access.  These remain implementation details of SolveImplicitTransport().
@@ -132,6 +164,11 @@ class ThermalRadiation {
                              DvceArray5D<Real> &result, Real dt);
   Real ImplicitGlobalDot(const DvceArray5D<Real> &lhs,
                          const DvceArray5D<Real> &rhs) const;
+  void BuildImplicitBlockCoarsePreconditioner(Real dt);
+  void ExchangeImplicitMultilevelFaces(const DvceArray5D<Real> &field, int level);
+  void SolveImplicitBlockRootSystem();
+  void ApplyImplicitPreconditioner(const DvceArray5D<Real> &residual,
+                                   DvceArray5D<Real> &preconditioned, Real dt);
 };
 
 } // namespace two_temperature

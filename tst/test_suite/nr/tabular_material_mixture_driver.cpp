@@ -852,10 +852,10 @@ int main(int argc, char **argv) {
 
           // FLASH-style continuation must retain conservative energy above the old
           // common table endpoint for pure, mixed, and arbitrary-count compositions.
-          // Four times the old common endpoint also covers the 3.4x excess measured in
-          // the DCI laser-heated plume.
+          // Ten times the old common endpoint covers the 8.22x temperature reach found
+          // by the SHA-256-pinned historical DCI t=1 ns restart scan, with margin.
           constexpr Real old_common_maximum_temperature = 1000.0;
-          constexpr Real continued_temperature = 4000.0;
+          constexpr Real continued_temperature = 10000.0;
           const auto extrapolate_mix2 =
               extrapolate_mixture.CompositionFromY0(ych);
           const auto native1 = extrapolate_single_mixture.StateFromRhoTemperatures(

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-08-08",
+  "scope": "Exact-final-source compact DCI_3D smoke and restart",
+  "sha256": {
+    "athena_binary": "0e3513e15354cf12f17105b417ea30e34f84c003dc9e7f357659d7dbbf80a6c0",
+    "src/two_temperature/thermal_radiation.cpp": "ea670aae556672bd1e5c183b0e4a5e8aad251435a1a724949542290987067881",
+    "src/two_temperature/thermal_radiation.hpp": "95169d0668f319d7349a8e07c2e6b39f955cad6140e8681282782ac551a457d9",
+    "dci_3d_calibration.athinput": "834d405d43bad57ce148c594bc7a2c0c74d3690e79aee3d616cce5a611e8f1a6",
+    "material_manifest": "33232238f77139a869c5c4de50294259f2aed3763e3b1145e606c6b240b529e0"
+  },
+  "case": {
+    "mesh_cells": [100, 64, 64],
+    "meshblock_cells": [50, 32, 32],
+    "mpi_ranks": 7,
+    "gpu_model": "Tesla V100-SXM2-16GB",
+    "requested_implicit_preconditioner": "block-coarse",
+    "effective_preconditioner": "jacobi",
+    "fallback_reason": "MeshBlock dimensions are incompatible with the factor-three hierarchy"
+  },
+  "phase1": {
+    "exit_code": 0,
+    "cycles": 50,
+    "elapsed_seconds": 28.059480669995537,
+    "end_time_ns": 6.542658936097e-05,
+    "eos_bad": 0
+  },
+  "restart_phase": {
+    "exit_code": 0,
+    "start_cycle": 50,
+    "end_cycle": 60,
+    "elapsed_seconds": 6.486380947986618,
+    "end_time_ns": 7.389676454491e-05,
+    "last_dt_ns": 8.058203844891e-07,
+    "eos_floor": 15015,
+    "eos_bad": 0
+  },
+  "final_material_integrals": {
+    "total_mass": 0.2666893394554,
+    "ch_mass": 0.01926692255939,
+    "au_mass": 0.2474070118168,
+    "ch_fraction": 0.07224481712967802,
+    "au_fraction": 0.927697418734562,
+    "he_fraction_by_closure": 5.77641357599141e-05,
+    "fraction_sum": 1.0000000000000002
+  },
+  "local_run_directory": "DCI_3D/runs/smoke",
+  "caveat": "The endpoint is about 338 times earlier than the historical first bad-EOS observation at 0.025 ns and does not prove long-time elimination."
+}

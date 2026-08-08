@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-08-08",
+  "scope": "Two-cycle initialization-scale DCI_3D implicit-radiation convergence and memory probe",
+  "case": {
+    "mesh_cells": [315, 315, 315],
+    "meshblock_cells": [45, 45, 45],
+    "meshblocks": 343,
+    "radiation_groups": 20,
+    "mpi_ranks": 7,
+    "gpu_model": "Tesla V100-SXM2-16GB",
+    "gpu_ids": [0, 1, 2, 3, 4, 5, 6],
+    "cycle_limit": 2,
+    "implicit_preconditioner": "block-coarse",
+    "implicit_tolerance": 1e-10,
+    "implicit_max_iterations": 2000
+  },
+  "sha256": {
+    "athena_binary": "0e3513e15354cf12f17105b417ea30e34f84c003dc9e7f357659d7dbbf80a6c0",
+    "src/two_temperature/thermal_radiation.cpp": "ea670aae556672bd1e5c183b0e4a5e8aad251435a1a724949542290987067881",
+    "src/two_temperature/thermal_radiation.hpp": "95169d0668f319d7349a8e07c2e6b39f955cad6140e8681282782ac551a457d9",
+    "dci_3d.cpp": "dfc3de08fac1734f9318f2c4675986d7cc12d3c6313564cbdbceb7afdbb2bd3c",
+    "dci_3d.athinput": "46d20d35d1afdbe90e6822f62786c7a5b8848aefc8806678cc502e88358cb015",
+    "dci_3d_calibration.athinput": "834d405d43bad57ce148c594bc7a2c0c74d3690e79aee3d616cce5a611e8f1a6",
+    "run_case.py": "c63a3746b13746aa426c972bb425022403f84a4fb2f47f185a3ada722bde37f5",
+    "ch.2t_eos": "b29624877c7c90ed1d8c385bef6a7882b106dd8202bf0398301e2dee09faa0d8",
+    "au.2t_eos": "57d75330db3c6363d9cd13406f4614591776eb307a506d44053101faa3c0c27d",
+    "he.2t_eos": "aae12f2dde296992ad630094e5755f7f52baa0816c678771e075f4848a9d63d0",
+    "ch_20g.opacity": "47ee4b8ab3e7f249e4b7108ab5efbaabeee71bb7dd88cdea59f4b4c64738f94d",
+    "au_20g.opacity": "c233098c4d389f44ed4d7490172f8e0cd40e83b1023ab6132b7dc4b0742057e5",
+    "he_20g.opacity": "1e0daba15df1a23f5f558663e867dda181886ea53b0dbad119beb6fa1215f420"
+  },
+  "monitored_run": {
+    "exit_code": 0,
+    "elapsed_seconds": 25.054178421007236,
+    "peak_used_mib_by_gpu": [12622, 12622, 12621, 12622, 12622, 12622, 12620],
+    "local_run_directory": "DCI_3D/runs/fullscale_implicit_global_exact_final_20260808",
+    "runner_arguments": [
+      "--mode", "calibrate",
+      "--nlim", "2",
+      "--ranks", "7",
+      "--gpus", "0,1,2,3,4,5,6"
+    ]
+  },
+  "report_enabled_repeat": {
+    "exit_code": 0,
+    "wall_seconds": 24.03038066,
+    "maximum_pcg_iterations_by_cycle": [67, 149],
+    "maximum_true_relative_residual_by_cycle": [9.782791e-11, 1.181642e-10],
+    "true_residual_acceptance_factor": 16,
+    "extra_override": "thermal_radiation/implicit_report=true",
+    "stdout_report_lines": [
+      "# implicit thermal radiation: groups=20 max_iterations=67 max_relative_residual=9.782791e-11",
+      "# implicit thermal radiation: groups=20 max_iterations=149 max_relative_residual=1.181642e-10"
+    ]
+  },
+  "caveats": [
+    "This probe covers only two initialization-scale cycles.",
+    "It does not establish sustained production performance or long-time physics.",
+    "The full logs and run_status.json are local ignored run artifacts; this file is their tracked compact record."
+  ]
+}

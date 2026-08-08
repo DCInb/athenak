@@ -127,6 +127,18 @@ so laser-deposited energy is not retained in the conservative state while temper
 pressure are pinned to the endpoint.  This follows FLASH's use of a wider configured EOS
 temperature bracket; the original `clamp` and `error` policies remain available.
 
+The read-only historical scanner in `historical_eos_restart_scan/` tests this repair on
+the SHA-256-pinned legacy CH/He restart at `1 ns`, cycle 48420.  Across all `33554432`
+active cells, the old `clamp` policy finds `1688558` cells currently above an ion or
+electron endpoint and a maximum target/endpoint energy ratio of `8.016194089`.
+`flash-extrapolate` recovers those same stored component energies with no high-energy
+flags or nonpositive/non-finite states; its maximum recovered electron temperature is
+`9.541060299e8 K`.  The JSON evidence in `evidence/historical_eos_restart_t1.json`
+records the restart/table hashes and energy residuals.  This is a same-state recovery of
+the old two-material layout, not a clean trajectory replay or evidence for a CH/Au/He
+restart.  Neither the historical producer executable hash nor the exact first offending
+cell at the `0.025 ns` history cadence was preserved.
+
 `run_case.py` verifies the source manifest, copies the six tables and manifest into the
 owned run directory, and launches with run-relative `material_tables/...` paths.  Restarts
 therefore see byte-identical tables and the same auto-recorded table fingerprints, and the
@@ -147,15 +159,22 @@ flux-limited cell receives the causal regularization
 exchanged before the solve, so both MPI ranks use the same arithmetic coefficient on a
 shared face even when the preceding implicit-conduction step refreshed only interior
 temperatures.  A physical vacuum face separately enforces
-`D_face <= flux_limit_coefficient*dx_normal/2`; the matrix operator, Jacobi diagonal, and
-`rad_Pesc` surface flux all use that same capped face coefficient.  The resulting
-centered finite-volume backward-Euler system is solved by Jacobi-preconditioned conjugate
-gradients (PCG), not by the explicit AP/upwind face flux.  This first implicit
-implementation rejects multilevel meshes rather than applying an unverified coarse-fine
-diffusion operator:
+`D_face <= flux_limit_coefficient*dx_normal/2`; the matrix operator, preconditioner
+diagonals, and `rad_Pesc` surface flux all use that same capped face coefficient.  The
+resulting centered finite-volume backward-Euler system is solved by preconditioned
+conjugate gradients (PCG), not by the explicit AP/upwind face flux.  DCI selects the
+fixed linear `block-coarse` preconditioner.  On its 45-cubed MeshBlocks this is a true
+global Galerkin V-cycle, `45^3 -> 15^3 -> 5^3 -> one value/MeshBlock`, with exact-sum
+restriction, piecewise-constant prolongation, MPI face exchanges, symmetric red/black
+Gauss-Seidel sweeps, and an exact replicated 343-by-343 root Cholesky solve.  The
+  default `jacobi` option remains available, and incompatible block sizes fall back to
+  point Jacobi.  Implicit transport rejects
+SMR/AMR and shear-periodic boundaries; the global red/black hierarchy additionally
+rejects an odd periodic coarse graph:
 
 ```text
 transport_integrator = implicit
+implicit_preconditioner = block-coarse
 implicit_tolerance = 1.0e-10
 implicit_max_iterations = 2000
 implicit_x1_inner_boundary = vacuum
@@ -211,16 +230,21 @@ macro timestep is independent of `c`, because `source_cfl` remains active as qua
 above.
 
 On the exact implementation and decks described here, 10 focused CPU tests passed, the
-CUDA/MPI target built, and compact seven-GPU initialization validation passed.  A
-seven-GPU 50-cycle phase-1 smoke also passed in 27.36 s, ending at
-`t=6.542658936097e-05 ns` with `eos_bad=0`.  Its domain-integrated CH/Au/He mass fractions
-were respectively `0.07224481712971552`, `0.9276974187345620`, and
-`5.776413572244726e-05`, summing to one within roundoff.  This time is about 382 times
-shorter than the historical first bad-EOS observation at `0.025 ns`; the smoke therefore
-checks integration and early behavior, not long-time elimination of the original DCI
-symptom.  It is also not evidence for SMR/AMR, a nonlinear coefficient iteration, or
-full-scale PCG convergence/performance.  Quantitative vacuum-loss/energy closure,
-restart, long-horizon, and production-scale gates below remain required.
+one-rank/two-rank MPI regression passed, the CUDA/MPI target built, and compact seven-GPU
+initialization validation passed.  A seven-GPU smoke advanced 50 cycles in 28.06 s and
+then restarted for 10 more cycles in 6.49 s.  It ended at
+`t=7.389676454491e-05 ns` with `eos_bad=0`; its domain-integrated CH/Au/He mass fractions
+were respectively `0.07224481712967802`, `0.9276974187345620`, and
+`5.776413575991410e-05`, summing to one within roundoff.  The compact `50 x 32 x 32`
+MeshBlocks deliberately exercise the documented point-Jacobi fallback because their
+dimensions do not support the factor-three hierarchy.  The endpoint is about 338 times
+earlier than the historical first bad-EOS observation at `0.025 ns`; the smoke therefore
+checks integration, fallback behavior, restart, and early EOS behavior, not long-time
+elimination of the original DCI symptom.  It is also not evidence for SMR/AMR, a
+nonlinear coefficient iteration, or full-scale PCG convergence/performance.
+Quantitative vacuum-loss/energy closure, long-horizon, and production-scale gates below
+remain required.  A compact tracked record is in
+`evidence/smoke_final_20260808.json`.
 
 ## Laser
 
@@ -312,9 +336,19 @@ for plain `z_order`, even though it moves about twice as many rays across ranks;
 radially interleaved map that balances near-axis work more evenly on paper was the
 slowest of the three.
 
-Those rank-map timings also predate the current 20-group Jacobi-PCG transport.  Full-scale
-iteration counts, convergence, memory use, and runtime are unproven.  A multigrid or
-stronger preconditioner is future work if Jacobi-PCG is not adequate at production scale.
+Those rank-map timings predate implicit radiation and are not comparable transport
+benchmarks.  Binary
+`0e3513e15354cf12f17105b417ea30e34f84c003dc9e7f357659d7dbbf80a6c0` passed an exact
+two-cycle calibration probe on the 315-cubed mesh and seven V100s.  The monitored run
+took 25.05 s and peaked at 12620--12622 MiB per GPU (77.0 percent).  A separate
+report-enabled repeat of the same binary and input recorded maximum PCG counts of 67 and
+149 and independently recomputed maximum true residuals of `9.782791e-11` and
+`1.181642e-10`; the latter is the documented small recursive-to-true residual drift and
+remains within the solver's guarded acceptance factor.  A compact tracked record is in
+`evidence/radiation_final_probe_20260808.json`; full local logs for the monitored run are
+in the ignored `runs/fullscale_implicit_global_exact_final_20260808/`.  This establishes
+initialization-scale solver convergence and memory fit, not sustained production
+performance or long-time physics.
 
 History is written every `0.025 ns`.  Its 22 reductions include laser deposited energy
 and power, outward radiation power, total/CH mass, material/kinetic/magnetic/ion/electron

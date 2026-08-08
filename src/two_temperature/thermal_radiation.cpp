@@ -20,6 +20,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/nghbr_index.hpp"
 #include "parameter_input.hpp"
 #include "two_temperature/opacity_table.hpp"
 #include "two_temperature/thermal_radiation.hpp"
@@ -58,6 +59,337 @@ Real ImplicitFrozenFaceCoefficient(const Real center, const Real neighbor,
                                    const Real vacuum_face_cap) {
   const Real arithmetic_face = 0.5*(center+neighbor);
   return vacuum_face ? fmin(arithmetic_face, vacuum_face_cap) : arithmetic_face;
+}
+
+// Contribution of a face conductance to the diagonal of the homogeneous operator.
+// Internal and periodic ghosts are independent neighboring unknowns.  At a physical
+// face, zero-gradient ghosts equal the boundary cell, fixed-value ghosts equal its
+// negative, and vacuum ghosts vanish.
+KOKKOS_INLINE_FUNCTION
+Real ImplicitFaceDiagonalWeight(const bool physical_face, const int boundary_type) {
+  if (!physical_face) return 1.0;
+  if (boundary_type == 0) return 0.0;
+  if (boundary_type == 1) return 2.0;
+  return 1.0;
+}
+
+// Sum the fine-grid conductances crossing one face of a piecewise-constant aggregate.
+// This is the corresponding off-diagonal magnitude of the Galerkin matrix P^T A P.
+// direction is 0/1/2 for x1/x2/x3 and side is -1/+1.  The aggregate extents are in
+// fine cells; inactive dimensions therefore have extent one.
+KOKKOS_INLINE_FUNCTION
+Real ImplicitAggregateFaceConductance(
+    const DvceArray5D<Real> coefficient, const int m, const int direction,
+    const int side, const int ci, const int cj, const int ck,
+    const int aggregate1, const int aggregate2, const int aggregate3,
+    const int is, const int js, const int ks, const Real dt, const Real dx,
+    const bool vacuum_face, const Real vacuum_face_cap) {
+  Real sum = 0.0;
+  if (direction == 0) {
+    const int i = is+ci*aggregate1+(side > 0 ? aggregate1-1 : 0);
+    for (int ok = 0; ok < aggregate3; ++ok) {
+      const int k = ks+ck*aggregate3+ok;
+      for (int oj = 0; oj < aggregate2; ++oj) {
+        const int j = js+cj*aggregate2+oj;
+        sum += ImplicitFrozenFaceCoefficient(
+            coefficient(m, 0, k, j, i), coefficient(m, 0, k, j, i+side),
+            vacuum_face, vacuum_face_cap);
+      }
+    }
+  } else if (direction == 1) {
+    const int j = js+cj*aggregate2+(side > 0 ? aggregate2-1 : 0);
+    for (int ok = 0; ok < aggregate3; ++ok) {
+      const int k = ks+ck*aggregate3+ok;
+      for (int oi = 0; oi < aggregate1; ++oi) {
+        const int i = is+ci*aggregate1+oi;
+        sum += ImplicitFrozenFaceCoefficient(
+            coefficient(m, 0, k, j, i), coefficient(m, 0, k, j+side, i),
+            vacuum_face, vacuum_face_cap);
+      }
+    }
+  } else {
+    const int k = ks+ck*aggregate3+(side > 0 ? aggregate3-1 : 0);
+    for (int oj = 0; oj < aggregate2; ++oj) {
+      const int j = js+cj*aggregate2+oj;
+      for (int oi = 0; oi < aggregate1; ++oi) {
+        const int i = is+ci*aggregate1+oi;
+        sum += ImplicitFrozenFaceCoefficient(
+            coefficient(m, 0, k, j, i), coefficient(m, 0, k+side, j, i),
+            vacuum_face, vacuum_face_cap);
+      }
+    }
+  }
+  return dt*sum/(dx*dx);
+}
+
+// Treat the active interior of an existing fine-grid scratch field as packed storage for
+// the much smaller aggregate hierarchy.  This avoids a second 3.84%-of-field allocation.
+KOKKOS_INLINE_FUNCTION
+Real ImplicitPackedScratchValue(
+    const DvceArray5D<Real> scratch, const int m, const int packed,
+    const int nx1, const int nx2, const int is, const int js, const int ks) {
+  const int plane = nx1*nx2;
+  const int k = packed/plane;
+  const int remainder = packed-k*plane;
+  const int j = remainder/nx1;
+  const int i = remainder-j*nx1;
+  return scratch(m, 0, ks+k, js+j, is+i);
+}
+
+KOKKOS_INLINE_FUNCTION
+void SetImplicitPackedScratchValue(
+    const DvceArray5D<Real> scratch, const int m, const int packed,
+    const int nx1, const int nx2, const int is, const int js, const int ks,
+    const Real value) {
+  const int plane = nx1*nx2;
+  const int k = packed/plane;
+  const int remainder = packed-k*plane;
+  const int j = remainder/nx1;
+  const int i = remainder-j*nx1;
+  scratch(m, 0, ks+k, js+j, is+i) = value;
+}
+
+// Sum -A_ij*x_j over the neighbors that remain inside one MeshBlock aggregate grid.
+// Global multilevel callers add the cross-MeshBlock face terms after exchanging the
+// corresponding aggregate field.
+KOKKOS_INLINE_FUNCTION
+Real ImplicitAggregateInternalNeighborSum(
+    const DvceArray5D<Real> coefficient, const DvceArray5D<Real> solution,
+    const int m, const int packed, const int ci, const int cj, const int ck,
+    const int cnx1, const int cnx2, const int cnx3,
+    const int aggregate1, const int aggregate2, const int aggregate3,
+    const int fine_nx1, const int fine_nx2, const int is, const int js, const int ks,
+    const Real dt, const Real dx1, const Real dx2, const Real dx3,
+    const bool multi_d, const bool three_d) {
+  Real sum = 0.0;
+  if (ci > 0) {
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 0, -1, ci, cj, ck,
+        aggregate1, aggregate2, aggregate3, is, js, ks,
+        dt, dx1, false, 0.0)*ImplicitPackedScratchValue(
+            solution, m, packed-1, fine_nx1, fine_nx2, is, js, ks);
+  }
+  if (ci < cnx1-1) {
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 0, 1, ci, cj, ck,
+        aggregate1, aggregate2, aggregate3, is, js, ks,
+        dt, dx1, false, 0.0)*ImplicitPackedScratchValue(
+            solution, m, packed+1, fine_nx1, fine_nx2, is, js, ks);
+  }
+  if (multi_d) {
+    if (cj > 0) {
+      sum += ImplicitAggregateFaceConductance(
+          coefficient, m, 1, -1, ci, cj, ck,
+          aggregate1, aggregate2, aggregate3, is, js, ks,
+          dt, dx2, false, 0.0)*ImplicitPackedScratchValue(
+              solution, m, packed-cnx1, fine_nx1, fine_nx2, is, js, ks);
+    }
+    if (cj < cnx2-1) {
+      sum += ImplicitAggregateFaceConductance(
+          coefficient, m, 1, 1, ci, cj, ck,
+          aggregate1, aggregate2, aggregate3, is, js, ks,
+          dt, dx2, false, 0.0)*ImplicitPackedScratchValue(
+              solution, m, packed+cnx1, fine_nx1, fine_nx2, is, js, ks);
+    }
+  }
+  if (three_d) {
+    const int plane = cnx1*cnx2;
+    if (ck > 0) {
+      sum += ImplicitAggregateFaceConductance(
+          coefficient, m, 2, -1, ci, cj, ck,
+          aggregate1, aggregate2, aggregate3, is, js, ks,
+          dt, dx3, false, 0.0)*ImplicitPackedScratchValue(
+              solution, m, packed-plane, fine_nx1, fine_nx2, is, js, ks);
+    }
+    if (ck < cnx3-1) {
+      sum += ImplicitAggregateFaceConductance(
+          coefficient, m, 2, 1, ci, cj, ck,
+          aggregate1, aggregate2, aggregate3, is, js, ks,
+          dt, dx3, false, 0.0)*ImplicitPackedScratchValue(
+              solution, m, packed+plane, fine_nx1, fine_nx2, is, js, ks);
+    }
+  }
+  return sum;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ImplicitFineBlockInternalNeighborSum(
+    const DvceArray5D<Real> coefficient, const DvceArray5D<Real> solution,
+    const int m, const int k, const int j, const int i,
+    const int is, const int ie, const int js, const int je, const int ks, const int ke,
+    const Real dt, const Real dx1, const Real dx2, const Real dx3,
+    const bool multi_d, const bool three_d) {
+  const Real kc = coefficient(m, 0, k, j, i);
+  Real sum = 0.0;
+  const Real scale1 = dt/(dx1*dx1);
+  if (i > is) {
+    sum += scale1*0.5*(kc+coefficient(m, 0, k, j, i-1))*
+        solution(m, 0, k, j, i-1);
+  }
+  if (i < ie) {
+    sum += scale1*0.5*(kc+coefficient(m, 0, k, j, i+1))*
+        solution(m, 0, k, j, i+1);
+  }
+  if (multi_d) {
+    const Real scale2 = dt/(dx2*dx2);
+    if (j > js) {
+      sum += scale2*0.5*(kc+coefficient(m, 0, k, j-1, i))*
+          solution(m, 0, k, j-1, i);
+    }
+    if (j < je) {
+      sum += scale2*0.5*(kc+coefficient(m, 0, k, j+1, i))*
+          solution(m, 0, k, j+1, i);
+    }
+  }
+  if (three_d) {
+    const Real scale3 = dt/(dx3*dx3);
+    if (k > ks) {
+      sum += scale3*0.5*(kc+coefficient(m, 0, k-1, j, i))*
+          solution(m, 0, k-1, j, i);
+    }
+    if (k < ke) {
+      sum += scale3*0.5*(kc+coefficient(m, 0, k+1, j, i))*
+          solution(m, 0, k+1, j, i);
+    }
+  }
+  return sum;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ImplicitFineGlobalNeighborSum(
+    const DvceArray5D<Real> coefficient, const DvceArray5D<Real> solution,
+    const DvceArray3D<Real> remote_faces, const DvceArray2D<int> neighbor_gid,
+    const DvceArray2D<int> neighbor_rank, const int m, const int gid,
+    const int gid0, const int my_rank, const int k, const int j, const int i,
+    const int is, const int ie, const int js, const int je, const int ks, const int ke,
+    const int nx1, const int nx2, const Real dt, const Real dx1, const Real dx2,
+    const Real dx3, const bool multi_d, const bool three_d) {
+  Real sum = ImplicitFineBlockInternalNeighborSum(
+      coefficient, solution, m, k, j, i, is, ie, js, je, ks, ke,
+      dt, dx1, dx2, dx3, multi_d, three_d);
+  const Real kc = coefficient(m, 0, k, j, i);
+  if (i == is && neighbor_gid(gid, 0) >= 0) {
+    const Real value = neighbor_rank(gid, 0) == my_rank ?
+        solution(neighbor_gid(gid, 0)-gid0, 0, k, j, ie) :
+        remote_faces(m, 0, (k-ks)*nx2+(j-js));
+    sum += dt*0.5*(kc+coefficient(m, 0, k, j, i-1))*value/(dx1*dx1);
+  }
+  if (i == ie && neighbor_gid(gid, 1) >= 0) {
+    const Real value = neighbor_rank(gid, 1) == my_rank ?
+        solution(neighbor_gid(gid, 1)-gid0, 0, k, j, is) :
+        remote_faces(m, 1, (k-ks)*nx2+(j-js));
+    sum += dt*0.5*(kc+coefficient(m, 0, k, j, i+1))*value/(dx1*dx1);
+  }
+  if (multi_d && j == js && neighbor_gid(gid, 2) >= 0) {
+    const Real value = neighbor_rank(gid, 2) == my_rank ?
+        solution(neighbor_gid(gid, 2)-gid0, 0, k, je, i) :
+        remote_faces(m, 2, (k-ks)*nx1+(i-is));
+    sum += dt*0.5*(kc+coefficient(m, 0, k, j-1, i))*value/(dx2*dx2);
+  }
+  if (multi_d && j == je && neighbor_gid(gid, 3) >= 0) {
+    const Real value = neighbor_rank(gid, 3) == my_rank ?
+        solution(neighbor_gid(gid, 3)-gid0, 0, k, js, i) :
+        remote_faces(m, 3, (k-ks)*nx1+(i-is));
+    sum += dt*0.5*(kc+coefficient(m, 0, k, j+1, i))*value/(dx2*dx2);
+  }
+  if (three_d && k == ks && neighbor_gid(gid, 4) >= 0) {
+    const Real value = neighbor_rank(gid, 4) == my_rank ?
+        solution(neighbor_gid(gid, 4)-gid0, 0, ke, j, i) :
+        remote_faces(m, 4, (j-js)*nx1+(i-is));
+    sum += dt*0.5*(kc+coefficient(m, 0, k-1, j, i))*value/(dx3*dx3);
+  }
+  if (three_d && k == ke && neighbor_gid(gid, 5) >= 0) {
+    const Real value = neighbor_rank(gid, 5) == my_rank ?
+        solution(neighbor_gid(gid, 5)-gid0, 0, ks, j, i) :
+        remote_faces(m, 5, (j-js)*nx1+(i-is));
+    sum += dt*0.5*(kc+coefficient(m, 0, k+1, j, i))*value/(dx3*dx3);
+  }
+  return sum;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ImplicitAggregateGlobalNeighborSum(
+    const DvceArray5D<Real> coefficient, const DvceArray5D<Real> solution,
+    const DvceArray3D<Real> remote_faces, const DvceArray2D<int> neighbor_gid,
+    const DvceArray2D<int> neighbor_rank, const int m, const int gid,
+    const int gid0, const int my_rank, const int packed,
+    const int level_offset, const int ci, const int cj, const int ck,
+    const int cnx1, const int cnx2, const int cnx3,
+    const int aggregate1, const int aggregate2, const int aggregate3,
+    const int fine_nx1, const int fine_nx2, const int is, const int js, const int ks,
+    const Real dt, const Real dx1, const Real dx2, const Real dx3,
+    const bool multi_d, const bool three_d) {
+  Real sum = ImplicitAggregateInternalNeighborSum(
+      coefficient, solution, m, packed, ci, cj, ck, cnx1, cnx2, cnx3,
+      aggregate1, aggregate2, aggregate3, fine_nx1, fine_nx2,
+      is, js, ks, dt, dx1, dx2, dx3, multi_d, three_d);
+  if (ci == 0 && neighbor_gid(gid, 0) >= 0) {
+    const int peer = level_offset+(ck*cnx2+cj)*cnx1+(cnx1-1);
+    const Real value = neighbor_rank(gid, 0) == my_rank ?
+        ImplicitPackedScratchValue(
+            solution, neighbor_gid(gid, 0)-gid0, peer,
+            fine_nx1, fine_nx2, is, js, ks) :
+        remote_faces(m, 0, ck*cnx2+cj);
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 0, -1, ci, cj, ck, aggregate1, aggregate2, aggregate3,
+        is, js, ks, dt, dx1, false, 0.0)*value;
+  }
+  if (ci == cnx1-1 && neighbor_gid(gid, 1) >= 0) {
+    const int peer = level_offset+(ck*cnx2+cj)*cnx1;
+    const Real value = neighbor_rank(gid, 1) == my_rank ?
+        ImplicitPackedScratchValue(
+            solution, neighbor_gid(gid, 1)-gid0, peer,
+            fine_nx1, fine_nx2, is, js, ks) :
+        remote_faces(m, 1, ck*cnx2+cj);
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 0, 1, ci, cj, ck, aggregate1, aggregate2, aggregate3,
+        is, js, ks, dt, dx1, false, 0.0)*value;
+  }
+  if (multi_d && cj == 0 && neighbor_gid(gid, 2) >= 0) {
+    const int peer = level_offset+(ck*cnx2+(cnx2-1))*cnx1+ci;
+    const Real value = neighbor_rank(gid, 2) == my_rank ?
+        ImplicitPackedScratchValue(
+            solution, neighbor_gid(gid, 2)-gid0, peer,
+            fine_nx1, fine_nx2, is, js, ks) :
+        remote_faces(m, 2, ck*cnx1+ci);
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 1, -1, ci, cj, ck, aggregate1, aggregate2, aggregate3,
+        is, js, ks, dt, dx2, false, 0.0)*value;
+  }
+  if (multi_d && cj == cnx2-1 && neighbor_gid(gid, 3) >= 0) {
+    const int peer = level_offset+(ck*cnx2)*cnx1+ci;
+    const Real value = neighbor_rank(gid, 3) == my_rank ?
+        ImplicitPackedScratchValue(
+            solution, neighbor_gid(gid, 3)-gid0, peer,
+            fine_nx1, fine_nx2, is, js, ks) :
+        remote_faces(m, 3, ck*cnx1+ci);
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 1, 1, ci, cj, ck, aggregate1, aggregate2, aggregate3,
+        is, js, ks, dt, dx2, false, 0.0)*value;
+  }
+  if (three_d && ck == 0 && neighbor_gid(gid, 4) >= 0) {
+    const int peer = level_offset+((cnx3-1)*cnx2+cj)*cnx1+ci;
+    const Real value = neighbor_rank(gid, 4) == my_rank ?
+        ImplicitPackedScratchValue(
+            solution, neighbor_gid(gid, 4)-gid0, peer,
+            fine_nx1, fine_nx2, is, js, ks) :
+        remote_faces(m, 4, cj*cnx1+ci);
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 2, -1, ci, cj, ck, aggregate1, aggregate2, aggregate3,
+        is, js, ks, dt, dx3, false, 0.0)*value;
+  }
+  if (three_d && ck == cnx3-1 && neighbor_gid(gid, 5) >= 0) {
+    const int peer = level_offset+cj*cnx1+ci;
+    const Real value = neighbor_rank(gid, 5) == my_rank ?
+        ImplicitPackedScratchValue(
+            solution, neighbor_gid(gid, 5)-gid0, peer,
+            fine_nx1, fine_nx2, is, js, ks) :
+        remote_faces(m, 5, cj*cnx1+ci);
+    sum += ImplicitAggregateFaceConductance(
+        coefficient, m, 2, 1, ci, cj, ck, aggregate1, aggregate2, aggregate3,
+        is, js, ks, dt, dx3, false, 0.0)*value;
+  }
+  return sum;
 }
 
 // The face flux can be written as
@@ -493,6 +825,19 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
       "thermal_radiation", "implicit_max_iterations", 400);
   implicit_report_ = pin->GetOrAddBoolean(
       "thermal_radiation", "implicit_report", false);
+  const std::string implicit_preconditioner = pin->GetOrAddString(
+      "thermal_radiation", "implicit_preconditioner", "jacobi");
+  if (implicit_preconditioner == "jacobi") {
+    implicit_preconditioner_mode_ = 0;
+  } else if (implicit_preconditioner == "block-coarse") {
+    implicit_preconditioner_mode_ = 1;
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Unknown <thermal_radiation>/implicit_preconditioner='"
+              << implicit_preconditioner
+              << "'; expected jacobi or block-coarse" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (!std::isfinite(implicit_tolerance_) ||
       implicit_tolerance_ < minimum_implicit_tolerance ||
       implicit_tolerance_ >= 1.0 ||
@@ -508,6 +853,15 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
               << std::endl << "Implicit thermal-radiation transport does not yet "
               << "support SMR/AMR" << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+  if (implicit_transport_) {
+    for (int face = BoundaryFace::inner_x1; face <= BoundaryFace::outer_x3; ++face) {
+      if (ppack->pmesh->mesh_bcs[face] == BoundaryFlag::shear_periodic) {
+        ImplicitRadiationError(
+            "Implicit thermal-radiation transport does not support shear-periodic "
+            "boundaries");
+      }
+    }
   }
 
   const char *boundary_names[6] = {
@@ -743,12 +1097,168 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
     allocate(implicit_preconditioned_);
     allocate(implicit_operator_);
     allocate(implicit_coarse_scratch_);
+
+    if (implicit_preconditioner_mode_ == 1) {
+      // Two factor-three aggregate levels are available whenever every active
+      // MeshBlock dimension is divisible by nine.  The final (possibly non-factor-three)
+      // collapse is the existing one-value-per-MeshBlock root; for DCI this gives
+      // 45^3 -> 15^3 -> 5^3 -> 1^3.  Other block sizes retain point Jacobi.
+      const auto supports_two_levels = [](const int n) {
+        return n == 1 || (n >= 9 && n%9 == 0);
+      };
+      const bool supports_multilevel = supports_two_levels(indcs.nx1) &&
+          supports_two_levels(indcs.nx2) && supports_two_levels(indcs.nx3);
+      // Red/black smoothing is not a two-coloring across an odd periodic wrap.  Reject
+      // that combination explicitly instead of silently applying a non-SPD smoother
+      // inside ordinary conjugate gradient.
+      const bool odd_periodic_x1 =
+          ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::periodic &&
+          ppack->pmesh->mesh_indcs.nx1%2 != 0;
+      const bool odd_periodic_x2 = ppack->pmesh->multi_d &&
+          ppack->pmesh->mesh_bcs[BoundaryFace::inner_x2] == BoundaryFlag::periodic &&
+          ppack->pmesh->mesh_indcs.nx2%2 != 0;
+      const bool odd_periodic_x3 = ppack->pmesh->three_d &&
+          ppack->pmesh->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic &&
+          ppack->pmesh->mesh_indcs.nx3%2 != 0;
+      if (supports_multilevel &&
+          (odd_periodic_x1 || odd_periodic_x2 || odd_periodic_x3)) {
+        ImplicitRadiationError(
+            "The block-coarse implicit-radiation multilevel preconditioner does not "
+            "support an odd number of cells in a periodic direction");
+      }
+      implicit_multilevel_enabled_ = supports_multilevel;
+      if (implicit_multilevel_enabled_) {
+        implicit_multilevel_nx1_[0] = indcs.nx1 == 1 ? 1 : indcs.nx1/3;
+        implicit_multilevel_nx2_[0] = indcs.nx2 == 1 ? 1 : indcs.nx2/3;
+        implicit_multilevel_nx3_[0] = indcs.nx3 == 1 ? 1 : indcs.nx3/3;
+        implicit_multilevel_nx1_[1] = indcs.nx1 == 1 ? 1 : indcs.nx1/9;
+        implicit_multilevel_nx2_[1] = indcs.nx2 == 1 ? 1 : indcs.nx2/9;
+        implicit_multilevel_nx3_[1] = indcs.nx3 == 1 ? 1 : indcs.nx3/9;
+        const int level1_cells = implicit_multilevel_nx1_[0]*
+            implicit_multilevel_nx2_[0]*implicit_multilevel_nx3_[0];
+        const int level2_cells = implicit_multilevel_nx1_[1]*
+            implicit_multilevel_nx2_[1]*implicit_multilevel_nx3_[1];
+        implicit_multilevel_offset_[0] = 0;
+        implicit_multilevel_offset_[1] = level1_cells;
+        Kokkos::realloc(
+            implicit_multilevel_vector_, nmb, level1_cells+level2_cells);
+        const int max_face_cells = std::max(
+            std::max(indcs.nx2*indcs.nx3, indcs.nx1*indcs.nx3),
+            indcs.nx1*indcs.nx2);
+        Kokkos::realloc(implicit_multilevel_send_faces_, nmb, 6, max_face_cells);
+        Kokkos::realloc(implicit_multilevel_recv_faces_, nmb, 6, max_face_cells);
+#if MPI_PARALLEL_ENABLED
+        if (MPI_Comm_dup(MPI_COMM_WORLD, &implicit_multilevel_comm_) != MPI_SUCCESS) {
+          ImplicitRadiationError(
+              "Could not duplicate the implicit-radiation multilevel communicator");
+        }
+#endif
+      }
+
+      if (implicit_multilevel_enabled_) {
+        const int ncoarse = ppack->pmesh->nmb_total;
+        if (ncoarse > 1024) {
+          ImplicitRadiationError(
+              "The dense implicit-radiation root solve supports at most 1024 MeshBlocks");
+        }
+        Kokkos::realloc(implicit_coarse_faces_, ncoarse, 6);
+        Kokkos::realloc(implicit_coarse_vector_, ncoarse);
+        Kokkos::realloc(implicit_coarse_neighbor_gid_device_, ncoarse, 6);
+        Kokkos::realloc(implicit_coarse_neighbor_rank_device_, ncoarse, 6);
+        Kokkos::realloc(implicit_multilevel_block_parity_, ncoarse, 3);
+        implicit_coarse_neighbor_gid_.assign(6*ncoarse, -1);
+        implicit_coarse_scaling_.resize(ncoarse);
+        implicit_coarse_cholesky_.resize(
+            static_cast<std::size_t>(ncoarse)*static_cast<std::size_t>(ncoarse));
+
+        // The implicit path already rejects multilevel meshes, so each face has exactly
+        // one neighbor.  Gather that fixed global topology once; subsequent groups need
+        // communicate only their six scalar face-conductance sums per MeshBlock.
+        const int offsets[6][3] = {
+            {-1, 0, 0}, {1, 0, 0}, {0, -1, 0},
+            {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
+        const int active_faces = ppack->pmesh->three_d ? 6 :
+            (ppack->pmesh->multi_d ? 4 : 2);
+        for (int m = 0; m < ppack->nmb_thispack; ++m) {
+          const int gid = ppack->pmb->mb_gid.h_view(m);
+          for (int face = 0; face < active_faces; ++face) {
+            const int neighbor_index = NeighborIndex(
+                offsets[face][0], offsets[face][1], offsets[face][2], 0, 0);
+            implicit_coarse_neighbor_gid_[6*gid+face] =
+                ppack->pmb->nghbr.h_view(m, neighbor_index).gid;
+          }
+        }
+  #if MPI_PARALLEL_ENABLED
+        MPI_Allreduce(MPI_IN_PLACE, implicit_coarse_neighbor_gid_.data(), 6*ncoarse,
+                      MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  #endif
+        for (int gid = 0; gid < ncoarse; ++gid) {
+          for (int face = 0; face < active_faces; ++face) {
+            const int neighbor = implicit_coarse_neighbor_gid_[6*gid+face];
+            if (neighbor >= ncoarse) {
+              ImplicitRadiationError(
+                  "Invalid MeshBlock neighbor while constructing the implicit-radiation "
+                  "coarse topology");
+            }
+            if (neighbor >= 0 &&
+                implicit_coarse_neighbor_gid_[6*neighbor+(face^1)] != gid) {
+              ImplicitRadiationError(
+                  "Non-reciprocal MeshBlock face in the implicit-radiation coarse "
+                  "topology");
+            }
+            const int neighbor_rank = neighbor < 0 ? -1 :
+                ppack->pmesh->rank_eachmb[neighbor];
+            if (neighbor_rank >= global_variable::nranks || neighbor_rank < -1 ||
+                (neighbor >= 0 && (neighbor <
+                    ppack->pmesh->gids_eachrank[neighbor_rank] || neighbor >=
+                    ppack->pmesh->gids_eachrank[neighbor_rank]+
+                    ppack->pmesh->nmb_eachrank[neighbor_rank]))) {
+              ImplicitRadiationError(
+                  "Invalid MeshBlock rank/local-index metadata in the implicit-radiation "
+                  "coarse topology");
+            }
+            if (neighbor_rank == global_variable::my_rank &&
+                (neighbor < ppack->gids ||
+                 neighbor >= ppack->gids+ppack->nmb_thispack)) {
+              ImplicitRadiationError(
+                  "Same-rank implicit-radiation neighbor is outside the active "
+                  "MeshBlockPack");
+            }
+            implicit_coarse_neighbor_gid_device_.h_view(gid, face) = neighbor;
+            implicit_coarse_neighbor_rank_device_.h_view(gid, face) = neighbor_rank;
+          }
+          const auto &location = ppack->pmesh->lloc_eachmb[gid];
+          const int level_nx1[3] = {
+              indcs.nx1, implicit_multilevel_nx1_[0], implicit_multilevel_nx1_[1]};
+          const int level_nx2[3] = {
+              indcs.nx2, implicit_multilevel_nx2_[0], implicit_multilevel_nx2_[1]};
+          const int level_nx3[3] = {
+              indcs.nx3, implicit_multilevel_nx3_[0], implicit_multilevel_nx3_[1]};
+          for (int level = 0; level < 3; ++level) {
+            implicit_multilevel_block_parity_.h_view(gid, level) =
+                (location.lx1*level_nx1[level]+location.lx2*level_nx2[level]+
+                 location.lx3*level_nx3[level]) & 1;
+          }
+        }
+        implicit_coarse_neighbor_gid_device_.modify_host();
+        implicit_coarse_neighbor_rank_device_.modify_host();
+        implicit_multilevel_block_parity_.modify_host();
+        implicit_coarse_neighbor_gid_device_.sync_device();
+        implicit_coarse_neighbor_rank_device_.sync_device();
+        implicit_multilevel_block_parity_.sync_device();
+      }
+    }
   }
 }
 
 //----------------------------------------------------------------------------------------
 
 ThermalRadiation::~ThermalRadiation() {
+#if MPI_PARALLEL_ENABLED
+  if (implicit_multilevel_comm_ != MPI_COMM_NULL) {
+    MPI_Comm_free(&implicit_multilevel_comm_);
+  }
+#endif
   if (opacity_table_ != nullptr) delete opacity_table_;
   if (mixed_opacity_table_ != nullptr) delete mixed_opacity_table_;
 }
@@ -1220,6 +1730,897 @@ Real ThermalRadiation::ImplicitGlobalDot(
 }
 
 //----------------------------------------------------------------------------------------
+//! Assemble and factor E=Z^T A Z for piecewise-constant MeshBlock basis functions.
+//! Internal faces cancel exactly.  Consequently the coarse matrix needs only the mass
+//! term, inter-MeshBlock face conductances, and homogeneous physical-boundary terms.
+
+void ThermalRadiation::BuildImplicitBlockCoarsePreconditioner(const Real dt) {
+  if (implicit_preconditioner_mode_ != 1 || !implicit_multilevel_enabled_) return;
+
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  const int nmb = pmy_pack_->nmb_thispack;
+  const int gid0 = pmy_pack_->gids;
+  const int ncoarse = pmy_pack_->pmesh->nmb_total;
+  const bool multi_d = pmy_pack_->pmesh->multi_d;
+  const bool three_d = pmy_pack_->pmesh->three_d;
+  auto coefficient = implicit_coefficient_;
+  auto face_sums = implicit_coarse_faces_.d_view;
+  auto size = pmy_pack_->pmb->mb_size;
+  auto mb_bcs = pmy_pack_->pmb->mb_bcs;
+  const int b0 = implicit_boundary_type_[0];
+  const int b1 = implicit_boundary_type_[1];
+  const int b2 = implicit_boundary_type_[2];
+  const int b3 = implicit_boundary_type_[3];
+  const int b4 = implicit_boundary_type_[4];
+  const int b5 = implicit_boundary_type_[5];
+  const Real vacuum_cap_coefficient = 0.5*chat_*flux_limit_coefficient_;
+
+  // Build the diagonals of the two Galerkin matrices.  A coarse basis function is one on
+  // its aggregate and zero elsewhere, so its mass is the aggregate volume and only fine
+  // faces on the aggregate boundary survive P^T A P.  The global V-cycle applies the
+  // matching inter-MeshBlock off-diagonals after each level's face exchange.
+  if (implicit_multilevel_enabled_) {
+    auto multilevel_diagonal = implicit_multilevel_vector_;
+    for (int level = 0; level < 2; ++level) {
+      const int cnx1 = implicit_multilevel_nx1_[level];
+      const int cnx2 = implicit_multilevel_nx2_[level];
+      const int cnx3 = implicit_multilevel_nx3_[level];
+      const int aggregate1 = indcs.nx1/cnx1;
+      const int aggregate2 = indcs.nx2/cnx2;
+      const int aggregate3 = indcs.nx3/cnx3;
+      const int level_offset = implicit_multilevel_offset_[level];
+      par_for("thermal_rad_impl_multilevel_diagonal", DevExeSpace(), 0, nmb-1,
+              0, cnx3-1, 0, cnx2-1, 0, cnx1-1,
+      KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+        const bool physical_m1 = ci == 0 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::inner_x1));
+        const bool physical_p1 = ci == cnx1-1 && IsPhysicalBoundary(
+            mb_bcs.d_view(m, BoundaryFace::outer_x1));
+        const Real dx1 = size.d_view(m).dx1;
+        const Real gm1 = ImplicitAggregateFaceConductance(
+            coefficient, m, 0, -1, ci, cj, ck,
+            aggregate1, aggregate2, aggregate3, is, js, ks, dt, dx1,
+            physical_m1 && b0 == 2, vacuum_cap_coefficient*dx1);
+        const Real gp1 = ImplicitAggregateFaceConductance(
+            coefficient, m, 0, 1, ci, cj, ck,
+            aggregate1, aggregate2, aggregate3, is, js, ks, dt, dx1,
+            physical_p1 && b1 == 2, vacuum_cap_coefficient*dx1);
+        Real diagonal = static_cast<Real>(aggregate1*aggregate2*aggregate3)+
+            ImplicitFaceDiagonalWeight(physical_m1, b0)*gm1+
+            ImplicitFaceDiagonalWeight(physical_p1, b1)*gp1;
+        if (multi_d) {
+          const bool physical_m2 = cj == 0 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x2));
+          const bool physical_p2 = cj == cnx2-1 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x2));
+          const Real dx2 = size.d_view(m).dx2;
+          const Real gm2 = ImplicitAggregateFaceConductance(
+              coefficient, m, 1, -1, ci, cj, ck,
+              aggregate1, aggregate2, aggregate3, is, js, ks, dt, dx2,
+              physical_m2 && b2 == 2, vacuum_cap_coefficient*dx2);
+          const Real gp2 = ImplicitAggregateFaceConductance(
+              coefficient, m, 1, 1, ci, cj, ck,
+              aggregate1, aggregate2, aggregate3, is, js, ks, dt, dx2,
+              physical_p2 && b3 == 2, vacuum_cap_coefficient*dx2);
+          diagonal += ImplicitFaceDiagonalWeight(physical_m2, b2)*gm2+
+              ImplicitFaceDiagonalWeight(physical_p2, b3)*gp2;
+        }
+        if (three_d) {
+          const bool physical_m3 = ck == 0 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::inner_x3));
+          const bool physical_p3 = ck == cnx3-1 && IsPhysicalBoundary(
+              mb_bcs.d_view(m, BoundaryFace::outer_x3));
+          const Real dx3 = size.d_view(m).dx3;
+          const Real gm3 = ImplicitAggregateFaceConductance(
+              coefficient, m, 2, -1, ci, cj, ck,
+              aggregate1, aggregate2, aggregate3, is, js, ks, dt, dx3,
+              physical_m3 && b4 == 2, vacuum_cap_coefficient*dx3);
+          const Real gp3 = ImplicitAggregateFaceConductance(
+              coefficient, m, 2, 1, ci, cj, ck,
+              aggregate1, aggregate2, aggregate3, is, js, ks, dt, dx3,
+              physical_p3 && b5 == 2, vacuum_cap_coefficient*dx3);
+          diagonal += ImplicitFaceDiagonalWeight(physical_m3, b4)*gm3+
+              ImplicitFaceDiagonalWeight(physical_p3, b5)*gp3;
+        }
+        const int coarse = (ck*cnx2+cj)*cnx1+ci;
+        multilevel_diagonal(m, level_offset+coarse) = diagonal;
+      });
+    }
+  }
+
+  Kokkos::deep_copy(DevExeSpace(), face_sums, 0.0);
+  Kokkos::parallel_for("thermal_rad_impl_coarse_faces_x1",
+      Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
+          {0, ks, js}, {nmb, ke+1, je+1}),
+  KOKKOS_LAMBDA(int m, int k, int j) {
+    const int gid = gid0+m;
+    const Real dx = size.d_view(m).dx1;
+    const Real scale = dt/(dx*dx);
+    const bool vacuum_m = b0 == 2 && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::inner_x1));
+    const bool vacuum_p = b1 == 2 && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::outer_x1));
+    const Real km = ImplicitFrozenFaceCoefficient(
+        coefficient(m, 0, k, j, is), coefficient(m, 0, k, j, is-1),
+        vacuum_m, vacuum_cap_coefficient*dx);
+    const Real kp = ImplicitFrozenFaceCoefficient(
+        coefficient(m, 0, k, j, ie), coefficient(m, 0, k, j, ie+1),
+        vacuum_p, vacuum_cap_coefficient*dx);
+    Kokkos::atomic_add(&face_sums(gid, 0), scale*km);
+    Kokkos::atomic_add(&face_sums(gid, 1), scale*kp);
+  });
+  if (multi_d) {
+    Kokkos::parallel_for("thermal_rad_impl_coarse_faces_x2",
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
+            {0, ks, is}, {nmb, ke+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int k, int i) {
+      const int gid = gid0+m;
+      const Real dx = size.d_view(m).dx2;
+      const Real scale = dt/(dx*dx);
+      const bool vacuum_m = b2 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x2));
+      const bool vacuum_p = b3 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x2));
+      const Real km = ImplicitFrozenFaceCoefficient(
+          coefficient(m, 0, k, js, i), coefficient(m, 0, k, js-1, i),
+          vacuum_m, vacuum_cap_coefficient*dx);
+      const Real kp = ImplicitFrozenFaceCoefficient(
+          coefficient(m, 0, k, je, i), coefficient(m, 0, k, je+1, i),
+          vacuum_p, vacuum_cap_coefficient*dx);
+      Kokkos::atomic_add(&face_sums(gid, 2), scale*km);
+      Kokkos::atomic_add(&face_sums(gid, 3), scale*kp);
+    });
+  }
+  if (three_d) {
+    Kokkos::parallel_for("thermal_rad_impl_coarse_faces_x3",
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
+            {0, js, is}, {nmb, je+1, ie+1}),
+    KOKKOS_LAMBDA(int m, int j, int i) {
+      const int gid = gid0+m;
+      const Real dx = size.d_view(m).dx3;
+      const Real scale = dt/(dx*dx);
+      const bool vacuum_m = b4 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x3));
+      const bool vacuum_p = b5 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x3));
+      const Real km = ImplicitFrozenFaceCoefficient(
+          coefficient(m, 0, ks, j, i), coefficient(m, 0, ks-1, j, i),
+          vacuum_m, vacuum_cap_coefficient*dx);
+      const Real kp = ImplicitFrozenFaceCoefficient(
+          coefficient(m, 0, ke, j, i), coefficient(m, 0, ke+1, j, i),
+          vacuum_p, vacuum_cap_coefficient*dx);
+      Kokkos::atomic_add(&face_sums(gid, 4), scale*km);
+      Kokkos::atomic_add(&face_sums(gid, 5), scale*kp);
+    });
+  }
+  implicit_coarse_faces_.template modify<DevExeSpace>();
+  implicit_coarse_faces_.template sync<HostMemSpace>();
+  auto host_faces = implicit_coarse_faces_.h_view;
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, host_faces.data(), 6*ncoarse, MPI_ATHENA_REAL,
+                MPI_SUM, MPI_COMM_WORLD);
+#endif
+
+  auto &factor = implicit_coarse_cholesky_;
+  std::fill(factor.begin(), factor.end(), 0.0);
+  const Real block_cells = static_cast<Real>(
+      indcs.nx1*indcs.nx2*indcs.nx3);
+  for (int gid = 0; gid < ncoarse; ++gid) {
+    factor[static_cast<std::size_t>(gid)*ncoarse+gid] = block_cells;
+  }
+
+  const int active_faces = three_d ? 6 : (multi_d ? 4 : 2);
+  for (int gid = 0; gid < ncoarse; ++gid) {
+    for (int face = 0; face < active_faces; ++face) {
+      const Real local_conductance = host_faces(gid, face);
+      if (!std::isfinite(local_conductance) || local_conductance < 0.0) {
+        ImplicitRadiationError(
+            "Implicit-radiation coarse face conductance is negative or non-finite");
+      }
+      const int neighbor = implicit_coarse_neighbor_gid_[6*gid+face];
+      if (neighbor >= 0) {
+        // A periodic face may connect a one-block direction to itself.  Such a face
+        // annihilates a block-constant vector and contributes nothing to E.
+        if (neighbor == gid || gid > neighbor) continue;
+        const Real neighbor_conductance = host_faces(neighbor, face^1);
+        if (!std::isfinite(neighbor_conductance) ||
+            neighbor_conductance < 0.0) {
+          ImplicitRadiationError(
+              "Implicit-radiation peer face conductance is negative or non-finite");
+        }
+        // Both oriented sums represent the same shared faces.  Permit reduction-order
+        // roundoff, but reject a discrepancy large enough to indicate inconsistent
+        // coefficient halos or topology before symmetrizing the coarse matrix.
+        const Real face_scale = std::max(
+            std::max(local_conductance, neighbor_conductance),
+            std::numeric_limits<Real>::min());
+        const Real mismatch = std::abs(local_conductance-neighbor_conductance);
+        if (mismatch > 8192.0*kRealEpsilon*face_scale) {
+          ImplicitRadiationError(
+              "Implicit-radiation peer face sums disagree for MeshBlock "+
+              std::to_string(gid)+", face "+std::to_string(face));
+        }
+        const Real conductance = 0.5*(local_conductance+neighbor_conductance);
+        const std::size_t gg = static_cast<std::size_t>(gid)*ncoarse+gid;
+        const std::size_t nn = static_cast<std::size_t>(neighbor)*ncoarse+neighbor;
+        const std::size_t gn = static_cast<std::size_t>(gid)*ncoarse+neighbor;
+        const std::size_t ng = static_cast<std::size_t>(neighbor)*ncoarse+gid;
+        factor[gg] += conductance;
+        factor[nn] += conductance;
+        factor[gn] -= conductance;
+        factor[ng] -= conductance;
+      } else {
+        const Real boundary_weight = implicit_boundary_type_[face] == 0 ? 0.0 :
+            (implicit_boundary_type_[face] == 1 ? 2.0 : 1.0);
+        factor[static_cast<std::size_t>(gid)*ncoarse+gid] +=
+            boundary_weight*local_conductance;
+      }
+    }
+  }
+
+  // Symmetric diagonal equilibration protects the mass term when the diffusion
+  // conductance is many orders of magnitude larger.  If B=S E S and B=L L^T, then
+  // E^-1 = S L^-T L^-1 S.
+  auto &scaling = implicit_coarse_scaling_;
+  for (int row = 0; row < ncoarse; ++row) {
+    const Real diagonal = factor[static_cast<std::size_t>(row)*ncoarse+row];
+    if (!(diagonal > 0.0) || !std::isfinite(diagonal)) {
+      ImplicitRadiationError(
+          "Implicit-radiation coarse matrix has a non-positive or non-finite diagonal");
+    }
+    scaling[row] = 1.0/std::sqrt(diagonal);
+  }
+  for (int row = 0; row < ncoarse; ++row) {
+    for (int col = 0; col < ncoarse; ++col) {
+      factor[static_cast<std::size_t>(row)*ncoarse+col] *=
+          scaling[row]*scaling[col];
+    }
+  }
+
+  // Dense Cholesky is inexpensive for the intended 343-block DCI mesh, avoids another
+  // iterative tolerance inside PCG, and is redundantly reproducible on every rank.
+  for (int row = 0; row < ncoarse; ++row) {
+    for (int col = 0; col <= row; ++col) {
+      Real entry = factor[static_cast<std::size_t>(row)*ncoarse+col];
+      for (int k = 0; k < col; ++k) {
+        entry -= factor[static_cast<std::size_t>(row)*ncoarse+k]*
+                 factor[static_cast<std::size_t>(col)*ncoarse+k];
+      }
+      if (row == col) {
+        if (!(entry > 0.0) || !std::isfinite(entry)) {
+          ImplicitRadiationError(
+              "Implicit-radiation coarse Cholesky factorization failed at pivot "+
+              std::to_string(row)+" (value="+std::to_string(entry)+")");
+        }
+        factor[static_cast<std::size_t>(row)*ncoarse+col] = std::sqrt(entry);
+      } else {
+        const Real pivot = factor[static_cast<std::size_t>(col)*ncoarse+col];
+        const Real value = entry/pivot;
+        if (!std::isfinite(value)) {
+          ImplicitRadiationError(
+              "Implicit-radiation coarse Cholesky factor contains a non-finite value");
+        }
+        factor[static_cast<std::size_t>(row)*ncoarse+col] = value;
+      }
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! Exchange one face layer of a fine or aggregate correction.  Only the six faces are
+//! needed by the seven-point Galerkin operator.  Same-rank neighbors are read directly;
+//! off-rank faces use a dedicated CUDA-aware MPI communicator so tags cannot collide
+//! with fluid or laser traffic.
+
+void ThermalRadiation::ExchangeImplicitMultilevelFaces(
+    const DvceArray5D<Real> &field, const int level) {
+  if (!implicit_multilevel_enabled_ || level < 0 || level > 2) {
+    ImplicitRadiationError("Invalid implicit-radiation multilevel face exchange");
+  }
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  const int fine_nx1 = indcs.nx1, fine_nx2 = indcs.nx2;
+  const int nx1 = level == 0 ? indcs.nx1 : implicit_multilevel_nx1_[level-1];
+  const int nx2 = level == 0 ? indcs.nx2 : implicit_multilevel_nx2_[level-1];
+  const int nx3 = level == 0 ? indcs.nx3 : implicit_multilevel_nx3_[level-1];
+  const int offset = level == 0 ? 0 : implicit_multilevel_offset_[level-1];
+  const int active_faces = pmy_pack_->pmesh->three_d ? 6 :
+      (pmy_pack_->pmesh->multi_d ? 4 : 2);
+  const int max_face_cells = std::max(
+      std::max(nx2*nx3, nx1*nx3), nx1*nx2);
+  const int nmb = pmy_pack_->nmb_thispack;
+  auto send_faces = implicit_multilevel_send_faces_;
+  auto source = field;
+
+  Kokkos::parallel_for("thermal_rad_impl_pack_multilevel_faces",
+      Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
+          {0, 0, 0}, {nmb, active_faces, max_face_cells}),
+  KOKKOS_LAMBDA(int m, int face, int q) {
+    int ci = 0, cj = 0, ck = 0, count = 0;
+    if (face < 2) {
+      count = nx2*nx3;
+      ck = q/nx2;
+      cj = q-ck*nx2;
+      ci = face == 0 ? 0 : nx1-1;
+    } else if (face < 4) {
+      count = nx1*nx3;
+      ck = q/nx1;
+      ci = q-ck*nx1;
+      cj = face == 2 ? 0 : nx2-1;
+    } else {
+      count = nx1*nx2;
+      cj = q/nx1;
+      ci = q-cj*nx1;
+      ck = face == 4 ? 0 : nx3-1;
+    }
+    if (q >= count) return;
+    if (level == 0) {
+      send_faces(m, face, q) = source(m, 0, ks+ck, js+cj, is+ci);
+    } else {
+      const int packed = offset+(ck*nx2+cj)*nx1+ci;
+      send_faces(m, face, q) = ImplicitPackedScratchValue(
+          source, m, packed, fine_nx1, fine_nx2, is, js, ks);
+    }
+  });
+  Kokkos::fence();
+
+#if MPI_PARALLEL_ENABLED
+  std::vector<MPI_Request> requests;
+  requests.reserve(2*nmb*active_faces);
+  auto recv_faces = implicit_multilevel_recv_faces_;
+  const int my_rank = global_variable::my_rank;
+  for (int m = 0; m < nmb; ++m) {
+    const int gid = pmy_pack_->gids+m;
+    for (int face = 0; face < active_faces; ++face) {
+      const int neighbor = implicit_coarse_neighbor_gid_[6*gid+face];
+      if (neighbor < 0) continue;
+      const int rank = pmy_pack_->pmesh->rank_eachmb[neighbor];
+      if (rank == my_rank) continue;
+      const int count = face < 2 ? nx2*nx3 :
+          (face < 4 ? nx1*nx3 : nx1*nx2);
+      auto recv = Kokkos::subview(recv_faces, m, face, Kokkos::ALL);
+      requests.push_back(MPI_REQUEST_NULL);
+      const int tag = m*6+face;
+      if (MPI_Irecv(recv.data(), count, MPI_ATHENA_REAL, rank, tag,
+                    implicit_multilevel_comm_, &requests.back()) != MPI_SUCCESS) {
+        ImplicitRadiationError(
+            "Could not post an implicit-radiation multilevel face receive");
+      }
+    }
+  }
+  for (int m = 0; m < nmb; ++m) {
+    const int gid = pmy_pack_->gids+m;
+    for (int face = 0; face < active_faces; ++face) {
+      const int neighbor = implicit_coarse_neighbor_gid_[6*gid+face];
+      if (neighbor < 0) continue;
+      const int rank = pmy_pack_->pmesh->rank_eachmb[neighbor];
+      if (rank == my_rank) continue;
+      const int count = face < 2 ? nx2*nx3 :
+          (face < 4 ? nx1*nx3 : nx1*nx2);
+      auto send = Kokkos::subview(send_faces, m, face, Kokkos::ALL);
+      requests.push_back(MPI_REQUEST_NULL);
+      const int destination_lid =
+          neighbor-pmy_pack_->pmesh->gids_eachrank[rank];
+      const int tag = destination_lid*6+(face^1);
+      if (MPI_Isend(send.data(), count, MPI_ATHENA_REAL, rank, tag,
+                    implicit_multilevel_comm_, &requests.back()) != MPI_SUCCESS) {
+        ImplicitRadiationError(
+            "Could not post an implicit-radiation multilevel face send");
+      }
+    }
+  }
+  if (!requests.empty() && MPI_Waitall(
+          static_cast<int>(requests.size()), requests.data(),
+          MPI_STATUSES_IGNORE) != MPI_SUCCESS) {
+    ImplicitRadiationError(
+        "Could not complete implicit-radiation multilevel face communication");
+  }
+  Kokkos::fence();
+#endif
+}
+
+//----------------------------------------------------------------------------------------
+//! Reduce and solve the replicated exact MeshBlock-root Galerkin system.
+
+void ThermalRadiation::SolveImplicitBlockRootSystem() {
+  const int ncoarse = pmy_pack_->pmesh->nmb_total;
+  implicit_coarse_vector_.template modify<DevExeSpace>();
+  implicit_coarse_vector_.template sync<HostMemSpace>();
+  auto coarse = implicit_coarse_vector_.h_view;
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, coarse.data(), ncoarse, MPI_ATHENA_REAL,
+                MPI_SUM, MPI_COMM_WORLD);
+#endif
+  const auto &factor = implicit_coarse_cholesky_;
+  const auto &scaling = implicit_coarse_scaling_;
+  for (int row = 0; row < ncoarse; ++row) coarse(row) *= scaling[row];
+  for (int row = 0; row < ncoarse; ++row) {
+    Real value = coarse(row);
+    for (int col = 0; col < row; ++col) {
+      value -= factor[static_cast<std::size_t>(row)*ncoarse+col]*coarse(col);
+    }
+    coarse(row) = value/factor[static_cast<std::size_t>(row)*ncoarse+row];
+  }
+  for (int row = ncoarse-1; row >= 0; --row) {
+    Real value = coarse(row);
+    for (int col = row+1; col < ncoarse; ++col) {
+      value -= factor[static_cast<std::size_t>(col)*ncoarse+row]*coarse(col);
+    }
+    coarse(row) = value/factor[static_cast<std::size_t>(row)*ncoarse+row];
+  }
+  for (int row = 0; row < ncoarse; ++row) {
+    coarse(row) *= scaling[row];
+    if (!std::isfinite(coarse(row))) {
+      ImplicitRadiationError(
+          "Implicit-radiation coarse triangular solve produced a non-finite value");
+    }
+  }
+  implicit_coarse_vector_.template modify<HostMemSpace>();
+  implicit_coarse_vector_.template sync<DevExeSpace>();
+}
+
+//----------------------------------------------------------------------------------------
+//! Apply either point Jacobi or a fixed linear SPD Galerkin preconditioner.  Compatible
+//! factor-three MeshBlocks use a true global V-cycle with face exchanges at every level
+//! and an exact MeshBlock-root solve at the bottom.  Other block sizes use point Jacobi.
+
+void ThermalRadiation::ApplyImplicitPreconditioner(
+    const DvceArray5D<Real> &input_residual,
+    DvceArray5D<Real> &output_preconditioned, const Real dt) {
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  const int fine_nx1 = indcs.nx1;
+  const int fine_nx2 = indcs.nx2;
+  const int fine_nx3 = indcs.nx3;
+  const int nmb = pmy_pack_->nmb_thispack;
+  const int nmb1 = nmb-1;
+  const bool multi_d = pmy_pack_->pmesh->multi_d;
+  const bool three_d = pmy_pack_->pmesh->three_d;
+  auto coefficient = implicit_coefficient_;
+  auto diagonal = implicit_operator_;
+  auto residual = input_residual;
+  auto preconditioned = output_preconditioned;
+  auto size = pmy_pack_->pmb->mb_size;
+  auto mb_bcs = pmy_pack_->pmb->mb_bcs;
+  const int gid0 = pmy_pack_->gids;
+  const int b0 = implicit_boundary_type_[0];
+  const int b1 = implicit_boundary_type_[1];
+  const int b2 = implicit_boundary_type_[2];
+  const int b3 = implicit_boundary_type_[3];
+  const int b4 = implicit_boundary_type_[4];
+  const int b5 = implicit_boundary_type_[5];
+  const Real vacuum_cap_coefficient = 0.5*chat_*flux_limit_coefficient_;
+  const bool exact_boundary_diagonal = implicit_multilevel_enabled_;
+
+  // The block solve uses the exact diagonal of the homogeneous operator.
+  // Preserve the legacy point-Jacobi estimate in the default mode so selecting no new
+  // preconditioner does not perturb existing runs.
+  auto build_fine_diagonal = [&]() {
+    par_for("thermal_rad_impl_diagonal", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real kc = coefficient(m, 0, k, j, i);
+    const Real dx1 = size.d_view(m).dx1;
+    const bool physical_p1 = i == ie && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::outer_x1));
+    const bool physical_m1 = i == is && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::inner_x1));
+    const Real kp1 = ImplicitFrozenFaceCoefficient(
+        kc, coefficient(m, 0, k, j, i+1), physical_p1 && b1 == 2,
+        vacuum_cap_coefficient*dx1);
+    const Real km1 = ImplicitFrozenFaceCoefficient(
+        kc, coefficient(m, 0, k, j, i-1), physical_m1 && b0 == 2,
+        vacuum_cap_coefficient*dx1);
+    const Real wp1 = exact_boundary_diagonal ?
+        ImplicitFaceDiagonalWeight(physical_p1, b1) : 1.0;
+    const Real wm1 = exact_boundary_diagonal ?
+        ImplicitFaceDiagonalWeight(physical_m1, b0) : 1.0;
+    Real rate = (wp1*kp1+wm1*km1)/(dx1*dx1);
+    if (multi_d) {
+      const Real dx2 = size.d_view(m).dx2;
+      const bool physical_p2 = j == je && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x2));
+      const bool physical_m2 = j == js && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x2));
+      const Real kp2 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j+1, i), physical_p2 && b3 == 2,
+          vacuum_cap_coefficient*dx2);
+      const Real km2 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j-1, i), physical_m2 && b2 == 2,
+          vacuum_cap_coefficient*dx2);
+      const Real wp2 = exact_boundary_diagonal ?
+          ImplicitFaceDiagonalWeight(physical_p2, b3) : 1.0;
+      const Real wm2 = exact_boundary_diagonal ?
+          ImplicitFaceDiagonalWeight(physical_m2, b2) : 1.0;
+      rate += (wp2*kp2+wm2*km2)/(dx2*dx2);
+    }
+    if (three_d) {
+      const Real dx3 = size.d_view(m).dx3;
+      const bool physical_p3 = k == ke && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x3));
+      const bool physical_m3 = k == ks && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x3));
+      const Real kp3 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k+1, j, i), physical_p3 && b5 == 2,
+          vacuum_cap_coefficient*dx3);
+      const Real km3 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k-1, j, i), physical_m3 && b4 == 2,
+          vacuum_cap_coefficient*dx3);
+      const Real wp3 = exact_boundary_diagonal ?
+          ImplicitFaceDiagonalWeight(physical_p3, b5) : 1.0;
+      const Real wm3 = exact_boundary_diagonal ?
+          ImplicitFaceDiagonalWeight(physical_m3, b4) : 1.0;
+      rate += (wp3*kp3+wm3*km3)/(dx3*dx3);
+    }
+      diagonal(m, 0, k, j, i) = 1.0+dt*rate;
+    });
+  };
+  build_fine_diagonal();
+
+  if (implicit_preconditioner_mode_ == 0 || !implicit_multilevel_enabled_) {
+    par_for("thermal_rad_impl_jacobi", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      preconditioned(m, 0, k, j, i) =
+          residual(m, 0, k, j, i)/diagonal(m, 0, k, j, i);
+    });
+    return;
+  }
+
+  Kokkos::deep_copy(DevExeSpace(), output_preconditioned, 0.0);
+
+  // True global Galerkin V-cycle.  P is piecewise-constant injection and P^T is exact
+  // summation.  Each red/black pre-sweep is paired with the exact black/red transpose.
+  auto hierarchy_rhs = implicit_coarse_scratch_;
+  auto hierarchy_solution = implicit_operator_;
+  auto hierarchy_diagonal = implicit_multilevel_vector_;
+  auto neighbor_gid = implicit_coarse_neighbor_gid_device_.d_view;
+  auto neighbor_rank = implicit_coarse_neighbor_rank_device_.d_view;
+  auto block_parity = implicit_multilevel_block_parity_.d_view;
+  auto remote_faces = implicit_multilevel_recv_faces_;
+  const int my_rank = global_variable::my_rank;
+  const int level1_nx1 = implicit_multilevel_nx1_[0];
+  const int level1_nx2 = implicit_multilevel_nx2_[0];
+  const int level1_nx3 = implicit_multilevel_nx3_[0];
+  const int level2_nx1 = implicit_multilevel_nx1_[1];
+  const int level2_nx2 = implicit_multilevel_nx2_[1];
+  const int level2_nx3 = implicit_multilevel_nx3_[1];
+  const int level1_offset = implicit_multilevel_offset_[0];
+  const int level2_offset = implicit_multilevel_offset_[1];
+  const int aggregate1_x1 = fine_nx1/level1_nx1;
+  const int aggregate1_x2 = fine_nx2/level1_nx2;
+  const int aggregate1_x3 = fine_nx3/level1_nx3;
+  const int aggregate2_x1 = fine_nx1/level2_nx1;
+  const int aggregate2_x2 = fine_nx2/level2_nx2;
+  const int aggregate2_x3 = fine_nx3/level2_nx3;
+  const int child1 = level1_nx1/level2_nx1;
+  const int child2 = level1_nx2/level2_nx2;
+  const int child3 = level1_nx3/level2_nx3;
+
+  par_for("thermal_rad_impl_vcycle_fine_red_forward", DevExeSpace(), 0, nmb1,
+          ks, ke, js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const int parity = (i-is)+(j-js)+(k-ks)+block_parity(gid0+m, 0);
+    if (parity%2 == 0) {
+      preconditioned(m, 0, k, j, i) =
+          residual(m, 0, k, j, i)/diagonal(m, 0, k, j, i);
+    }
+  });
+  ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
+  par_for("thermal_rad_impl_vcycle_fine_black_forward", DevExeSpace(), 0, nmb1,
+          ks, ke, js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const int parity = (i-is)+(j-js)+(k-ks)+block_parity(gid0+m, 0);
+    if (parity%2 != 0) {
+      const Real neighbor_sum = ImplicitFineGlobalNeighborSum(
+          coefficient, preconditioned, remote_faces, neighbor_gid, neighbor_rank,
+          m, gid0+m, gid0, my_rank, k, j, i, is, ie, js, je, ks, ke,
+          fine_nx1, fine_nx2, dt, size.d_view(m).dx1,
+          multi_d ? size.d_view(m).dx2 : 1.0,
+          three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+      preconditioned(m, 0, k, j, i) =
+          (residual(m, 0, k, j, i)+neighbor_sum)/diagonal(m, 0, k, j, i);
+    }
+  });
+  ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
+
+  par_for("thermal_rad_impl_vcycle_restrict_fine", DevExeSpace(), 0, nmb1,
+          0, level1_nx3-1, 0, level1_nx2-1, 0, level1_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    Real restricted = 0.0;
+    for (int ok = 0; ok < aggregate1_x3; ++ok) {
+      const int k = ks+ck*aggregate1_x3+ok;
+      for (int oj = 0; oj < aggregate1_x2; ++oj) {
+        const int j = js+cj*aggregate1_x2+oj;
+        for (int oi = 0; oi < aggregate1_x1; ++oi) {
+          const int i = is+ci*aggregate1_x1+oi;
+          const Real neighbor_sum = ImplicitFineGlobalNeighborSum(
+              coefficient, preconditioned, remote_faces, neighbor_gid, neighbor_rank,
+              m, gid0+m, gid0, my_rank, k, j, i, is, ie, js, je, ks, ke,
+              fine_nx1, fine_nx2, dt, size.d_view(m).dx1,
+              multi_d ? size.d_view(m).dx2 : 1.0,
+              three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+          const Real applied = diagonal(m, 0, k, j, i)*
+              preconditioned(m, 0, k, j, i)-neighbor_sum;
+          restricted += residual(m, 0, k, j, i)-applied;
+        }
+      }
+    }
+    const int packed = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+    SetImplicitPackedScratchValue(
+        hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks, restricted);
+  });
+
+  par_for("thermal_rad_impl_vcycle_l1_red_forward", DevExeSpace(), 0, nmb1,
+          0, level1_nx3-1, 0, level1_nx2-1, 0, level1_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    const int parity = ci+cj+ck+block_parity(gid0+m, 1);
+    if (parity%2 == 0) {
+      const int packed = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+      const Real value = ImplicitPackedScratchValue(
+          hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)/
+          hierarchy_diagonal(m, packed);
+      SetImplicitPackedScratchValue(
+          hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks, value);
+    }
+  });
+  ExchangeImplicitMultilevelFaces(hierarchy_solution, 1);
+  par_for("thermal_rad_impl_vcycle_l1_black_forward", DevExeSpace(), 0, nmb1,
+          0, level1_nx3-1, 0, level1_nx2-1, 0, level1_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    const int parity = ci+cj+ck+block_parity(gid0+m, 1);
+    if (parity%2 != 0) {
+      const int packed = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+      const Real neighbor_sum = ImplicitAggregateGlobalNeighborSum(
+          coefficient, hierarchy_solution, remote_faces, neighbor_gid, neighbor_rank,
+          m, gid0+m, gid0, my_rank, packed, level1_offset, ci, cj, ck,
+          level1_nx1, level1_nx2, level1_nx3,
+          aggregate1_x1, aggregate1_x2, aggregate1_x3,
+          fine_nx1, fine_nx2, is, js, ks, dt, size.d_view(m).dx1,
+          multi_d ? size.d_view(m).dx2 : 1.0,
+          three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+      const Real value = (ImplicitPackedScratchValue(
+          hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)+
+          neighbor_sum)/hierarchy_diagonal(m, packed);
+      SetImplicitPackedScratchValue(
+          hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks, value);
+    }
+  });
+  ExchangeImplicitMultilevelFaces(hierarchy_solution, 1);
+
+  par_for("thermal_rad_impl_vcycle_restrict_l1", DevExeSpace(), 0, nmb1,
+          0, level2_nx3-1, 0, level2_nx2-1, 0, level2_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck2, int cj2, int ci2) {
+    Real restricted = 0.0;
+    for (int ok = 0; ok < child3; ++ok) {
+      const int ck = ck2*child3+ok;
+      for (int oj = 0; oj < child2; ++oj) {
+        const int cj = cj2*child2+oj;
+        for (int oi = 0; oi < child1; ++oi) {
+          const int ci = ci2*child1+oi;
+          const int packed = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+          const Real neighbor_sum = ImplicitAggregateGlobalNeighborSum(
+              coefficient, hierarchy_solution, remote_faces, neighbor_gid, neighbor_rank,
+              m, gid0+m, gid0, my_rank, packed, level1_offset, ci, cj, ck,
+              level1_nx1, level1_nx2, level1_nx3,
+              aggregate1_x1, aggregate1_x2, aggregate1_x3,
+              fine_nx1, fine_nx2, is, js, ks, dt, size.d_view(m).dx1,
+              multi_d ? size.d_view(m).dx2 : 1.0,
+              three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+          const Real x = ImplicitPackedScratchValue(
+              hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks);
+          const Real applied = hierarchy_diagonal(m, packed)*x-neighbor_sum;
+          restricted += ImplicitPackedScratchValue(
+              hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)-applied;
+        }
+      }
+    }
+    const int packed2 = level2_offset+(ck2*level2_nx2+cj2)*level2_nx1+ci2;
+    SetImplicitPackedScratchValue(
+        hierarchy_rhs, m, packed2, fine_nx1, fine_nx2, is, js, ks, restricted);
+  });
+
+  par_for("thermal_rad_impl_vcycle_l2_red_forward", DevExeSpace(), 0, nmb1,
+          0, level2_nx3-1, 0, level2_nx2-1, 0, level2_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    const int parity = ci+cj+ck+block_parity(gid0+m, 2);
+    if (parity%2 == 0) {
+      const int packed = level2_offset+(ck*level2_nx2+cj)*level2_nx1+ci;
+      const Real value = ImplicitPackedScratchValue(
+          hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)/
+          hierarchy_diagonal(m, packed);
+      SetImplicitPackedScratchValue(
+          hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks, value);
+    }
+  });
+  ExchangeImplicitMultilevelFaces(hierarchy_solution, 2);
+  par_for("thermal_rad_impl_vcycle_l2_black_forward", DevExeSpace(), 0, nmb1,
+          0, level2_nx3-1, 0, level2_nx2-1, 0, level2_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    const int parity = ci+cj+ck+block_parity(gid0+m, 2);
+    if (parity%2 != 0) {
+      const int packed = level2_offset+(ck*level2_nx2+cj)*level2_nx1+ci;
+      const Real neighbor_sum = ImplicitAggregateGlobalNeighborSum(
+          coefficient, hierarchy_solution, remote_faces, neighbor_gid, neighbor_rank,
+          m, gid0+m, gid0, my_rank, packed, level2_offset, ci, cj, ck,
+          level2_nx1, level2_nx2, level2_nx3,
+          aggregate2_x1, aggregate2_x2, aggregate2_x3,
+          fine_nx1, fine_nx2, is, js, ks, dt, size.d_view(m).dx1,
+          multi_d ? size.d_view(m).dx2 : 1.0,
+          three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+      const Real value = (ImplicitPackedScratchValue(
+          hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)+
+          neighbor_sum)/hierarchy_diagonal(m, packed);
+      SetImplicitPackedScratchValue(
+          hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks, value);
+    }
+  });
+  ExchangeImplicitMultilevelFaces(hierarchy_solution, 2);
+
+  const int level2_cells = level2_nx1*level2_nx2*level2_nx3;
+  const int level2_plane = level2_nx1*level2_nx2;
+  auto coarse_vector = implicit_coarse_vector_.d_view;
+  Kokkos::deep_copy(DevExeSpace(), coarse_vector, 0.0);
+  par_for_outer("thermal_rad_impl_vcycle_restrict_root", DevExeSpace(), 0, 0,
+                0, nmb1,
+  KOKKOS_LAMBDA(TeamMember_t tmember, const int m) {
+    Real block_sum = 0.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tmember, level2_cells),
+    [=](const int idx, Real &sum) {
+      const int ck = idx/level2_plane;
+      const int remainder = idx-ck*level2_plane;
+      const int cj = remainder/level2_nx1;
+      const int ci = remainder-cj*level2_nx1;
+      const int packed = level2_offset+idx;
+      const Real neighbor_sum = ImplicitAggregateGlobalNeighborSum(
+          coefficient, hierarchy_solution, remote_faces, neighbor_gid, neighbor_rank,
+          m, gid0+m, gid0, my_rank, packed, level2_offset, ci, cj, ck,
+          level2_nx1, level2_nx2, level2_nx3,
+          aggregate2_x1, aggregate2_x2, aggregate2_x3,
+          fine_nx1, fine_nx2, is, js, ks, dt, size.d_view(m).dx1,
+          multi_d ? size.d_view(m).dx2 : 1.0,
+          three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+      const Real x = ImplicitPackedScratchValue(
+          hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks);
+      const Real applied = hierarchy_diagonal(m, packed)*x-neighbor_sum;
+      sum += ImplicitPackedScratchValue(
+          hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)-applied;
+    }, block_sum);
+    Kokkos::single(Kokkos::PerTeam(tmember), [&]() {
+      coarse_vector(gid0+m) = block_sum;
+    });
+  });
+  SolveImplicitBlockRootSystem();
+  par_for("thermal_rad_impl_vcycle_prolong_root", DevExeSpace(), 0, nmb1,
+          0, level2_nx3-1, 0, level2_nx2-1, 0, level2_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    const int packed = level2_offset+(ck*level2_nx2+cj)*level2_nx1+ci;
+    const Real value = ImplicitPackedScratchValue(
+        hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks)+
+        coarse_vector(gid0+m);
+    SetImplicitPackedScratchValue(
+        hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks, value);
+  });
+
+  // Transpose post-sweep at level 2: exchange the prolonged root, update black,
+  // exchange black, then update red.
+  ExchangeImplicitMultilevelFaces(hierarchy_solution, 2);
+  for (int color = 1; color >= 0; --color) {
+    par_for("thermal_rad_impl_vcycle_l2_backward", DevExeSpace(), 0, nmb1,
+            0, level2_nx3-1, 0, level2_nx2-1, 0, level2_nx1-1,
+    KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+      const int parity = ci+cj+ck+block_parity(gid0+m, 2);
+      if (parity%2 == color) {
+        const int packed = level2_offset+(ck*level2_nx2+cj)*level2_nx1+ci;
+        const Real neighbor_sum = ImplicitAggregateGlobalNeighborSum(
+            coefficient, hierarchy_solution, remote_faces, neighbor_gid, neighbor_rank,
+            m, gid0+m, gid0, my_rank, packed, level2_offset, ci, cj, ck,
+            level2_nx1, level2_nx2, level2_nx3,
+            aggregate2_x1, aggregate2_x2, aggregate2_x3,
+            fine_nx1, fine_nx2, is, js, ks, dt, size.d_view(m).dx1,
+            multi_d ? size.d_view(m).dx2 : 1.0,
+            three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+        const Real x = ImplicitPackedScratchValue(
+            hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks);
+        const Real coarse_residual = ImplicitPackedScratchValue(
+            hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)-
+            (hierarchy_diagonal(m, packed)*x-neighbor_sum);
+        SetImplicitPackedScratchValue(
+            hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks,
+            x+coarse_residual/hierarchy_diagonal(m, packed));
+      }
+    });
+    if (color == 1) ExchangeImplicitMultilevelFaces(hierarchy_solution, 2);
+  }
+
+  par_for("thermal_rad_impl_vcycle_prolong_l2", DevExeSpace(), 0, nmb1,
+          0, level1_nx3-1, 0, level1_nx2-1, 0, level1_nx1-1,
+  KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+    const int packed1 = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+    const int ci2 = ci/child1;
+    const int cj2 = cj/child2;
+    const int ck2 = ck/child3;
+    const int packed2 = level2_offset+(ck2*level2_nx2+cj2)*level2_nx1+ci2;
+    const Real value = ImplicitPackedScratchValue(
+        hierarchy_solution, m, packed1, fine_nx1, fine_nx2, is, js, ks)+
+        ImplicitPackedScratchValue(
+            hierarchy_solution, m, packed2, fine_nx1, fine_nx2, is, js, ks);
+    SetImplicitPackedScratchValue(
+        hierarchy_solution, m, packed1, fine_nx1, fine_nx2, is, js, ks, value);
+  });
+  ExchangeImplicitMultilevelFaces(hierarchy_solution, 1);
+  for (int color = 1; color >= 0; --color) {
+    par_for("thermal_rad_impl_vcycle_l1_backward", DevExeSpace(), 0, nmb1,
+            0, level1_nx3-1, 0, level1_nx2-1, 0, level1_nx1-1,
+    KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
+      const int parity = ci+cj+ck+block_parity(gid0+m, 1);
+      if (parity%2 == color) {
+        const int packed = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+        const Real neighbor_sum = ImplicitAggregateGlobalNeighborSum(
+            coefficient, hierarchy_solution, remote_faces, neighbor_gid, neighbor_rank,
+            m, gid0+m, gid0, my_rank, packed, level1_offset, ci, cj, ck,
+            level1_nx1, level1_nx2, level1_nx3,
+            aggregate1_x1, aggregate1_x2, aggregate1_x3,
+            fine_nx1, fine_nx2, is, js, ks, dt, size.d_view(m).dx1,
+            multi_d ? size.d_view(m).dx2 : 1.0,
+            three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+        const Real x = ImplicitPackedScratchValue(
+            hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks);
+        const Real coarse_residual = ImplicitPackedScratchValue(
+            hierarchy_rhs, m, packed, fine_nx1, fine_nx2, is, js, ks)-
+            (hierarchy_diagonal(m, packed)*x-neighbor_sum);
+        SetImplicitPackedScratchValue(
+            hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks,
+            x+coarse_residual/hierarchy_diagonal(m, packed));
+      }
+    });
+    if (color == 1) ExchangeImplicitMultilevelFaces(hierarchy_solution, 1);
+  }
+
+  par_for("thermal_rad_impl_vcycle_prolong_l1", DevExeSpace(), 0, nmb1,
+          ks, ke, js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const int ci = (i-is)/aggregate1_x1;
+    const int cj = (j-js)/aggregate1_x2;
+    const int ck = (k-ks)/aggregate1_x3;
+    const int packed = level1_offset+(ck*level1_nx2+cj)*level1_nx1+ci;
+    preconditioned(m, 0, k, j, i) += ImplicitPackedScratchValue(
+        hierarchy_solution, m, packed, fine_nx1, fine_nx2, is, js, ks);
+  });
+
+  // Coarse solutions alias packed entries of the fine diagonal.  Restore it before the
+  // fine transpose sweep, then exchange the newly prolonged correction.
+  build_fine_diagonal();
+  ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
+  for (int color = 1; color >= 0; --color) {
+    par_for("thermal_rad_impl_vcycle_fine_backward", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const int parity = (i-is)+(j-js)+(k-ks)+block_parity(gid0+m, 0);
+      if (parity%2 == color) {
+        const Real neighbor_sum = ImplicitFineGlobalNeighborSum(
+            coefficient, preconditioned, remote_faces, neighbor_gid, neighbor_rank,
+            m, gid0+m, gid0, my_rank, k, j, i, is, ie, js, je, ks, ke,
+            fine_nx1, fine_nx2, dt, size.d_view(m).dx1,
+            multi_d ? size.d_view(m).dx2 : 1.0,
+            three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+        const Real x = preconditioned(m, 0, k, j, i);
+        const Real fine_residual = residual(m, 0, k, j, i)-
+            (diagonal(m, 0, k, j, i)*x-neighbor_sum);
+        preconditioned(m, 0, k, j, i) =
+            x+fine_residual/diagonal(m, 0, k, j, i);
+      }
+    });
+    if (color == 1) ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! FLASH-like multigroup diffusion: freeze opacity and limiter coefficients at the old
 //! state, then solve one centered backward-Euler scalar diffusion equation for each
 //! group.  The explicit AP/upwind correction is not part of this matrix.  The group loop
@@ -1396,6 +2797,7 @@ void ThermalRadiation::SolveImplicitTransport(
     // coefficient ghosts would use stale thermodynamic data.  Exchange the interior
     // coefficients explicitly; physical coefficient ghosts use zero-gradient values.
     ExchangeImplicitField(implicit_coefficient_, pbval, false, true);
+    BuildImplicitBlockCoarsePreconditioner(dt);
 
     ExchangeImplicitField(implicit_solution_, pbval, false);
     ApplyImplicitOperator(implicit_solution_, implicit_operator_, dt);
@@ -1403,52 +2805,15 @@ void ThermalRadiation::SolveImplicitTransport(
     par_for("thermal_rad_impl_initial_residual", DevExeSpace(), 0, nmb1,
             ks, ke, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      const Real r = old(m, 0, k, j, i)-applied(m, 0, k, j, i);
-      residual(m, 0, k, j, i) = r;
-      const Real kc = coefficient(m, 0, k, j, i);
-      const Real dx1 = size.d_view(m).dx1;
-      const bool vacuum_p1 = i == ie && b1 == 2 && IsPhysicalBoundary(
-          mb_bcs.d_view(m, BoundaryFace::outer_x1));
-      const bool vacuum_m1 = i == is && b0 == 2 && IsPhysicalBoundary(
-          mb_bcs.d_view(m, BoundaryFace::inner_x1));
-      const Real kp1 = ImplicitFrozenFaceCoefficient(
-          kc, coefficient(m, 0, k, j, i+1), vacuum_p1,
-          vacuum_cap_coefficient*dx1);
-      const Real km1 = ImplicitFrozenFaceCoefficient(
-          kc, coefficient(m, 0, k, j, i-1), vacuum_m1,
-          vacuum_cap_coefficient*dx1);
-      Real rate = (kp1+km1)/(dx1*dx1);
-      if (multi_d) {
-        const Real dx2 = size.d_view(m).dx2;
-        const bool vacuum_p2 = j == je && b3 == 2 && IsPhysicalBoundary(
-            mb_bcs.d_view(m, BoundaryFace::outer_x2));
-        const bool vacuum_m2 = j == js && b2 == 2 && IsPhysicalBoundary(
-            mb_bcs.d_view(m, BoundaryFace::inner_x2));
-        const Real kp2 = ImplicitFrozenFaceCoefficient(
-            kc, coefficient(m, 0, k, j+1, i), vacuum_p2,
-            vacuum_cap_coefficient*dx2);
-        const Real km2 = ImplicitFrozenFaceCoefficient(
-            kc, coefficient(m, 0, k, j-1, i), vacuum_m2,
-            vacuum_cap_coefficient*dx2);
-        rate += (kp2+km2)/(dx2*dx2);
-      }
-      if (three_d) {
-        const Real dx3 = size.d_view(m).dx3;
-        const bool vacuum_p3 = k == ke && b5 == 2 && IsPhysicalBoundary(
-            mb_bcs.d_view(m, BoundaryFace::outer_x3));
-        const bool vacuum_m3 = k == ks && b4 == 2 && IsPhysicalBoundary(
-            mb_bcs.d_view(m, BoundaryFace::inner_x3));
-        const Real kp3 = ImplicitFrozenFaceCoefficient(
-            kc, coefficient(m, 0, k+1, j, i), vacuum_p3,
-            vacuum_cap_coefficient*dx3);
-        const Real km3 = ImplicitFrozenFaceCoefficient(
-            kc, coefficient(m, 0, k-1, j, i), vacuum_m3,
-            vacuum_cap_coefficient*dx3);
-        rate += (kp3+km3)/(dx3*dx3);
-      }
-      const Real z = r/(1.0+dt*rate);
-      preconditioned(m, 0, k, j, i) = z;
-      direction(m, 0, k, j, i) = z;
+      residual(m, 0, k, j, i) =
+          old(m, 0, k, j, i)-applied(m, 0, k, j, i);
+    });
+    ApplyImplicitPreconditioner(
+        implicit_residual_, implicit_preconditioned_, dt);
+    par_for("thermal_rad_impl_initial_direction", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      direction(m, 0, k, j, i) = preconditioned(m, 0, k, j, i);
     });
 
     const Real rhs_norm = ImplicitGlobalDot(implicit_old_, implicit_old_);
@@ -1477,53 +2842,8 @@ void ThermalRadiation::SolveImplicitTransport(
       ++iterations;
       if (residual_norm <= tolerance_squared*scale) break;
 
-      par_for("thermal_rad_impl_precondition", DevExeSpace(), 0, nmb1,
-              ks, ke, js, je, is, ie,
-      KOKKOS_LAMBDA(int m, int k, int j, int i) {
-        const Real kc = coefficient(m, 0, k, j, i);
-        const Real dx1 = size.d_view(m).dx1;
-        const bool vacuum_p1 = i == ie && b1 == 2 && IsPhysicalBoundary(
-            mb_bcs.d_view(m, BoundaryFace::outer_x1));
-        const bool vacuum_m1 = i == is && b0 == 2 && IsPhysicalBoundary(
-            mb_bcs.d_view(m, BoundaryFace::inner_x1));
-        const Real kp1 = ImplicitFrozenFaceCoefficient(
-            kc, coefficient(m, 0, k, j, i+1), vacuum_p1,
-            vacuum_cap_coefficient*dx1);
-        const Real km1 = ImplicitFrozenFaceCoefficient(
-            kc, coefficient(m, 0, k, j, i-1), vacuum_m1,
-            vacuum_cap_coefficient*dx1);
-        Real rate = (kp1+km1)/(dx1*dx1);
-        if (multi_d) {
-          const Real dx2 = size.d_view(m).dx2;
-          const bool vacuum_p2 = j == je && b3 == 2 && IsPhysicalBoundary(
-              mb_bcs.d_view(m, BoundaryFace::outer_x2));
-          const bool vacuum_m2 = j == js && b2 == 2 && IsPhysicalBoundary(
-              mb_bcs.d_view(m, BoundaryFace::inner_x2));
-          const Real kp2 = ImplicitFrozenFaceCoefficient(
-              kc, coefficient(m, 0, k, j+1, i), vacuum_p2,
-              vacuum_cap_coefficient*dx2);
-          const Real km2 = ImplicitFrozenFaceCoefficient(
-              kc, coefficient(m, 0, k, j-1, i), vacuum_m2,
-              vacuum_cap_coefficient*dx2);
-          rate += (kp2+km2)/(dx2*dx2);
-        }
-        if (three_d) {
-          const Real dx3 = size.d_view(m).dx3;
-          const bool vacuum_p3 = k == ke && b5 == 2 && IsPhysicalBoundary(
-              mb_bcs.d_view(m, BoundaryFace::outer_x3));
-          const bool vacuum_m3 = k == ks && b4 == 2 && IsPhysicalBoundary(
-              mb_bcs.d_view(m, BoundaryFace::inner_x3));
-          const Real kp3 = ImplicitFrozenFaceCoefficient(
-              kc, coefficient(m, 0, k+1, j, i), vacuum_p3,
-              vacuum_cap_coefficient*dx3);
-          const Real km3 = ImplicitFrozenFaceCoefficient(
-              kc, coefficient(m, 0, k-1, j, i), vacuum_m3,
-              vacuum_cap_coefficient*dx3);
-          rate += (kp3+km3)/(dx3*dx3);
-        }
-        preconditioned(m, 0, k, j, i) =
-            residual(m, 0, k, j, i)/(1.0+dt*rate);
-      });
+      ApplyImplicitPreconditioner(
+          implicit_residual_, implicit_preconditioned_, dt);
       const Real rz_new = ImplicitGlobalDot(
           implicit_residual_, implicit_preconditioned_);
       const Real beta = rz_new/rz;

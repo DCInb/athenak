@@ -433,7 +433,7 @@ int main(int argc, char **argv) {
               constexpr Real tolerance = 3.0e-11;
               constexpr Real density = 1.0;
               constexpr Real native_temperature = 16.0;
-              constexpr Real continued_temperature = 32.0;
+              constexpr Real continued_temperature = 160.0;
               const auto endpoint = extrapolate_device.StateFromRhoTemperatures(
                   density, native_temperature, native_temperature);
               const auto continued = extrapolate_device.StateFromRhoTemperatures(
