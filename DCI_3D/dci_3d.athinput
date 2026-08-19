@@ -40,6 +40,22 @@ x3max = 0.6
 ix3_bc = outflow
 ox3_bc = outflow
 
+# Keep each rank's 49 MeshBlocks in complete x1-directed tubes, so no rank boundary cuts
+# a ray's path along the drive axis.  One x3 slab per rank measured fastest over 60
+# cycles on the seven available V100s: 110.2 s versus 120.2 s for plain z_order, despite
+# about twice the cross-rank ray transfers.  A radially interleaved map balances the
+# near-axis work more evenly on paper but was the slowest of the three (3.7x the
+# transfers, 9 waves), so tube locality dominates column-level load balance here.
+meshblock_order = x1_rank_map
+meshblock_rank_map_x3_0 = 0,0,0,0,0,0,0
+meshblock_rank_map_x3_1 = 1,1,1,1,1,1,1
+meshblock_rank_map_x3_2 = 2,2,2,2,2,2,2
+meshblock_rank_map_x3_3 = 3,3,3,3,3,3,3
+meshblock_rank_map_x3_4 = 4,4,4,4,4,4,4
+meshblock_rank_map_x3_5 = 5,5,5,5,5,5,5
+meshblock_rank_map_x3_6 = 6,6,6,6,6,6,6
+
+# 7x7x7 = 343 blocks, exactly 49 per rank on the seven available GPUs.
 <meshblock>
 nx1 = 45
 nx2 = 45
@@ -108,14 +124,16 @@ material2_zeff = 2.0
 
 # The tables are generated locally from the audited archive.  The launcher stages
 # byte-identical copies in each run directory and overrides these repo-relative paths.
-material0_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/ch.2t_eos
-material1_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/he.2t_eos
+material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch.2t_eos
+material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au.2t_eos
+material2_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
 eos_table_bounds = flash-extrapolate
 eos_table_interpolation = geometric
 
-material0_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/ch_20g.opacity
-material1_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/he_20g.opacity
+material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
+material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au_20g.opacity
+material2_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
 material0_opacity_interpolation = geometric
 material1_opacity_interpolation = geometric
 material2_opacity_interpolation = geometric
