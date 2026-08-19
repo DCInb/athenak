@@ -31,18 +31,6 @@ x3max = 1.0
 ix3_bc = outflow
 ox3_bc = outflow
 
-# Keep each rank's 128 MeshBlocks in complete x1-directed tubes.  This symmetric
-# map balances both mixed-material work and ray residence without an x1 MPI cut.
-meshblock_order = x1_rank_map
-meshblock_rank_map_x3_0 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_1 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_2 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_3 = 0,1,1,0,2,3,3,2
-meshblock_rank_map_x3_4 = 4,5,5,4,6,7,7,6
-meshblock_rank_map_x3_5 = 4,5,5,4,6,7,7,6
-meshblock_rank_map_x3_6 = 4,5,5,4,6,7,7,6
-meshblock_rank_map_x3_7 = 4,5,5,4,6,7,7,6
-
 <meshblock>
 nx1 = 32
 nx2 = 32
@@ -104,14 +92,14 @@ material1_zeff = 2.0
 
 # The tables are generated locally from the audited archive.  The launcher stages
 # byte-identical copies in each run directory and overrides these repo-relative paths.
-material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch.2t_eos
-material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
+material0_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/ch.2t_eos
+material1_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
 eos_table_bounds = clamp
 eos_table_interpolation = geometric
 
-material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
-material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
+material0_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/ch_20g.opacity
+material1_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/he_20g.opacity
 material0_opacity_interpolation = geometric
 material1_opacity_interpolation = geometric
 material0_opacity_coordinate_interpolation = log
