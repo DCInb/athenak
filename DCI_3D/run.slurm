@@ -7,4 +7,4 @@
 
 source ~/mengqi/bashrc_athenak
 
-mpirun -n 4 src/athena -i ../DCI_3D/dci_3d.athinput
+mpirun -n 4 src/athena -i dci_3d.athinput
