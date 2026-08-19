@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -494,16 +496,33 @@ OpacityTableDevice OpacityTable::DeviceData() const {
 
 MixedOpacityTable::MixedOpacityTable(
     ParameterInput *pin, int expected_groups,
-    const DualArray1D<Real> &expected_group_bounds) :
-    material0_(pin, expected_groups, expected_group_bounds,
-               "materials", "material0_opacity"),
-    material1_(pin, expected_groups, expected_group_bounds,
-               "materials", "material1_opacity") {}
+    const DualArray1D<Real> &expected_group_bounds, int nmaterials) :
+    nmaterials_(nmaterials) {
+  for (int n = 0; n < nmaterials_; ++n) {
+    tables_.push_back(std::make_unique<OpacityTable>(
+        pin, expected_groups, expected_group_bounds, "materials",
+        "material"+std::to_string(n)+"_opacity"));
+  }
+  std::vector<OpacityTableDevice> host_tables(nmaterials_);
+  for (int n = 0; n < nmaterials_; ++n) {
+    host_tables[n] = tables_[n]->DeviceData();
+  }
+  const std::size_t table_bytes = nmaterials_*sizeof(OpacityTableDevice);
+  HostArray1D<unsigned char> host_storage(
+      "mixed-opacity-host-storage", table_bytes);
+  std::memcpy(host_storage.data(), host_tables.data(), table_bytes);
+  device_table_storage_ = DvceArray1D<unsigned char>(
+      "mixed-opacity-table-storage", table_bytes);
+  Kokkos::deep_copy(device_table_storage_, host_storage);
+  device_tables_ = reinterpret_cast<const OpacityTableDevice *>(
+      device_table_storage_.data());
+}
 
 MixedOpacityTableDevice MixedOpacityTable::DeviceData() const {
   MixedOpacityTableDevice result;
-  result.material0 = material0_.DeviceData();
-  result.material1 = material1_.DeviceData();
+  result.nmaterials = nmaterials_;
+  result.material_table_storage = device_table_storage_;
+  result.material_tables = device_tables_;
   return result;
 }
 

@@ -281,7 +281,7 @@ void TwoTemperature::Initialize(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real density = prim(m, IDN, k, j, i);
       const Real eint_old = prim(m, IEN, k, j, i);
-      const Real y0 = mixture.Material0MassFractionFromPrimitive(prim, m, k, j, i);
+      const auto y0 = mixture.CompositionFromPrimitive(prim, m, k, j, i);
       materials::MaterialThermodynamicState state =
           mixture.InitialStateFromTotalSpecificEnergy(
               density, eint_old/density, y0, initial_ratio);
@@ -378,7 +378,7 @@ void TwoTemperature::Sync(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real density = prim(m, IDN, k, j, i);
       Real eint = prim(m, IEN, k, j, i);
-      const Real y0 = mixture.Material0MassFractionFromPrimitive(prim, m, k, j, i);
+      const auto y0 = mixture.CompositionFromPrimitive(prim, m, k, j, i);
       const Real eion_raw = cons(m, iion_, k, j, i);
       const Real eele_raw = cons(m, iele_, k, j, i);
       const Real eion_adv = fmax(eion_raw, 0.0);
@@ -526,7 +526,7 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
             ju, il, iu,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real density = cons(m, IDN, k, j, i);
-      const Real y0 = mixture.Material0MassFractionFromConserved(
+      const auto y0 = mixture.CompositionFromConserved(
           cons, m, k, j, i);
       const Real eion = cons(m, iion_, k, j, i);
       const Real eele = cons(m, iele_, k, j, i);
@@ -713,7 +713,7 @@ void TwoTemperature::RefreshMaterialThermodynamics(
           kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const Real density = cons(m, IDN, k, j, i);
-    const Real y0 = mixture.Material0MassFractionFromConserved(
+    const auto y0 = mixture.CompositionFromConserved(
         cons, m, k, j, i);
     const materials::MaterialThermodynamicState state =
         mixture.StateFromRhoSpecificEnergies(
@@ -778,7 +778,7 @@ void TwoTemperature::CloseBiermannStage(
             kl, ku, jl, ju, il, iu,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real density = w(m, IDN, k, j, i);
-      const Real y0 = mixture.Material0MassFractionFromPrimitive(w, m, k, j, i);
+      const auto y0 = mixture.CompositionFromPrimitive(w, m, k, j, i);
       const Real eele_raw = cons(m, iele_, k, j, i);
       const Real eint_before = w(m, IEN, k, j, i);
       const BiermannClosedState closed = closure.CloseSelected(
@@ -794,10 +794,10 @@ void TwoTemperature::CloseBiermannStage(
       w(m, iion_, k, j, i) = eion/density;
       w(m, iele_, k, j, i) = eele/density;
       const int ion_query_flags = mixture.IonSpecificEnergyQueryFlags(
-          density, eion/density, closed.material0_mass_fraction);
+          density, eion/density, closed.composition);
       const materials::MaterialElectronState state =
           mixture.ElectronStateFromRhoSpecificEnergy(
-              density, eele/density, closed.material0_mass_fraction);
+              density, eele/density, closed.composition);
       StoreMaterialElectronState(
           temp, thermo, state, closed.query_flags | ion_query_flags, m, k, j, i);
     });
@@ -809,7 +809,7 @@ void TwoTemperature::CloseBiermannStage(
             kl, ku, jl, ju, il, iu,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real density = w(m, IDN, k, j, i);
-      const Real y0 = mixture.Material0MassFractionFromPrimitive(w, m, k, j, i);
+      const auto y0 = mixture.CompositionFromPrimitive(w, m, k, j, i);
       const Real eele_raw = cons(m, iele_, k, j, i);
       const Real eint_before = w(m, IEN, k, j, i);
       const BiermannClosedState closed = closure.CloseSelected(
@@ -827,7 +827,7 @@ void TwoTemperature::CloseBiermannStage(
       const materials::MaterialThermodynamicState state =
           mixture.StateFromRhoSpecificEnergies(
               density, eion/density, eele/density,
-              closed.material0_mass_fraction);
+              closed.composition);
       StoreMaterialThermodynamics(
           temp, thermo, state, closed.query_flags, m, k, j, i);
     });
@@ -842,6 +842,16 @@ void TwoTemperature::CloseBiermannStage(
 void TwoTemperature::AddRadiationFluxes(const DvceArray5D<Real> &prim,
                                         DvceFaceFld5D<Real> &flx) {
   if (pradiation != nullptr) pradiation->AddFluxes(prim, temperature, flx);
+}
+
+//----------------------------------------------------------------------------------------
+
+void TwoTemperature::SolveImplicitRadiationTransport(
+    const Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
+    MeshBoundaryValuesCC *pbval) {
+  if (pradiation != nullptr) {
+    pradiation->SolveImplicitTransport(dt, cons, prim, temperature, pbval);
+  }
 }
 
 //----------------------------------------------------------------------------------------

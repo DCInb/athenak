@@ -4,13 +4,17 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file material_mixture.cpp
-//! \brief Input parsing for ideal and tabular two-material plasma closures.
+//! \brief Input parsing for ideal and tabular multi-material plasma closures.
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "athena.hpp"
 #include "materials/material_mixture.hpp"
@@ -73,19 +77,24 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
                                  units::Units *unit_system) {
   const int number_of_materials =
       pin->GetOrAddInteger("materials", "nmaterials", 2);
-  if (number_of_materials != 2) {
-    MaterialInputError("this closure requires nmaterials=2");
+  if (number_of_materials < 1) {
+    MaterialInputError("nmaterials must be a positive integer");
   }
+  data_.nmaterials = number_of_materials;
+  // Every material has an explicit mass fraction. scalar_index names the first of a
+  // contiguous run of nmaterials passive scalars.
   const int relative_scalar =
       pin->GetOrAddInteger("materials", "scalar_index", 0);
-  if (relative_scalar < 0 || relative_scalar >= nuser_scalars) {
-    MaterialInputError("scalar_index must select a user passive scalar in <" +
-                       block + ">");
+  if (relative_scalar < 0 || relative_scalar > nuser_scalars ||
+      number_of_materials > nuser_scalars-relative_scalar) {
+    MaterialInputError("scalar_index must select " +
+                       std::to_string(number_of_materials) +
+                       " user passive scalars in <" + block + ">");
   }
   constexpr Real monatomic_gamma = 5.0/3.0;
   if (!std::isfinite(gamma) ||
       std::abs(gamma-monatomic_gamma) > 32.0*std::numeric_limits<Real>::epsilon()) {
-    MaterialInputError("the two-material closure currently requires <" + block +
+    MaterialInputError("the material-mixture closure currently requires <" + block +
                        ">/gamma=5/3");
   }
 
@@ -93,21 +102,40 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
   if (!std::isfinite(default_exchange_time)) {
     MaterialInputError("the default <" + block + ">/t_ei must be finite");
   }
-  data_.material0 = ReadMaterial(pin, 0, default_exchange_time);
-  data_.material1 = ReadMaterial(pin, 1, default_exchange_time);
+  std::vector<SpeciesProperties> host_species(number_of_materials);
+  for (int n = 0; n < number_of_materials; ++n) {
+    host_species[n] = ReadMaterial(pin, n, default_exchange_time);
+  }
+  data_.species = DvceArray1D<SpeciesProperties>(
+      "material_species", number_of_materials);
+  auto species_host = Kokkos::create_mirror_view(data_.species);
+  for (int n = 0; n < number_of_materials; ++n) {
+    species_host(n) = host_species[n];
+  }
+  Kokkos::deep_copy(data_.species, species_host);
+
   data_.scalar_index = first_user_scalar+relative_scalar;
+  data_.scalar_indices = DvceArray1D<int>(
+      "material_scalar_indices", number_of_materials);
+  auto scalar_indices_host = Kokkos::create_mirror_view(data_.scalar_indices);
+  for (int n = 0; n < number_of_materials; ++n) {
+    scalar_indices_host(n) = first_user_scalar+relative_scalar+n;
+  }
+  Kokkos::deep_copy(data_.scalar_indices, scalar_indices_host);
+
   data_.gamma_minus_one = gamma-1.0;
 
-  pin->GetOrAddString("materials", "material0_name", "material0");
-  pin->GetOrAddString("materials", "material1_name", "material1");
+  for (int n = 0; n < number_of_materials; ++n) {
+    pin->GetOrAddString("materials", Key(n, "name"), "material"+std::to_string(n));
+  }
 
   const bool has_table0 = pin->DoesParameterExist(
       "materials", "material0_eos_table_file");
-  const bool has_table1 = pin->DoesParameterExist(
-      "materials", "material1_eos_table_file");
-  if (has_table0 != has_table1) {
-    MaterialInputError(
-        "material0_eos_table_file and material1_eos_table_file must be supplied together");
+  for (int n = 1; n < number_of_materials; ++n) {
+    if (pin->DoesParameterExist("materials", Key(n, "eos_table_file")) !=
+        has_table0) {
+      MaterialInputError("every material*_eos_table_file must be supplied together");
+    }
   }
   if (!has_table0) {
     if (unit_system != nullptr) {
@@ -117,7 +145,8 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     return;
   }
   if (unit_system == nullptr) {
-    MaterialInputError("tabular two-temperature EOS requires a <units> block");
+    MaterialInputError(
+        "tabular multi-material two-temperature EOS requires a <units> block");
   }
 
   const std::string mixing_rule = pin->GetOrAddString(
@@ -136,8 +165,11 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     options.bounds_policy = IonmixBoundsPolicy::clamp;
   } else if (bounds == "error") {
     options.bounds_policy = IonmixBoundsPolicy::error;
+  } else if (bounds == "flash-extrapolate") {
+    options.bounds_policy = IonmixBoundsPolicy::flash_extrapolate;
   } else {
-    MaterialInputError("eos_table_bounds must be 'clamp' or 'error'");
+    MaterialInputError(
+        "eos_table_bounds must be 'clamp', 'error', or 'flash-extrapolate'");
   }
   if (interpolation == "geometric") {
     options.geometric_interpolation = true;
@@ -166,32 +198,34 @@ MaterialMixture::MaterialMixture(ParameterInput *pin, const std::string &block,
     MaterialInputError("eos_wave_speed_safety must be finite and at least one");
   }
 
-  const std::string file0 = pin->GetString(
-      "materials", "material0_eos_table_file");
-  const std::string file1 = pin->GetString(
-      "materials", "material1_eos_table_file");
-  material0_table_ = std::make_unique<IonmixTwoTemperatureTable>(file0, options);
-  material1_table_ = std::make_unique<IonmixTwoTemperatureTable>(file1, options);
-  CheckAbar(0, data_.material0, material0_table_->Metadata());
-  CheckAbar(1, data_.material1, material1_table_->Metadata());
-
-  const std::string fingerprint0 = pin->GetOrAddString(
-      "materials", "material0_eos_table_fingerprint",
-      material0_table_->Metadata().file_fingerprint);
-  const std::string fingerprint1 = pin->GetOrAddString(
-      "materials", "material1_eos_table_fingerprint",
-      material1_table_->Metadata().file_fingerprint);
-  if (fingerprint0 != material0_table_->Metadata().file_fingerprint) {
-    MaterialInputError(
-        "material0_eos_table_fingerprint does not match the loaded file");
+  tables_.resize(number_of_materials);
+  std::vector<IonmixTwoTemperatureTableDevice> host_material_tables(
+      number_of_materials);
+  for (int n = 0; n < number_of_materials; ++n) {
+    const std::string file = pin->GetString("materials", Key(n, "eos_table_file"));
+    tables_[n] = std::make_unique<IonmixTwoTemperatureTable>(file, options);
+    CheckAbar(n, host_species[n], tables_[n]->Metadata());
+    const std::string fingerprint = pin->GetOrAddString(
+        "materials", Key(n, "eos_table_fingerprint"),
+        tables_[n]->Metadata().file_fingerprint);
+    if (fingerprint != tables_[n]->Metadata().file_fingerprint) {
+      MaterialInputError(
+          Key(n, "eos_table_fingerprint")+" does not match the loaded file");
+    }
+    host_material_tables[n] = tables_[n]->DeviceData();
   }
-  if (fingerprint1 != material1_table_->Metadata().file_fingerprint) {
-    MaterialInputError(
-        "material1_eos_table_fingerprint does not match the loaded file");
-  }
-
-  data_.material0_table = material0_table_->DeviceData();
-  data_.material1_table = material1_table_->DeviceData();
+  const std::size_t table_bytes =
+      number_of_materials*sizeof(IonmixTwoTemperatureTableDevice);
+  HostArray1D<unsigned char> host_table_storage(
+      "material-eos-table-host-storage", table_bytes);
+  std::memcpy(
+      host_table_storage.data(), host_material_tables.data(), table_bytes);
+  data_.material_table_storage = DvceArray1D<unsigned char>(
+      "material-eos-table-storage", table_bytes);
+  Kokkos::deep_copy(data_.material_table_storage, host_table_storage);
+  data_.material_tables =
+      reinterpret_cast<const IonmixTwoTemperatureTableDevice *>(
+          data_.material_table_storage.data());
   data_.density_to_cgs = options.density_to_cgs;
   data_.temperature_to_kelvin = options.temperature_to_kelvin;
   data_.use_tabular_eos = true;

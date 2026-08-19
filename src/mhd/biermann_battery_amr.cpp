@@ -94,11 +94,12 @@ struct CompositeAMREvaluator {
       const Real raw_density,
       const Real momentum1, const Real momentum2, const Real momentum3,
       const Real total_energy, const Real raw_ion_energy,
-      const Real raw_electron_energy, const Real raw_material0_density,
+      const Real raw_electron_energy,
+      const materials::MaterialComposition &composition,
       const Real bcc1, const Real bcc2, const Real bcc3) const {
     const two_temperature::BiermannClosedState closed = closure.CloseConserved(
         raw_density, momentum1, momentum2, momentum3, total_energy,
-        raw_ion_energy, raw_electron_energy, raw_material0_density,
+        raw_ion_energy, raw_electron_energy, composition,
         bcc1, bcc2, bcc3);
     CompositeCellState result;
     result.density = closed.density;
@@ -108,7 +109,7 @@ struct CompositeAMREvaluator {
           closure.mixture.StateFromRhoSpecificEnergiesNoSound(
               result.density, closed.ion_energy/result.density,
               closed.electron_energy/result.density,
-              closed.material0_mass_fraction);
+              closed.composition);
       result.electron_pressure = fmax(state.electron_pressure, 0.0);
       const Real conversion =
           materials::MaterialMixtureDevice::atomic_mass_unit_cgs/
@@ -133,7 +134,7 @@ struct CompositeAMREvaluator {
           closure.gamma_minus_one*closed.electron_energy;
       if (closure.use_materials) {
         result.electron_density = closure.mixture.ElectronNumberDensity(
-            result.density, closed.material0_mass_fraction);
+            result.density, closed.composition);
       } else {
         result.electron_density = electron_fraction*result.density;
       }
@@ -146,8 +147,11 @@ struct CompositeAMREvaluator {
                               const DvceFaceFld4D<Real> &magnetic,
                               const int m, const int k,
                               const int j, const int i) const {
-    const Real material0_density = closure.use_materials
-        ? conserved(m, closure.mixture.scalar_index, k, j, i) : 0.0;
+    materials::MaterialComposition composition;
+    if (closure.use_materials) {
+      composition = closure.mixture.CompositionFromConserved(
+          conserved, m, k, j, i);
+    }
     const Real bcc1 = 0.5*(
         magnetic.x1f(m, k, j, i)+magnetic.x1f(m, k, j, i+1));
     const Real bcc2 = 0.5*(
@@ -159,7 +163,7 @@ struct CompositeAMREvaluator {
         conserved(m, IM1, k, j, i), conserved(m, IM2, k, j, i),
         conserved(m, IM3, k, j, i), conserved(m, IEN, k, j, i),
         conserved(m, ion_index, k, j, i),
-        conserved(m, electron_index, k, j, i), material0_density,
+        conserved(m, electron_index, k, j, i), composition,
         bcc1, bcc2, bcc3);
   }
 
@@ -178,7 +182,6 @@ struct CompositeAMREvaluator {
     Real total_energy = 0.0;
     Real ion_energy = 0.0;
     Real electron_energy = 0.0;
-    Real material0_density = 0.0;
     for (int dk=0; dk<nk; ++dk) {
       for (int dj=0; dj<2; ++dj) {
         for (int di=0; di<2; ++di) {
@@ -191,10 +194,6 @@ struct CompositeAMREvaluator {
               weight*fine_conserved(m, ion_index, fk+dk, fj+dj, fi+di);
           electron_energy +=
               weight*fine_conserved(m, electron_index, fk+dk, fj+dj, fi+di);
-          if (closure.use_materials) {
-            material0_density += weight*fine_conserved(
-                m, closure.mixture.scalar_index, fk+dk, fj+dj, fi+di);
-          }
         }
       }
     }
@@ -240,9 +239,14 @@ struct CompositeAMREvaluator {
         }
       }
     }
+    materials::MaterialComposition composition;
+    if (closure.use_materials) {
+      composition = closure.mixture.CompositionFromConservedRestriction(
+          fine_conserved, m, fk, fj, fi, nk, weight, density);
+    }
     return CellFromValues(
         density, momentum1, momentum2, momentum3, total_energy,
-        ion_energy, electron_energy, material0_density, bcc1, bcc2, bcc3);
+        ion_energy, electron_energy, composition, bcc1, bcc2, bcc3);
   }
 
   KOKKOS_INLINE_FUNCTION

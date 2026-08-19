@@ -419,6 +419,87 @@ int main(int argc, char **argv) {
       }
 
       if (mode == "check") {
+        materials::IonmixTwoTemperatureTableOptions extrapolate_options = options;
+        extrapolate_options.bounds_policy =
+            materials::IonmixBoundsPolicy::flash_extrapolate;
+        materials::IonmixTwoTemperatureTable extrapolate_table(
+            filename, extrapolate_options);
+        const auto extrapolate_device = extrapolate_table.DeviceData();
+        int extrapolate_failures = 0;
+        Kokkos::parallel_reduce(
+            "ionmix_flash_high_temperature_continuation",
+            Kokkos::RangePolicy<>(0, 1),
+            KOKKOS_LAMBDA(const int, int &local_failures) {
+              constexpr Real tolerance = 3.0e-11;
+              constexpr Real density = 1.0;
+              constexpr Real native_temperature = 16.0;
+              constexpr Real continued_temperature = 160.0;
+              const auto endpoint = extrapolate_device.StateFromRhoTemperatures(
+                  density, native_temperature, native_temperature);
+              const auto continued = extrapolate_device.StateFromRhoTemperatures(
+                  density, continued_temperature, continued_temperature);
+              const auto temperature =
+                  extrapolate_device.TemperatureFromRhoTemperature(
+                      density, continued_temperature);
+              const auto paired =
+                  extrapolate_device.PressureEnergyFromRhoTemperature(
+                      density, continued_temperature);
+              const auto ion_inverse =
+                  extrapolate_device.IonFromRhoSpecificEnergy(
+                      density, continued.ion.specific_internal_energy);
+              const auto electron_inverse =
+                  extrapolate_device.ElectronFromRhoSpecificEnergy(
+                      density, continued.electron.specific_internal_energy);
+              const auto prepared =
+                  extrapolate_device.PrepareDensityLocation(density);
+              materials::IonmixEnergyIntervalCache cache;
+              const Real cached_ion_energy =
+                  extrapolate_device.ComponentEnergyFromPreparedDensityTemperature(
+                      materials::IonmixComponent::ion, prepared,
+                      continued_temperature, log(continued_temperature), cache);
+
+              if (!NearlyEqual(temperature.temperature,
+                               continued_temperature, tolerance) ||
+                  temperature.query_flags != materials::ionmix_query_in_bounds ||
+                  continued.query_flags != materials::ionmix_query_in_bounds ||
+                  !ExactPressureEnergyMatch(
+                      paired, continued.ion, continued.electron) ||
+                  !(continued.ion.pressure > endpoint.ion.pressure) ||
+                  !(continued.electron.pressure > endpoint.electron.pressure) ||
+                  !(continued.ion.specific_internal_energy >
+                    endpoint.ion.specific_internal_energy) ||
+                  !(continued.electron.specific_internal_energy >
+                    endpoint.electron.specific_internal_energy) ||
+                  continued.mean_ionization != endpoint.mean_ionization ||
+                  !NearlyEqual(cached_ion_energy,
+                               continued.ion.specific_internal_energy,
+                               tolerance) ||
+                  !NearlyEqual(ion_inverse.temperature,
+                               continued_temperature, tolerance) ||
+                  !NearlyEqual(ion_inverse.pressure,
+                               continued.ion.pressure, tolerance) ||
+                  !NearlyEqual(ion_inverse.specific_internal_energy,
+                               continued.ion.specific_internal_energy,
+                               tolerance) ||
+                  ion_inverse.query_flags != materials::ionmix_query_in_bounds ||
+                  !NearlyEqual(electron_inverse.temperature,
+                               continued_temperature, tolerance) ||
+                  !NearlyEqual(electron_inverse.pressure,
+                               continued.electron.pressure, tolerance) ||
+                  !NearlyEqual(electron_inverse.specific_internal_energy,
+                               continued.electron.specific_internal_energy,
+                               tolerance) ||
+                  electron_inverse.query_flags !=
+                      materials::ionmix_query_in_bounds) {
+                ++local_failures;
+              }
+            }, Kokkos::Sum<int>(extrapolate_failures));
+        if (extrapolate_failures != 0) {
+          std::cerr << extrapolate_failures
+                    << " high-temperature continuation checks failed\n";
+          return_code = EXIT_FAILURE;
+        }
+
         materials::IonmixTwoTemperatureTableOptions linear_options = options;
         linear_options.geometric_interpolation = false;
         materials::IonmixTwoTemperatureTable linear_table(filename, linear_options);

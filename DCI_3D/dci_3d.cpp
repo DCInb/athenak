@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 //! \file dci_3d.cpp
-//! \brief Three-dimensional laser drive of an open CH spherical shell with CH/He 3T.
+//! \brief Three-dimensional laser drive of an open CH/Au target in a He chamber.
 //!
 //! The deck selects the carrier fluid: a <mhd> block runs the full 3T MHD problem with
 //! the Biermann battery, while a <hydro> block runs exactly the same target, laser, and
@@ -34,7 +34,7 @@
 
 namespace {
 
-constexpr int kHistoryFields = 21;
+constexpr int kHistoryFields = 22;
 
 void DCIHistory(HistoryData *pdata, Mesh *pm);
 void VacuumRadiationBoundary(Mesh *pm);
@@ -118,8 +118,9 @@ DCIFluid SelectFluid(MeshBlockPack *pmbp) {
 //! The smooth geometry variable alpha is a volume fraction.  The passive scalar is a
 //! mass fraction: rho*X_CH = alpha*rho_CH.  This distinction is important across the
 //! smoothed solid/ambient interface where the component densities differ by five orders
-//! of magnitude.  The material closure evaluates the CH and He tables at their partial
-//! densities and initializes both components at the requested common physical temperature.
+//! of magnitude.  The material closure evaluates the CH, Au, and He tables at their partial
+//! densities and initializes every component at the requested common physical
+//! temperature.
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   static_assert(kHistoryFields <= NHISTORY_VARIABLES,
@@ -151,14 +152,18 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (!pmy_mesh_->three_d) {
     ProblemError("dci_3d requires a three-dimensional Cartesian mesh");
   }
-  if (fluid.nuser_scalars != 1) {
-    ProblemError("dci_3d requires exactly one user scalar for rho*X_CH");
+  // Each material is explicit: rho*Y_CH, rho*Y_Au, and rho*Y_He are all advected.
+  if (fluid.nuser_scalars != 3) {
+    ProblemError("dci_3d requires exactly three user scalars for CH, Au, and He");
   }
   if (fluid.pmaterials == nullptr) {
-    ProblemError("dci_3d requires the two-material CH/He closure");
+    ProblemError("dci_3d requires the three-material CH/Au/He closure");
+  }
+  if (fluid.pmaterials->NumberOfMaterials() != 3) {
+    ProblemError("dci_3d requires <materials>/nmaterials=3 (CH shell, Au cone, He)");
   }
   if (!fluid.pmaterials->UsesTabularEOS()) {
-    ProblemError("dci_3d requires both audited CH and He two-temperature EOS tables");
+    ProblemError("dci_3d requires the audited CH, Au, and He two-temperature EOS tables");
   }
   if (ptwo->pradiation->ngroups != 20) {
     ProblemError("dci_3d requires the 20 reference radiation groups");
@@ -173,52 +178,66 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     ProblemError("dci_3d requires the material-number-density Biermann normalization");
   }
 
+  // Target geometry transcribed from 3d_zb/Simulation_initBlock.F90 with the FLASH cone
+  // axis +z mapped to +x1.  Lengths are code mm (0.1 cm), so the archive's cm constants
+  // are multiplied by ten:
+  //
+  //   CH shell (FOAM_SPEC): 0.52 < R <= 0.55 mm spherical cap, |polar| <= 50 deg
+  //   Au cone (CONE_SPEC):  hollow cone on the same 50-degree surface, x1 from 0.085 mm
+  //                         up to the cap edge, wall 0.031 mm thick measured in
+  //                         cylindrical
+  //                         radius (the archive's lxa offset)
+  //   He ambient (CHAM_SPEC): everything else
   const Real ambient_density =
       pin->GetOrAddReal("problem", "ambient_density", 9.090909090909091e-6);
   const Real solid_density =
       pin->GetOrAddReal("problem", "solid_density", 1.0);
+  const Real cone_density =
+      pin->GetOrAddReal("problem", "cone_density", 17.454545454545453);
   const Real temperature_kelvin =
       pin->GetOrAddReal("problem", "temperature_kelvin", 11606.0);
   const Real inner_radius =
-      pin->GetOrAddReal("problem", "inner_radius", 0.8);
+      pin->GetOrAddReal("problem", "inner_radius", 0.52);
   const Real outer_radius =
-      pin->GetOrAddReal("problem", "outer_radius", 1.0);
+      pin->GetOrAddReal("problem", "outer_radius", 0.55);
   const Real opening_half_angle_deg =
       pin->GetOrAddReal("problem", "opening_half_angle_deg", 50.0);
+  const Real cone_base_x1 =
+      pin->GetOrAddReal("problem", "cone_base_x1", 0.085);
+  const Real cone_wall_offset =
+      pin->GetOrAddReal("problem", "cone_wall_offset", 0.031);
   const Real transition_width =
-      pin->GetOrAddReal("problem", "transition_width", 2.0e-2);
+      pin->GetOrAddReal("problem", "transition_width", 5.0e-3);
   const Real angular_transition =
       pin->GetOrAddReal("problem", "angular_transition", 1.0e-2);
   if (!(ambient_density > 0.0) || !(solid_density > ambient_density) ||
+      !(cone_density > solid_density) ||
       !(temperature_kelvin > 0.0) || !(inner_radius > 0.0) ||
       !(outer_radius > inner_radius) || !(opening_half_angle_deg > 0.0) ||
       !(opening_half_angle_deg < 90.0) || !(transition_width > 0.0) ||
-      !(angular_transition > 0.0)) {
+      !(angular_transition > 0.0) || !(cone_base_x1 > 0.0) ||
+      !(cone_wall_offset > 0.0)) {
     ProblemError("dci_3d geometry and thermodynamic parameters are invalid");
   }
   if (!NearlyEqual(solid_density, 1.0) ||
+      !NearlyEqual(cone_density, 17.454545454545453, 17.454545454545453) ||
       !NearlyEqual(ambient_density, 9.090909090909091e-6) ||
       !NearlyEqual(temperature_kelvin, 11606.0, 11606.0) ||
-      !NearlyEqual(inner_radius, 0.8) || !NearlyEqual(outer_radius, 1.0) ||
-      !NearlyEqual(opening_half_angle_deg, 50.0, 50.0)) {
-    ProblemError("dci_3d target must be 1.1 g/cc CH from 0.8--1.0 mm, a 50-degree "
-                 "half-angle, 1e-5 g/cc He, and 11606 K");
+      !NearlyEqual(inner_radius, 0.52) || !NearlyEqual(outer_radius, 0.55) ||
+      !NearlyEqual(opening_half_angle_deg, 50.0, 50.0) ||
+      !NearlyEqual(cone_base_x1, 0.085) ||
+      !NearlyEqual(cone_wall_offset, 0.031)) {
+    ProblemError("dci_3d target must be the archived 1.1 g/cc CH cap from 0.52--0.55 mm, "
+                 "a 19.2 g/cc Au cone on the same 50-degree surface, 1e-5 g/cc He, "
+                 "and 11606 K");
   }
 
-  const std::string geometry =
-      pin->GetString("laser", "beam0_geometry");
-  const std::string profile = pin->GetString("laser", "beam0_profile");
-  const Real lens_x1 = pin->GetReal("laser", "beam0_lens_x1");
-  const Real target_x1 = pin->GetReal("laser", "beam0_target_x1");
-  const Real aperture_radius =
-      pin->GetReal("laser", "beam0_aperture_radius");
-  const Real target_radius = pin->GetReal("laser", "beam0_target_radius");
-  const Real profile_radius = pin->GetReal("laser", "beam0_profile_radius");
-  const Real beam_power = pin->GetReal("laser", "beam0_power");
-  const Real wavelength = pin->GetReal("laser", "beam0_wavelength");
-  const Real beam_start = pin->GetReal("laser", "beam0_start_time");
-  const Real beam_end = pin->GetReal("laser", "beam0_end_time");
-  const int beam_rays = pin->GetInteger("laser", "beam0_nrays");
+  // The drive is the audited FLASH 3d_zb/ParDir/1l_4beam_BB.par laser mapped with the
+  // cone axis +z -> +x1: four collimated 0.275 mm uniform 3-omega beams at the four
+  // diagonal azimuths, 50 degrees off axis, sharing the archived 13-section picket
+  // pulse whose per-beam integral is 1.774550 kJ (7.0982 kJ total).
+  const int nbeams = pin->GetInteger("laser", "nbeams");
+  const int npulses = pin->GetInteger("laser", "npulses");
   const int max_reflections =
       pin->GetInteger("laser", "max_reflections_per_ray");
   const int max_mpi_waves = pin->GetInteger("laser", "max_mpi_waves");
@@ -228,11 +247,62 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetReal("laser", "reflection_hysteresis_fraction");
   const bool allow_laser_transport_variants = pin->GetOrAddBoolean(
       "problem", "allow_laser_transport_variants", false);
+  if (nbeams != 4 || npulses != 1 ||
+      pin->GetInteger("laser", "pulse0_nsections") != 13) {
+    ProblemError("dci_3d requires the archived four-beam single-pulse FLASH drive");
+  }
+  Real pulse_energy = 0.0;  // erg, from code-ns knots and erg/s powers
+  Real peak_power = 0.0;
+  Real previous_time = 0.0;
+  Real previous_power = 0.0;
+  for (int s = 0; s < 13; ++s) {
+    const Real knot_time =
+        pin->GetReal("laser", "pulse0_time_" + std::to_string(s));
+    const Real knot_power =
+        pin->GetReal("laser", "pulse0_power_" + std::to_string(s));
+    if (s > 0) {
+      pulse_energy += 0.5*(knot_power+previous_power)*(knot_time-previous_time)*1.0e-9;
+    }
+    peak_power = std::fmax(peak_power, knot_power);
+    previous_time = knot_time;
+    previous_power = knot_power;
+  }
+  const Real reference_pulse_energy = 1.774550e10;  // erg per beam
+  const bool pulse_matches =
+      std::abs(pulse_energy-reference_pulse_energy) <=
+          1.0e-6*reference_pulse_energy &&
+      NearlyEqual(peak_power, 6.875e18, 6.875e18) &&
+      NearlyEqual(previous_time, 4.71, 4.71) &&
+      NearlyEqual(previous_power, 0.0);
+  bool beams_match = true;
+  bool quadrant_used[2][2] = {{false, false}, {false, false}};
+  for (int b = 0; b < nbeams; ++b) {
+    const std::string beam = "beam" + std::to_string(b) + "_";
+    const Real lens_x2 = pin->GetReal("laser", beam + "lens_x2");
+    const Real lens_x3 = pin->GetReal("laser", beam + "lens_x3");
+    beams_match = beams_match &&
+        pin->GetString("laser", beam + "geometry") == "lens" &&
+        pin->GetString("laser", beam + "profile") == "uniform" &&
+        NearlyEqual(pin->GetReal("laser", beam + "wavelength"),
+                    3.51e-5, 3.51e-5) &&
+        NearlyEqual(pin->GetReal("laser", beam + "lens_x1"), 2.037, 2.037) &&
+        NearlyEqual(std::abs(lens_x2), 1.4142, 1.4142) &&
+        NearlyEqual(std::abs(lens_x3), 1.4142, 1.4142) &&
+        NearlyEqual(pin->GetReal("laser", beam + "target_x1"), 0.359) &&
+        NearlyEqual(pin->GetReal("laser", beam + "target_x2"), 0.0) &&
+        NearlyEqual(pin->GetReal("laser", beam + "target_x3"), 0.0) &&
+        NearlyEqual(pin->GetReal("laser", beam + "aperture_radius"), 0.275) &&
+        NearlyEqual(pin->GetReal("laser", beam + "target_radius"), 0.275) &&
+        pin->GetInteger("laser", beam + "pulse_number") == 0 &&
+        pin->GetInteger("laser", beam + "nrays") >= 4096 &&
+        NearlyEqual(pin->GetReal("laser", beam + "start_time"), 0.0) &&
+        NearlyEqual(pin->GetReal("laser", beam + "end_time"), 5.0, 5.0);
+    quadrant_used[lens_x2 > 0.0 ? 1 : 0][lens_x3 > 0.0 ? 1 : 0] = true;
+  }
+  beams_match = beams_match &&
+      quadrant_used[0][0] && quadrant_used[0][1] &&
+      quadrant_used[1][0] && quadrant_used[1][1];
   const Real pi = std::acos(-1.0);
-  const Real projected_outer_radius =
-      outer_radius*std::sin(opening_half_angle_deg*pi/180.0);
-  const Real covered_area_fraction =
-      SQR(target_radius/projected_outer_radius);
   const bool production_transport =
       max_reflections == 64 && max_mpi_waves >= 64 &&
       NearlyEqual(reflection_offset, 1.0e-5) &&
@@ -241,23 +311,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       max_reflections > 0 && max_mpi_waves >= 64 &&
       reflection_offset >= 1.0e-7 && reflection_offset <= 1.0e-3 &&
       reflection_hysteresis >= 0.0 && reflection_hysteresis < 0.1;
-  if (geometry != "lens" || profile != "gaussian" ||
-      !NearlyEqual(lens_x1, pmy_mesh_->mesh_size.x1max,
-                   std::abs(pmy_mesh_->mesh_size.x1max)) ||
-      !NearlyEqual(target_x1, outer_radius, outer_radius) ||
-      !(lens_x1 > target_x1) ||
-      !(aperture_radius > target_radius) || !(target_radius > 0.0) ||
-      target_radius > projected_outer_radius || covered_area_fraction < 0.5 ||
-      covered_area_fraction > 1.0 ||
-      !NearlyEqual(profile_radius, aperture_radius, aperture_radius) ||
-      beam_rays < 4096 ||
-      !NearlyEqual(beam_power, 2.0e19, 2.0e19) ||
-      !NearlyEqual(wavelength, 1.053e-4, 1.053e-4) ||
-      !NearlyEqual(beam_start, 0.0) || !NearlyEqual(beam_end, 5.0, 5.0) ||
+  if (!beams_match || !pulse_matches ||
       !(allow_laser_transport_variants ? diagnostic_transport
                                       : production_transport)) {
-    ProblemError("dci_3d requires the documented focused Gaussian 10 kJ beam "
-                 "and chatter-controlled ray-transport limits");
+    ProblemError("dci_3d requires the archived FLASH 3d_zb four-beam collimated "
+                 "uniform 3-omega picket drive and chatter-controlled "
+                 "ray-transport limits");
   }
 
   auto &indcs = pmy_mesh_->mb_indcs;
@@ -266,13 +325,19 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int ks = indcs.ks, ke = indcs.ke;
   const int nmb1 = pmbp->nmb_thispack - 1;
   const int scalar_index = fluid.pmaterials->ScalarIndex();
+  const int cone_scalar_index = scalar_index+1;
+  const int helium_scalar_index = scalar_index+2;
   const auto material_mixture = fluid.pmaterials->DeviceData();
   const Real code_temperature =
       material_mixture.CodeTemperatureFromKelvin(temperature_kelvin);
   auto size = pmbp->pmb->mb_size;
   auto w0 = fluid.w0;
-  const Real cos_half_angle =
-      std::cos(opening_half_angle_deg*pi/180.0);
+  const Real half_angle = opening_half_angle_deg*pi/180.0;
+  const Real cos_half_angle = std::cos(half_angle);
+  // The archive writes the cone surface as |z| = tan(90-angle/2)*rr, i.e. the same
+  // 50-degree half-angle as the CH cap edge, and truncates it at the cap's own edge.
+  const Real cone_slope = std::tan(0.5*pi-half_angle);
+  const Real cone_tip_x1 = outer_radius*cos_half_angle;
 
   Kokkos::deep_copy(w0, 0.0);
   if (fluid.is_mhd) {
@@ -292,22 +357,50 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real x3 = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                 size.d_view(m).x3max);
     const Real radius = sqrt(x1*x1 + x2*x2 + x3*x3);
+    const Real cylindrical_radius = sqrt(x2*x2 + x3*x3);
     const Real axis_cosine = (radius > 0.0) ? x1/radius : -1.0;
 
+    // CH spherical cap: a shell in radius intersected with the polar cone.
     const Real inside_outer =
         0.5*(1.0 - tanh((radius-outer_radius)/transition_width));
     const Real outside_inner =
         0.5*(1.0 + tanh((radius-inner_radius)/transition_width));
     const Real inside_cap = 0.5*(1.0 +
         tanh((axis_cosine-cos_half_angle)/angular_transition));
-    const Real alpha = inside_outer*outside_inner*inside_cap;
+    const Real alpha_ch = inside_outer*outside_inner*inside_cap;
 
-    const Real ch_partial_density = alpha*solid_density;
-    const Real ambient_partial_density = (1.0-alpha)*ambient_density;
-    const Real density = ch_partial_density + ambient_partial_density;
+    // Au cone: the wall between the cap's own 50-degree surface and a parallel surface
+    // offset inward by cone_wall_offset in cylindrical radius, truncated below the CH
+    // cap edge and above the archive's flat base.
+    const Real inside_cone_outer = 0.5*(1.0 -
+        tanh((x1-cone_slope*cylindrical_radius)/transition_width));
+    const Real outside_cone_inner = 0.5*(1.0 +
+        tanh((x1-cone_slope*(cylindrical_radius-cone_wall_offset))/
+             transition_width));
+    const Real above_cone_base =
+        0.5*(1.0 + tanh((x1-cone_base_x1)/transition_width));
+    const Real below_cone_tip =
+        0.5*(1.0 - tanh((x1-cone_tip_x1)/transition_width));
+    // The cap and the cone touch along the same conical surface, so remove any overlap
+    // from the cone rather than double-counting solid mass there.
+    const Real alpha_cone = fmax(
+        inside_cone_outer*outside_cone_inner*above_cone_base*below_cone_tip-
+            alpha_ch, 0.0);
+
+    const Real ch_partial_density = alpha_ch*solid_density;
+    const Real cone_partial_density = alpha_cone*cone_density;
+    const Real ambient_fraction = fmax(1.0-alpha_ch-alpha_cone, 0.0);
+    const Real ambient_partial_density = ambient_fraction*ambient_density;
+    const Real density =
+        ch_partial_density + cone_partial_density + ambient_partial_density;
     const Real ch_mass_fraction = ch_partial_density/density;
+    const Real cone_mass_fraction = cone_partial_density/density;
+    const Real helium_mass_fraction = ambient_partial_density/density;
+    Real fractions[3] = {
+        ch_mass_fraction, cone_mass_fraction, helium_mass_fraction};
+    const auto composition = material_mixture.CompositionFromFractions(fractions);
     const auto thermo = material_mixture.StateFromRhoTemperatures(
-        density, code_temperature, code_temperature, ch_mass_fraction);
+        density, code_temperature, code_temperature, composition);
     const Real internal_energy = density*(thermo.ion_specific_internal_energy +
                                           thermo.electron_specific_internal_energy);
 
@@ -317,6 +410,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     w0(m, IVZ, k, j, i) = 0.0;
     w0(m, IEN, k, j, i) = internal_energy;
     w0(m, scalar_index, k, j, i) = ch_mass_fraction;
+    w0(m, cone_scalar_index, k, j, i) = cone_mass_fraction;
+    w0(m, helium_scalar_index, k, j, i) = helium_mass_fraction;
   });
 
   if (fluid.is_mhd) {
@@ -421,6 +516,7 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   pdata->label[18] = "eos_floor";
   pdata->label[19] = "eos_bad";
   pdata->label[20] = "divB";
+  pdata->label[21] = "Au_mass";
 
   const bool have_magnetic = fluid.is_mhd;
   auto u0 = fluid.u0;
@@ -436,6 +532,7 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
   auto thermodynamics = ptwo->thermodynamics;
   auto size = pmbp->pmb->mb_size;
   const int scalar_index = fluid.pmaterials->ScalarIndex();
+  const int cone_scalar_index = scalar_index+1;
   const int iion = ptwo->iion;
   const int iele = ptwo->iele;
   const int ifirst = prad->ifirst;
@@ -555,9 +652,16 @@ void DCIHistory(HistoryData *pdata, Mesh *pm) {
                  (b0x3f(m, k+1, j, i)-b0x3f(m, k, j, i))/dx3;
         }
         local.the_array[20] = volume*fabs(divb);
+        local.the_array[21] = volume*u0(m, cone_scalar_index, k, j, i);
         sum += local;
       }, Kokkos::Sum<array_sum::GlobalSum>(sum_this_rank));
   Kokkos::fence();
+
+  // Explicit FLD contributes directly to uflx above.  The backward-Euler solve is
+  // operator split, so add its step-averaged physical-boundary surface integral here.
+  if (prad->IsImplicit()) {
+    sum_this_rank.the_array[2] += prad->implicit_boundary_power;
+  }
 
   for (int n = 0; n < pdata->nhist; ++n) {
     pdata->hdata[n] = sum_this_rank.the_array[n];

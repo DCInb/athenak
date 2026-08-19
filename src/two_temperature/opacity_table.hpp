@@ -8,9 +8,12 @@
 //! \file opacity_table.hpp
 //! \brief Density- and electron-temperature-dependent multigroup opacity tables.
 
-#include "athena.hpp"
-
+#include <memory>
 #include <string>
+#include <vector>
+
+#include "athena.hpp"
+#include "materials/material_mixture.hpp"
 
 class ParameterInput;
 
@@ -209,40 +212,61 @@ class OpacityTable {
 
 //----------------------------------------------------------------------------------------
 //! \struct MixedOpacityTableDevice
-//! \brief Partial-density, mass-weighted additive two-material opacity closure.
+//! \brief Partial-density, mass-weighted additive multi-material opacity closure.
+//!
+//! kappa_mix = sum_s Y_s kappa_s(rho Y_s, Te), which recovers every pure-material limit.
 
 struct MixedOpacityTableLocation {
-  OpacityTableLocation material0;
-  OpacityTableLocation material1;
-  Real material0_mass_fraction = 0.0;
+  Real density = 0.0;
+  Real temperature = 0.0;
+  materials::MaterialComposition composition;
 };
 
 struct MixedOpacityTableDevice {
-  OpacityTableDevice material0;
-  OpacityTableDevice material1;
+  DvceArray1D<unsigned char> material_table_storage;
+  const OpacityTableDevice *material_tables = nullptr;
+  int nmaterials = 1;
+
+  KOKKOS_INLINE_FUNCTION
+  const OpacityTableDevice &Material(const int index) const {
+    return material_tables[index];
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  MixedOpacityTableLocation Locate(
+      Real density, Real temperature,
+      const materials::MaterialComposition &mix) const {
+    MixedOpacityTableLocation location;
+    location.density = density;
+    location.temperature = temperature;
+    location.composition = mix;
+    return location;
+  }
 
   KOKKOS_INLINE_FUNCTION
   MixedOpacityTableLocation Locate(
       Real density, Real temperature, Real y0_in) const {
     MixedOpacityTableLocation location;
-    const Real y0 = fmin(fmax(y0_in, 0.0), 1.0);
-    location.material0_mass_fraction = y0;
-    if (y0 > 0.0) {
-      location.material0 = material0.Locate(density*y0, temperature);
-    }
-    if (y0 < 1.0) {
-      location.material1 = material1.Locate(density*(1.0-y0), temperature);
-    }
+    location.density = density;
+    location.temperature = temperature;
+    materials::MaterialComposition mix;
+    mix.count = 2;
+    mix.source = materials::MaterialComposition::legacy_two_material;
+    mix.legacy_y0 = fmin(fmax(y0_in, 0.0), 1.0);
+    mix.inverse_sum = 1.0;
+    location.composition = mix;
     return location;
   }
 
   KOKKOS_INLINE_FUNCTION
   Real Get(int kind, int group, const MixedOpacityTableLocation &location) const {
-    const Real y0 = location.material0_mass_fraction;
     Real result = 0.0;
-    if (y0 > 0.0) result += y0*material0.Get(kind, group, location.material0);
-    if (y0 < 1.0) {
-      result += (1.0-y0)*material1.Get(kind, group, location.material1);
+    for (int n = 0; n < location.composition.count; ++n) {
+      const Real fraction = location.composition[n];
+      if (fraction > 0.0) {
+        result += fraction*Material(n).Get(
+            kind, group, location.density*fraction, location.temperature);
+      }
     }
     return result;
   }
@@ -251,19 +275,28 @@ struct MixedOpacityTableDevice {
   Real Get(int kind, int group, Real density, Real temperature, Real y0_in) const {
     return Get(kind, group, Locate(density, temperature, y0_in));
   }
+
+  KOKKOS_INLINE_FUNCTION
+  Real Get(int kind, int group, Real density, Real temperature,
+           const materials::MaterialComposition &mix) const {
+    return Get(kind, group, Locate(density, temperature, mix));
+  }
 };
 
 class MixedOpacityTable {
  public:
   MixedOpacityTable(ParameterInput *pin, int expected_groups,
-                    const DualArray1D<Real> &expected_group_bounds);
+                    const DualArray1D<Real> &expected_group_bounds,
+                    int nmaterials = 2);
   ~MixedOpacityTable() = default;
 
   MixedOpacityTableDevice DeviceData() const;
 
  private:
-  OpacityTable material0_;
-  OpacityTable material1_;
+  int nmaterials_ = 2;
+  std::vector<std::unique_ptr<OpacityTable>> tables_;
+  DvceArray1D<unsigned char> device_table_storage_;
+  const OpacityTableDevice *device_tables_ = nullptr;
 };
 
 } // namespace two_temperature

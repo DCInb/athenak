@@ -429,7 +429,7 @@ void Conduction::SolveImplicit(const Real dt, DvceArray5D<Real> &cons,
       Real eele = 0.0;
       Real cv = 0.0;
       if (has_materials) {
-        const Real y0 = mixture.Material0MassFractionFromConserved(u, m, k, j, i);
+        const auto y0 = mixture.CompositionFromConserved(u, m, k, j, i);
         const Real tion = ion_temperature(m, 0, k, j, i);
         const auto state = mixture.StateFromRhoTemperaturesNoSound(
             density, tion, tele, y0);
@@ -581,7 +581,7 @@ void Conduction::SolveImplicit(const Real dt, DvceArray5D<Real> &cons,
           Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
               {0, ks, js, is}, {pmy_pack->nmb_thispack, ke+1, je+1, ie+1}),
       KOKKOS_LAMBDA(int m, int k, int j, int i, Real &minimum) {
-        const Real y0 = mixture.Material0MassFractionFromConserved(u, m, k, j, i);
+        const auto y0 = mixture.CompositionFromConserved(u, m, k, j, i);
         const Real tmin = mixture.MinimumTransportTemperature(y0);
         const Real tmax = mixture.MaximumTransportTemperature(y0);
         const Real change = correction(m, 0, k, j, i);

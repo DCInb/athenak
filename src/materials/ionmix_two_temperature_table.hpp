@@ -17,7 +17,12 @@ namespace materials {
 
 enum class IonmixBoundsPolicy : int {
   clamp = 0,
-  error = 1
+  error = 1,
+  // FLASH brackets caloric inversions with its configured EOS temperature range,
+  // rather than the final native IONMIX node.  Continue positive high-temperature
+  // pressure and energy surfaces with their last log-log slope to reproduce that
+  // behavior while retaining the native table unchanged.
+  flash_extrapolate = 2
 };
 
 enum class IonmixComponent : int {
@@ -144,6 +149,7 @@ struct IonmixTwoTemperatureTableDevice {
   int ndensity = 0;
   int ntemperature = 0;
   int bounds_error = 0;
+  int extrapolate_high_temperature = 0;
   bool geometric_interpolation = true;
   bool ion_energy_is_strictly_positive = false;
   bool electron_energy_is_strictly_positive = false;
@@ -248,6 +254,39 @@ struct IonmixTwoTemperatureTableDevice {
     return result;
   }
 
+  template <bool log_coordinate_is_precomputed = false>
+  KOKKOS_INLINE_FUNCTION
+  AxisLocation LocateTemperature(const Real code_temperature,
+                                 const int lower_hint = -1,
+                                 const Real precomputed_log_temperature = 0.0) const {
+    if (!Kokkos::isfinite(code_temperature) || !(code_temperature > 0.0)) {
+      Kokkos::abort("IONMIX table temperatures must be finite and positive.");
+    }
+    const Real log_code_temperature = log_coordinate_is_precomputed
+        ? precomputed_log_temperature : log(code_temperature);
+    const Real log_temperature_kelvin =
+        log_code_temperature+log_temperature_to_kelvin;
+    if (!Kokkos::isfinite(log_temperature_kelvin)) {
+      Kokkos::abort("IONMIX table temperature conversion is not finite.");
+    }
+    if (extrapolate_high_temperature != 0 &&
+        log_temperature_kelvin > this->log_temperature_kelvin(ntemperature-1)) {
+      AxisLocation result;
+      result.lower = ntemperature-2;
+      result.fraction =
+          (log_temperature_kelvin-this->log_temperature_kelvin(ntemperature-2))/
+          (this->log_temperature_kelvin(ntemperature-1)-
+           this->log_temperature_kelvin(ntemperature-2));
+      result.bounded_log_coordinate = log_temperature_kelvin;
+      return result;
+    }
+    return Locate<log_coordinate_is_precomputed>(
+        this->log_temperature_kelvin, ntemperature, code_temperature,
+        log_temperature_to_kelvin, ionmix_temperature_below_table,
+        ionmix_temperature_above_table, lower_hint,
+        precomputed_log_temperature);
+  }
+
   KOKKOS_INLINE_FUNCTION
   Real InterpolatePair(const Real lower, const Real upper, const Real fraction,
                        const bool allow_geometric) const {
@@ -305,6 +344,33 @@ struct IonmixTwoTemperatureTableDevice {
   }
 
   KOKKOS_INLINE_FUNCTION
+  Real ExtrapolateHighTemperaturePair(
+      const int field, const Real lower, const Real upper,
+      const Real fraction, const Real log_temperature) const {
+    // Ionization is already asymptoting to its fully-ionized value; extending it can
+    // create unphysical charge states.  FLASH likewise treats the table endpoint as the
+    // available ionization model while its caloric closure continues to higher T.
+    if (field == mean_ionization) return upper;
+    Real result;
+    if (lower > 0.0 && upper > lower) {
+      result = exp(Kokkos::fma(
+          fraction, log(upper), (1.0-fraction)*log(lower)));
+    } else if (upper > 0.0) {
+      // A flat, decreasing, or non-positive final interval has no usable monotone
+      // logarithmic slope.  Positive pressure/energy endpoints receive the
+      // fully-ionized ideal-gas T^1 tail; an exact zero remains zero.
+      result = upper*exp(
+          log_temperature-this->log_temperature_kelvin(ntemperature-1));
+    } else {
+      result = upper;
+    }
+    if (!Kokkos::isfinite(result)) {
+      Kokkos::abort("IONMIX high-temperature continuation is not finite.");
+    }
+    return result;
+  }
+
+  KOKKOS_INLINE_FUNCTION
   Real EvaluateWithLocations(const int field, const AxisLocation &density,
                              const AxisLocation &temperature) const {
     const int id0 = density.lower;
@@ -319,6 +385,11 @@ struct IonmixTwoTemperatureTableDevice {
         field, id0, id1, it0, density.fraction, geometric);
     const Real at_upper_temperature = InterpolateTablePair(
         field, id0, id1, it1, density.fraction, geometric);
+    if (extrapolate_high_temperature != 0 && temperature.fraction > 1.0) {
+      return ExtrapolateHighTemperaturePair(
+          field, at_lower_temperature, at_upper_temperature,
+          temperature.fraction, temperature.bounded_log_coordinate);
+    }
     return InterpolatePair(at_lower_temperature, at_upper_temperature,
                            temperature.fraction, geometric);
   }
@@ -403,10 +474,7 @@ struct IonmixTwoTemperatureTableDevice {
     density.lower = prepared_density.lower;
     density.fraction = prepared_density.fraction;
     density.query_flags = prepared_density.query_flags;
-    const AxisLocation temperature = Locate(
-        log_temperature_kelvin, ntemperature, code_temperature,
-        log_temperature_to_kelvin, ionmix_temperature_below_table,
-        ionmix_temperature_above_table);
+    const AxisLocation temperature = LocateTemperature(code_temperature);
     return StateAtLocations(component, density, temperature);
   }
 
@@ -419,11 +487,8 @@ struct IonmixTwoTemperatureTableDevice {
     density.lower = prepared_density.lower;
     density.fraction = prepared_density.fraction;
     density.query_flags = prepared_density.query_flags;
-    const AxisLocation temperature = Locate<true>(
-        log_temperature_kelvin, ntemperature, code_temperature,
-        log_temperature_to_kelvin, ionmix_temperature_below_table,
-        ionmix_temperature_above_table, cache.temperature_lower,
-        log_code_temperature);
+    const AxisLocation temperature = LocateTemperature<true>(
+        code_temperature, cache.temperature_lower, log_code_temperature);
     const int energy_field = EnergyField(component);
     if (cache.temperature_lower != temperature.lower) {
       cache.lower_energy =
@@ -437,10 +502,18 @@ struct IonmixTwoTemperatureTableDevice {
       }
       cache.temperature_lower = temperature.lower;
     }
-    return specific_energy_from_cgs*InterpolatePairWithLogs(
-        cache.lower_energy, cache.upper_energy,
-        cache.log_lower_energy, cache.log_upper_energy,
-        temperature.fraction, FieldAllowsGeometricInterpolation(energy_field));
+    Real energy;
+    if (extrapolate_high_temperature != 0 && temperature.fraction > 1.0) {
+      energy = ExtrapolateHighTemperaturePair(
+          energy_field, cache.lower_energy, cache.upper_energy,
+          temperature.fraction, temperature.bounded_log_coordinate);
+    } else {
+      energy = InterpolatePairWithLogs(
+          cache.lower_energy, cache.upper_energy,
+          cache.log_lower_energy, cache.log_upper_energy,
+          temperature.fraction, FieldAllowsGeometricInterpolation(energy_field));
+    }
+    return specific_energy_from_cgs*energy;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -477,10 +550,7 @@ struct IonmixTwoTemperatureTableDevice {
     const AxisLocation density = Locate(
         log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
-    const AxisLocation temperature = Locate(
-        log_temperature_kelvin, ntemperature, code_temperature,
-        log_temperature_to_kelvin, ionmix_temperature_below_table,
-        ionmix_temperature_above_table);
+    const AxisLocation temperature = LocateTemperature(code_temperature);
     IonmixPressureEnergyState result;
     result.ion_pressure = pressure_from_cgs*
         EvaluateWithLocations(ion_pressure, density, temperature);
@@ -503,10 +573,7 @@ struct IonmixTwoTemperatureTableDevice {
     const AxisLocation density = Locate(
         log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
-    const AxisLocation temperature = Locate(
-        log_temperature_kelvin, ntemperature, code_temperature,
-        log_temperature_to_kelvin, ionmix_temperature_below_table,
-        ionmix_temperature_above_table);
+    const AxisLocation temperature = LocateTemperature(code_temperature);
     IonmixTemperatureState result;
     result.temperature =
         exp(temperature.bounded_log_coordinate)/temperature_to_kelvin;
@@ -570,6 +637,41 @@ struct IonmixTwoTemperatureTableDevice {
     if (target > maximum) {
       if (bounds_error != 0) {
         Kokkos::abort("IONMIX inverse energy is above the table range.");
+      }
+      if (extrapolate_high_temperature != 0) {
+        const Real lower = ValueAtTemperatureIndex(
+            energy_field, density, ntemperature-2);
+        const Real log_temperature_span =
+            log_temperature_kelvin(ntemperature-1)-
+            log_temperature_kelvin(ntemperature-2);
+        Real log_target_temperature;
+        if (lower > 0.0 && maximum > lower) {
+          const Real log_value_span = log(maximum)-log(lower);
+          log_target_temperature = log_temperature_kelvin(ntemperature-1)+
+              (log(target)-log(maximum))*log_temperature_span/log_value_span;
+        } else if (maximum > 0.0) {
+          log_target_temperature = log_temperature_kelvin(ntemperature-1)+
+              log(target/maximum);
+        } else {
+          Kokkos::abort(
+              "IONMIX high-temperature continuation needs a positive energy endpoint.");
+        }
+        if (!Kokkos::isfinite(log_target_temperature)) {
+          Kokkos::abort("IONMIX extrapolated inverse temperature is not finite.");
+        }
+        const Real target_temperature =
+            exp(log_target_temperature)/temperature_to_kelvin;
+        if (!Kokkos::isfinite(target_temperature) ||
+            !(target_temperature > 0.0)) {
+          Kokkos::abort("IONMIX extrapolated inverse temperature overflows.");
+        }
+        AxisLocation temperature;
+        temperature.lower = ntemperature-2;
+        temperature.fraction =
+            (log_target_temperature-log_temperature_kelvin(ntemperature-2))/
+            log_temperature_span;
+        temperature.bounded_log_coordinate = log_target_temperature;
+        return StateAtLocations(component, density, temperature);
       }
       AxisLocation temperature;
       temperature.lower = ntemperature-2;
@@ -656,10 +758,7 @@ struct IonmixTwoTemperatureTableDevice {
     const AxisLocation density = Locate(
         log_density_cgs, ndensity, code_density, log_density_to_cgs,
         ionmix_density_below_table, ionmix_density_above_table);
-    const AxisLocation temperature = Locate(
-        log_temperature_kelvin, ntemperature, code_temperature,
-        log_temperature_to_kelvin, ionmix_temperature_below_table,
-        ionmix_temperature_above_table);
+    const AxisLocation temperature = LocateTemperature(code_temperature);
     return EvaluateWithLocations(mean_ionization, density, temperature);
   }
 

@@ -63,7 +63,7 @@ def prepare_case(ch_ionization=CH_IONIZATION, he_ionization=0.5):
     write_table(ch_table, CH_ABAR, ch_ionization)
     write_table(he_table, 4.0, he_ionization)
     text = base_input.read_text(encoding="ascii")
-    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 1\n", 1)
+    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 2\n", 1)
     text = text.replace("rsolver = hlle", "rsolver = llf", 1)
     text = text.replace(
         "biermann_coefficient = 0.1\n",

@@ -1,5 +1,11 @@
 # Laser transport convergence
 
+All sweeps and regressions below were performed with the earlier single-beam drive (one
+axial 4,096-ray 1ω Gaussian beam).  The decks have since adopted the archived FLASH
+four-beam collimated 3ω picket drive; the chatter-control selections recorded here
+(cap 64, `1e-2` hysteresis, `1e-5`-cell offset) carry over, and every remainder and
+closure condition is re-verified for the new drive by the production gates.
+
 The first production attempt exposed a hidden terminal-ray loss: with one allowed
 critical-surface reflection, roughly 44% of launched power was classified as
 `remaining`.  That power was included in the old accounting residual but was neither
@@ -8,7 +14,7 @@ diagnostics were added, and any remainder above `1e-10` of launched power became
 
 ## Initial-condition cap sweep
 
-The first sweep used eight V100 ranks, 4,096 Gaussian rays, the production CH/He tables,
+The first sweep used eight V100 ranks, 4,096 Gaussian rays, the then-current CH/He tables,
 straight transport, and one complete RK2 cycle.
 
 | Mesh | Reflection cap | Maximum reflection remainder / launched | Result |

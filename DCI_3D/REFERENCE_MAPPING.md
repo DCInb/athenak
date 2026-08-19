@@ -38,19 +38,23 @@ be described as bit-for-bit FLASH behavior.
 
 ## User requirements that override the archive
 
-The first AthenaK version retains the explicitly requested:
+The AthenaK case now follows the archive for target shape, domain, materials, beams, and
+pulse.  Only these user requirements remain as overrides:
 
-- all-CH shell with outer radius 1.0 mm and thickness 0.2 mm;
-- 1.1 g/cm3 initial CH density;
-- Gaussian beam in space;
-- square pulse in time;
-- 1ω wavelength, taken as 1.053 micrometres;
-- 10 kJ total incident energy over 5 ns;
-- a converging spot covering most of the projected open shell;
+- 1.1 g/cm3 initial CH density (the archive agrees: `sim_rhoFoam = 1.1`);
 - evolution through 10 ns;
-- uniform mesh using 60--80 percent of every one of eight V100 GPUs.
+- uniform mesh using 60--80 percent of every available V100 GPU.
 
-These choices are not claimed to reproduce the archived 3ω, uniform, four-beam pulse.
+Two earlier overrides have been withdrawn.  The first version used a requested
+single-beam drive (axial 1ω Gaussian, square 10 kJ/5 ns pulse); the laser now follows
+`ParDir/1l_4beam_BB.par` directly.  The first version also used a requested 1.0 mm CH
+shell of 0.2 mm thickness; the target is now the archive's own 0.52--0.55 mm cap plus its
+Au cone, so the archived beam coordinates apply without rescaling.
+
+That change is self-validating: sampling all four 0.275 mm apertures, every ray lands on
+the CH cap, and the outermost strikes it at 49.89 degrees against the 50-degree cap edge.
+The archived beams were evidently sized for exactly this target, a fit that the earlier
+1.0 mm shell obscured (rays then hit at only ~34 degrees, lighting an annulus).
 
 ## Reference choices carried into AthenaK
 
@@ -70,10 +74,11 @@ The newest laser/Biermann reference is `3d_zb/ParDir/1l_4beam_BB.par` together w
 - Hall and explicit resistivity are disabled;
 - all full-domain hydro boundaries are outflow;
 - the run ends at 10 ns;
-- CH and helium use IONMIX material tables.
+- CH, gold, and helium use IONMIX material tables.
 
-The archived Au cone is omitted because the requested target is an open spherical CH
-shell and one conservative scalar is reserved for CH versus helium.  Electron conduction
+The archived Au cone is now included: `MaterialMixture` accepts any positive
+`nmaterials`, and the deck explicitly advects all three mass fractions
+(`rho*Y_CH`, `rho*Y_Au`, and `rho*Y_He`).  Electron conduction
 is a reference feature (SpitzerHighZ with Larsen limiter 0.06) but is not an explicit
 first-version acceptance requirement; any omission must remain documented until a
 material-aware conduction model is implemented and tested.
@@ -83,10 +88,17 @@ material-aware conduction model is implemented and tested.
 | Role | Material | Abar | Zbar | Initial density | EOS source | Opacity source |
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | shell | equimolar CH | 6.5 | 3.5 | 1.1 g/cm3 | `C16H1620gPROP.cn4` | `feos_snop_CH_20g.cn4` |
+| cone | Au | 196.96655 | 79 | 19.2 g/cm3 | `feos_snop_Au.cn4` | `feos_snop_Au_20g.cn4` |
 | ambient | He | 4.002602 | 2 | 1.0e-5 g/cm3 | `He_20G_yr23.cn4` | `He20g.cn4` |
 
-The conservative passive scalar stores `rho*Y_CH`; `Y_He=1-Y_CH`.  Mixed opacity uses
-partial material densities and additive extinction,
+The Au sources are exactly the files the archived deck names (`eos_coneTableFile` and
+`op_coneFileName`).  Gold's Zeff is taken as its Zbar, and the laser reads the local
+tabular ionization rather than the deck constant, so inverse-bremsstrahlung absorption in
+the cone follows the Au table instead of a CH surrogate.
+
+Three conservative passive scalars explicitly store `rho*Y_CH`, `rho*Y_Au`, and
+`rho*Y_He`.  All nonnegative fractions are normalized before use; no material is an
+implicit remainder. Mixed opacity uses partial material densities and additive extinction,
 
 ```text
 kappa_mix(rho, Te, Y) = sum_s Y_s kappa_s(rho*Y_s, Te).
@@ -99,8 +111,30 @@ are clamped to the nearest endpoint.  EOS energy and ionization use the minimum-
 surface, while trace-material pressure is scaled linearly from that surface to zero as the
 partial density vanishes; this is an explicit part of the AthenaK closure.
 
-`generate_reference_tables.py` verifies the archive hash and converts the separate CH/He
-ion-electron EOS surfaces plus both opacity payloads into ignored local AthenaK tables.
+The DCI inputs use the opt-in `flash-extrapolate` EOS bounds policy.  In-range IONMIX
+values are unchanged; positive pressure and caloric surfaces above the final temperature
+node follow the final log-log slope, with a continuous `T^1` fallback for a flat or
+decreasing endpoint, and ionization holds its endpoint value.  Forward and inverse mixed
+closures expand above the native maximum for every present component.  This mirrors
+FLASH's broader EOS inversion bracket and prevents a high conserved energy from being
+paired with an endpoint-clamped temperature; `clamp` and `error` retain their prior
+behavior for other decks.
+
+The preserved legacy CH/He restart provides a bounded same-state check of that mapping.
+It is fixed by SHA-256, `t=1 ns`, and cycle 48420.  A read-only current-tree scan of all
+`33554432` active cells finds `1688558` cells currently above a native ion/electron
+energy endpoint under `clamp`, with a maximum target/endpoint ratio of `8.016194089`.
+With `flash-extrapolate`, all scanned states are finite and positive, no high-energy bit
+remains, the maximum recovered electron temperature is `9.541060299e8 K`, and the
+volume-integrated component energies agree with the stored values below `1e-15`
+relative.  The scanner and JSON evidence pin the restart and table hashes and verify that
+the restart is unchanged before and after the scan.  This does not replay the historical
+trajectory or validate the current three-material restart layout.  The exact historical
+producer executable and the first offending `0.025 ns` cell state were not preserved.
+
+`generate_reference_tables.py` verifies the archive hash and converts the separate
+CH/Au/He ion-electron EOS surfaces plus all three opacity payloads into ignored local
+AthenaK tables.
 Its manifest records hashes of the archive members and generated files.
 
 ## Radiation groups
@@ -114,33 +148,126 @@ The 20 reference photon boundaries are, in eV:
 
 The reference uses a harmonic flux limiter with coefficient one and vacuum conditions on
 all radiation faces.  The opacity tables provide Rosseland transport and Planck
-absorption/emission coefficients in cm2/g.  AthenaK uses its explicit
-asymptotic-preserving face flux and does not inflate opacity.  The production candidate
-uses the documented reduced value `c_hat=3.0e9 cm/s` (about `c/10`) so a 10 ns run is
-feasible.  Matched compact comparisons against `c_hat=10` and physical `c` are mandatory
-production gates.  Matter and laser changes are bounded directly; because the tiny
-radiation reservoir is not relatively converged, its absolute difference is normalized by
-deposited laser energy and bounded separately while its relative difference remains
-reported.
+absorption/emission coefficients in cm2/g; AthenaK does not inflate opacity.
 
-## Laser comparison
+FLASH keeps physical `c`.  Its MGD equation (FLASH 4.8 guide, equations 25.3--25.7)
+evaluates opacity, emission, and flux-limiter coefficients at time level `n` and solves
+each group's diffusion operator backward implicitly for `u_g^(n+1)`.  The general
+diffusion solver's `theta=1` scheme is backward Euler (guide equation 19.2), and the
+archived decks set `dt_diff_factor=1.0e100` with the comment "Disable diffusion dt".
+Thus FLASH removes the diffusion stability restriction rather than replacing physical
+light speed.
 
-The newest archived laser deck has four 50,000-ray uniform beams at 0.351 micrometres.
-They are inclined approximately 50 degrees from `-z`, have equal 0.275 mm lens/target
-radii (collimated), and use a shaped pulse inferred to integrate to 7.0982 kJ total.
-Those settings demonstrate the archive's ray and symmetry conventions but conflict with
-the requested 1ω Gaussian converging 10 kJ square drive.  The AthenaK laser therefore
-uses one axial 4,096-ray beam launched from the positive-x boundary with a 0.72 mm
-Gaussian aperture focused to 0.58 mm at the positive-x outer-surface apex.  The rays
-propagate right to left and irradiate the curved outer cap before reaching that tangent
-focal plane.  Incident,
-deposited, and escaped-radiation power are recorded for energy closure.  Initial compact
-and production-layout sweeps establish a hard cap of 64.  An evolved 100-cycle
-doubled-mesh sweep additionally brackets the one-percent underdense rearm band, the
-`1e-5`-cell normal offset, and caps 64/128; it retains zero terminal power with at most
-19 observed turns per ray.  Wave-cap and reflection-cap remainders are reported
-separately, are fatal above `1e-10` of launched power, and are checked in every baseline,
-resolution, light-speed, and calibration laser record by the production gate.
+AthenaK maps the time integration to `transport_integrator=implicit`: it evaluates a
+harmonic-limited FLD coefficient from the old-state centered cell gradient.  Resolved
+gradients retain their physical coefficient; only roundoff-flat limited cells receive
+the grid-scale `D <= alpha*dx_min/2` regularization.  AthenaK exchanges the frozen
+coefficient halo before PCG so an MPI-shared face remains symmetric even after the
+preceding implicit-conduction solve changed only interior temperatures.  It then
+arithmetic-averages the coefficient to faces and advances the centered finite-volume
+operator with backward Euler while retaining `c_light=299.792458 mm/ns` in both
+transport and matter coupling.  A vacuum face additionally caps
+`D_face <= alpha*dx_normal/2`; the operator, preconditioner diagonals, and `rad_Pesc`
+diagnostic all use the identical capped value.  This is not the explicit AP/upwind face
+discretization.  The deck's
+`transport_discretization=asymptotic-preserving` and `ap_*` thresholds are retained only
+as explicit-mode fallback controls and are inactive in the implicit solve.  All six
+implicit boundaries are pinned to `vacuum`, matching the DCI zero-radiation ghost
+treatment instead of the solver's zero-gradient default.
+The archive also writes `rt_dtFactor=0.02`, but its
+`rt_computeDt` switch is absent and defaults false.  That FLASH control does not map
+directly to AthenaK's source-splitting guard: AthenaK time-lags its local emission source
+and does not perform FLASH's fully coupled nonlinear source solve.  DCI therefore keeps
+`source_cfl=0.1` as an independent source-accuracy limit.  It constrains source changes
+only; the implicit transport operator remains free of the explicit `c*dt/dx` restriction.
+The guard itself still scales with physical `c`: at initialization it lowers the DCI
+candidate timestep from `1.068285e-6 ns` with the guard disabled to
+`7.88743694e-7 ns`, approximately 26 percent.  Lower `--radiation-c-light` values are
+non-production sensitivity diagnostics, not the mechanism used to relax the transport
+timestep.
+
+The correspondence to FLASH is limited to physical `c`, time-lagged coefficients, and
+backward-Euler transport; it is not a claim of identical spatial discretization or a
+fully coupled nonlinear radiation/material solve.  AthenaK's current implicit solver is
+uniform-grid only, rejects SMR/AMR and shear-periodic boundaries, and advances groups
+sequentially with frozen coefficients.  DCI uses CG at the pinned tolerance `1e-10` and
+2000-iteration ceiling with a fixed global Galerkin V-cycle:
+`45^3 -> 15^3 -> 5^3 -> one value/MeshBlock`.  Exact-sum restriction, MPI face halos,
+transpose red/black sweeps, and an exact replicated 343-root Cholesky solve preserve the
+SPD preconditioner required by ordinary PCG.  A compatible hierarchy rejects odd
+periodic graphs; `jacobi` remains the default for decks that do not select
+`block-coarse`.  Recursive convergence is verified with the true `b-Ax` residual.  The
+incoming conserved radiation state must be finite and nonnegative.  Only finite
+tolerance-scale negative solver roundoff may undergo a globally volume-conservative
+positive rescaling, followed by another true-residual check; larger negativity and
+non-finite states abort.  Matter coupling remains a separate time-lagged local source
+under `source_cfl=0.1`.
+
+Focused dense-reference tests cover constant periodic, harmonic-limited periodic, and
+harmonic-limited vacuum matrices.  Separate comparisons cover the 9-cubed hierarchy
+against Jacobi, the incompatible-block fallback, and the dense-root allocation cap.
+The one-rank/two-rank MPI decomposition result agrees across the ownership boundary;
+focused CPU material/EOS tests and CPU/CUDA-MPI builds pass.  The exact final-source
+seven-GPU smoke advanced 50 cycles in 28.06 s, restarted for 10 more in 6.49 s, and
+ended at `t=7.389676454491e-05 ns` with `eos_bad=0`.  Its domain-integrated CH/Au/He
+fractions are
+`0.07224481712967802/0.9276974187345620/5.776413575991410e-05`, whose sum is one within
+roundoff.  Its compact incompatible MeshBlocks exercise the Jacobi fallback rather than
+the global hierarchy; the tracked record is `evidence/smoke_final_20260808.json`.  Binary
+`0e3513e15354cf12f17105b417ea30e34f84c003dc9e7f357659d7dbbf80a6c0` passed the
+315-cubed/twenty-group two-cycle probe in 25.05 s under the memory monitor and peaked at
+12620--12622 MiB per V100.  A separate report-enabled repeat of the same binary/input
+recorded at most 67 and 149 PCG iterations and maximum true residuals of
+`9.782791e-11` and `1.181642e-10`, within the guarded recursive-to-true-residual drift
+allowance.  The tracked probe record is
+`evidence/radiation_final_probe_20260808.json`; full run artifacts remain in an ignored
+local run tree.  The restarted smoke is still roughly 338 times short of the historical
+`0.025 ns` first-failure time, so neither check proves long-time removal of the DCI
+symptom.  The production gate must separately supply long-horizon, restart,
+energy-budget, and sustained-performance evidence for the exact hashed deck and binary.
+
+## Laser drive adopted from the archive
+
+The newest archived laser deck, `ParDir/1l_4beam_BB.par`, is now adopted directly.  It
+defines four uniform beams at 0.351 micrometres (3ω) inclined 50 degrees from the cone
+axis at the four diagonal azimuths, with equal 0.275 mm lens/target radii (collimated)
+and one shared 13-section picket pulse that integrates to 1774.55 J per beam, 7.0982 kJ
+total.  The AthenaK decks map the archive's cone axis `+z` to `+x1` (`x -> x2`,
+`y -> x3`) and convert cm to the 0.1 cm code length unit:
+
+```text
+ed_lens (+/-0.14142, +/-0.14142, 0.2037) cm -> lens (2.037, +/-1.4142, +/-1.4142)
+ed_target (0, 0, 0.0359) cm               -> target (0.359, 0, 0)
+ed_lens/targetSemiAxis 0.0275 cm          -> aperture_radius = target_radius = 0.275
+ed_wavelength 0.351 um                    -> wavelength 3.51e-5 cm (unit_system=cgs)
+ed_time/ed_power pulse 1 (s, W)           -> pulse0 knots (code ns, erg/s)
+```
+
+The pulse is written inline through the laser module's FLASH-style shared tables
+(`npulses`, `pulse0_nsections`, `pulse0_time_S`/`pulse0_power_S`) and each beam
+references it with `beamN_pulse_number`, which is an absolute power table exactly like
+`ed_pulseNumber`.  Explicit modeling choices in this mapping:
+
+- The archived `ed_numberOfRays = 50000` is used as each beam's deterministic
+  Fibonacci-aperture ray count.  FLASH's `delta2D` grid at the archived 1 um spacing
+  would instead produce about 237,000 grid rays per beam; the parameter file's stated
+  ray count is honored rather than the implied delta-grid count.
+- The beams and the target now come from the same archived deck, so no aim rescaling is
+  needed.  Sampling all four apertures, every ray reaches the CH cap and the outermost
+  lands at 49.89 degrees against the 50-degree cap edge, confirming the archived spot
+  size was chosen for this shell.
+- Beam `start_time`/`end_time` remain `0`/`5 ns` as an independent gate; the pulse
+  itself is zero outside `[0, 4.71] ns`.
+
+Incident, deposited, and escaped-radiation power are recorded for energy closure.
+Initial compact and production-layout sweeps (performed with the earlier single-beam
+drive) establish a hard reflection cap of 64.  An evolved 100-cycle doubled-mesh sweep
+additionally brackets the one-percent underdense rearm band, the `1e-5`-cell normal
+offset, and caps 64/128; it retains zero terminal power with at most 19 observed turns
+per ray.  Those chatter-control selections carry over unchanged.  Wave-cap and
+reflection-cap remainders are reported separately, are fatal above `1e-10` of launched
+power, and are checked in every baseline, resolution, light-speed, and calibration
+laser record by the production gate.
 
 ## Exchange and numerical controls
 

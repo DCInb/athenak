@@ -17,10 +17,12 @@ from typing import Any
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
 SCHEMA = 8
-PRODUCTION_C_LIGHT = 30.0
+PRODUCTION_C_LIGHT = 299.792458
 RSLA_COMPARISON_C_LIGHT = 10.0
 PHYSICAL_C_LIGHT = 299.792458
 CALIBRATION_CYCLES = 22
+# GPUs/MPI ranks the acceptance layout targets; must match run_case.ACCEPTANCE_RANKS.
+ACCEPTANCE_RANKS = 7
 CALIBRATION_LASER_DIAGNOSTICS = 2*CALIBRATION_CYCLES
 DEFAULT_LASER_REMAINDER_RELATIVE_TOLERANCE = 1.0e-10
 LASER_DIAGNOSTIC_SOURCE_IDS = (
@@ -710,7 +712,14 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
             settings["maximum_eos_energy_floor_fraction"])
 
     c_light = float(production_c_light)
-    dx_min = min(3.5/(100*scale), 2.0/(64*scale))
+    calibration_lengths = tuple(
+        read_deck_value(sources["calibration_input"], f"x{axis}max")
+        - read_deck_value(sources["calibration_input"], f"x{axis}min")
+        for axis in (1, 2, 3)
+    )
+    dx_min = min(
+        length/cells for length, cells in zip(calibration_lengths, expected_shape)
+    )
     causal_dt = dx_min/c_light
     timesteps = [float(row["dt"]) for row in smoke1+smoke2 if float(row["dt"]) > 0.0]
     min_ratio = min(timesteps)/causal_dt
@@ -730,10 +739,19 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     residual = chain_delta+escaped-deposited
     energy_scale = max(abs(deposited), abs(chain_delta)+abs(escaped), 1.0e-30)
     energy_relative = abs(residual)/energy_scale
-    power = read_deck_value(sources["production_input"], "beam0_power")
-    start = read_deck_value(sources["production_input"], "beam0_start_time")
-    end = read_deck_value(sources["production_input"], "beam0_end_time")
-    incident_joules = power*(end-start)*1.0e-9/1.0e7
+    # Integrate the archived FLASH shared picket pulse (code-ns knots, erg/s powers)
+    # and multiply by the beam count: 4 x 1774.55 J = 7098.2 J.
+    nbeams = int(read_deck_value(sources["production_input"], "nbeams"))
+    nsections = int(read_deck_value(
+        sources["production_input"], "pulse0_nsections"))
+    knot_times = [read_deck_value(sources["production_input"], f"pulse0_time_{s}")
+                  for s in range(nsections)]
+    knot_powers = [read_deck_value(sources["production_input"], f"pulse0_power_{s}")
+                   for s in range(nsections)]
+    per_beam_erg = sum(
+        0.5*(knot_powers[s]+knot_powers[s+1])*(knot_times[s+1]-knot_times[s])*1.0e-9
+        for s in range(nsections-1))
+    incident_joules = nbeams*per_beam_erg/1.0e7
     configured_reflection_cap_value = read_deck_value(
         sources["production_input"], "max_reflections_per_ray"
     )
@@ -774,7 +792,7 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
     )
     energy_pass = (
         energy_relative <= settings["energy_relative_tolerance"]
-        and abs(incident_joules-10000.0) <= 1.0e-9
+        and abs(incident_joules-7098.2) <= 1.0e-6
         and laser_remainder_pass
         and reflection_headroom_pass
         and transport_wave_headroom_pass
@@ -939,7 +957,7 @@ def evaluate_checks(sources: dict[str, Path], settings: dict[str, Any]) -> dict[
         )
         and max(int(row["cycle"]) for row in calibration1) == CALIBRATION_CYCLES
         and calibration_laser_count == CALIBRATION_LASER_DIAGNOSTICS
-        and len(devices) == 8 and not memory.get("errors")
+        and len(devices) == ACCEPTANCE_RANKS and not memory.get("errors")
         and all(isinstance(record, dict)
                 and "V100" in str(record.get("name", ""))
                 and record.get("within_60_80_percent") is True

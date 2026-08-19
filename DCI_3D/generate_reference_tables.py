@@ -22,8 +22,10 @@ ARCHIVE_SHA256 = "952708009c9e3bc00dc645e11c9c0f804614def9c70cc999b78c92f16c8a96
 EXPECTED_OUTPUT_SHA256 = {
     "ch.2t_eos": "b29624877c7c90ed1d8c385bef6a7882b106dd8202bf0398301e2dee09faa0d8",
     "he.2t_eos": "aae12f2dde296992ad630094e5755f7f52baa0816c678771e075f4848a9d63d0",
+    "au.2t_eos": "57d75330db3c6363d9cd13406f4614591776eb307a506d44053101faa3c0c27d",
     "ch_20g.opacity": "47ee4b8ab3e7f249e4b7108ab5efbaabeee71bb7dd88cdea59f4b4c64738f94d",
     "he_20g.opacity": "1e0daba15df1a23f5f558663e867dda181886ea53b0dbad119beb6fa1215f420",
+    "au_20g.opacity": "c233098c4d389f44ed4d7490172f8e0cd40e83b1023ab6132b7dc4b0742057e5",
 }
 
 OPACITY_TABLES = (
@@ -39,6 +41,13 @@ OPACITY_TABLES = (
         4.002602,
         "he_20g.opacity",
     ),
+    # Au cone: the archived FLASH deck sets op_coneFileName = feos_snop_Au_20g.cn4.
+    (
+        "Au",
+        "3d_zb/feos_snop_Au_20g.cn4",
+        196.96655,
+        "au_20g.opacity",
+    ),
 )
 
 TWO_TEMPERATURE_TABLES = (
@@ -53,6 +62,13 @@ TWO_TEMPERATURE_TABLES = (
         "3d_zb/He_20G_yr23.cn4",
         4.002602,
         "he.2t_eos",
+    ),
+    # Au cone: the archived FLASH deck sets eos_coneTableFile = feos_snop_Au.cn4.
+    (
+        "Au",
+        "3d_zb/feos_snop_Au.cn4",
+        196.96655,
+        "au.2t_eos",
     ),
 )
 

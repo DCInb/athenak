@@ -178,8 +178,10 @@ int CurrentRank() { return 0; }
 void ValidateOptions(const std::string &filename,
                      const IonmixTwoTemperatureTableOptions &options) {
   if (options.bounds_policy != IonmixBoundsPolicy::clamp &&
-      options.bounds_policy != IonmixBoundsPolicy::error) {
-    IonmixTableError(filename, "bounds policy must be clamp or error");
+      options.bounds_policy != IonmixBoundsPolicy::error &&
+      options.bounds_policy != IonmixBoundsPolicy::flash_extrapolate) {
+    IonmixTableError(
+        filename, "bounds policy must be clamp, error, or flash-extrapolate");
   }
   const Real scales[] = {
       options.density_to_cgs, options.temperature_to_kelvin,
@@ -597,6 +599,8 @@ IonmixTwoTemperatureTableDevice IonmixTwoTemperatureTable::DeviceData() const {
   result.ntemperature = metadata_.ntemperature;
   result.bounds_error =
       (options_.bounds_policy == IonmixBoundsPolicy::error) ? 1 : 0;
+  result.extrapolate_high_temperature =
+      (options_.bounds_policy == IonmixBoundsPolicy::flash_extrapolate) ? 1 : 0;
   result.geometric_interpolation = options_.geometric_interpolation;
   result.ion_energy_is_strictly_positive =
       metadata_.ion_energy_is_strictly_positive;

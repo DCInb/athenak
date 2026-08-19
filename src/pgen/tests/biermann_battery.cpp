@@ -97,8 +97,10 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
   Real material0_fraction_x1_amplitude = 0.0;
   Real material0_fraction_x2_amplitude = 0.0;
   Real material0_fraction_x3_amplitude = 0.0;
+  materials::MaterialMixtureDevice material_mixture;
   if (pmbp->pmhd->pmaterials != nullptr) {
-    material_scalar = pmbp->pmhd->pmaterials->DeviceData().scalar_index;
+    material_mixture = pmbp->pmhd->pmaterials->DeviceData();
+    material_scalar = material_mixture.scalar_index;
     material0_fraction = pin->GetOrAddReal(
         "problem", "material0_fraction", 1.0);
     material0_fraction_x1_amplitude = pin->GetOrAddReal(
@@ -168,10 +170,20 @@ void ProblemGenerator::BiermannBattery(ParameterInput *pin,
         b3f(m, k, j, i) = b3;
         if (k == ke) b3f(m, k+1, j, i) = b3;
         if (material_scalar >= 0) {
-          w(m, material_scalar, k, j, i) = material0_fraction +
+          const Real y0 = material0_fraction +
               material0_fraction_x1_amplitude*sin(wave_number*x1) +
               material0_fraction_x2_amplitude*sin(wave_number*x2) +
               material0_fraction_x3_amplitude*sin(wave_number*x3);
+          for (int n=0; n<material_mixture.nmaterials; ++n) {
+            w(m, material_mixture.scalar_indices(n), k, j, i) = 0.0;
+          }
+          if (material_mixture.nmaterials == 1) {
+            w(m, material_mixture.scalar_indices(0), k, j, i) = 1.0;
+          } else {
+            w(m, material_mixture.scalar_indices(0), k, j, i) = y0;
+            w(m, material_mixture.scalar_indices(
+                material_mixture.nmaterials-1), k, j, i) = 1.0-y0;
+          }
         }
       });
 

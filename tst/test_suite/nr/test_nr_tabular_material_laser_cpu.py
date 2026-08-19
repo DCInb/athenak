@@ -58,7 +58,7 @@ def prepare_case():
     write_table(he_table, 4.0, 5.0, 15.0, 40.0, 100.0, 0.4)
 
     text = base_input.read_text(encoding="ascii")
-    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 1\n", 1)
+    text = text.replace("<mhd>\n", "<mhd>\nnscalars = 2\n", 1)
     text = text.replace("rsolver = hlle", "rsolver = llf", 1)
     text = text.replace("<problem>\n", "<problem>\nyl = 1.0\nyr = 1.0\n", 1)
     text += f"""

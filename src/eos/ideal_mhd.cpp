@@ -177,9 +177,14 @@ void IdealMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
       bcc(m,IBZ,k,j,i) = u.bz;
       // convert scalars (if any), always stored at end of cons and prim arrays.
       for (int n=nmhd; n<(nmhd+nscal); ++n) {
-        if (use_materials && n == material_mixture.scalar_index) {
-          // The material scalar is conservative rho*Y0. Clamp only its mass fraction;
-          // the complementary material remains exactly 1-Y0.
+        bool is_material_fraction = false;
+        if (use_materials) {
+          for (int q=0; q<material_mixture.nmaterials; ++q) {
+            if (n == material_mixture.scalar_indices(q)) is_material_fraction = true;
+          }
+        }
+        if (is_material_fraction) {
+          // Composition scalars are conservative rho*Y_s values.
           cons(m,n,k,j,i) = fmin(fmax(cons(m,n,k,j,i), 0.0), u.d);
         } else {
           // Legacy positivity floor for every other advected scalar.
@@ -188,6 +193,28 @@ void IdealMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
           }
         }
         prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
+      }
+      // All material densities are explicit. Normalize them to the bulk density after
+      // clamping; an all-zero state deterministically becomes the final material.
+      if (use_materials) {
+        Real material_density_sum = 0.0;
+        for (int q=0; q<material_mixture.nmaterials; ++q) {
+          material_density_sum += cons(
+              m, material_mixture.scalar_indices(q), k, j, i);
+        }
+        if (material_density_sum > 0.0) {
+          const Real scale = u.d/material_density_sum;
+          for (int q=0; q<material_mixture.nmaterials; ++q) {
+            const int n = material_mixture.scalar_indices(q);
+            cons(m,n,k,j,i) *= scale;
+            prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
+          }
+        } else {
+          const int n = material_mixture.scalar_indices(
+              material_mixture.nmaterials-1);
+          cons(m,n,k,j,i) = u.d;
+          prim(m,n,k,j,i) = 1.0;
+        }
       }
     }
   }, Kokkos::Sum<int>(nfloord_), Kokkos::Sum<int>(nfloore_), Kokkos::Sum<int>(nfloort_));
@@ -249,11 +276,14 @@ void IdealMHD::PrimToCons(const DvceArray5D<Real> &prim, const DvceArray5D<Real>
 
     // convert scalars (if any), always stored at end of cons and prim arrays.
     for (int n=nmhd; n<(nmhd+nscal); ++n) {
-      if (use_materials && n == material_mixture.scalar_index) {
-        cons(m,n,k,j,i) = u.d*material_mixture.ClampMassFraction(
-            prim(m,n,k,j,i));
-      } else {
-        cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+      cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+    }
+    if (use_materials) {
+      const materials::MaterialComposition composition =
+          material_mixture.CompositionFromPrimitive(prim, m, k, j, i);
+      for (int q=0; q<material_mixture.nmaterials; ++q) {
+        cons(m,material_mixture.scalar_indices(q),k,j,i) =
+            u.d*composition[q];
       }
     }
   });

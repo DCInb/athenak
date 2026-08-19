@@ -386,6 +386,45 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     LaserInputError("periodic_transport requires all mesh boundaries to be periodic");
   }
 
+  // FLASH-style shared pulse tables (ed_numberOfPulses/ed_time_p_s/ed_power_p_s):
+  // <laser> npulses names the tables; pulse<P>_nsections knots follow as
+  // pulse<P>_time_<S>/pulse<P>_power_<S>.  Beams opt in with beam<B>_pulse_number.
+  const int npulses = pin->GetOrAddInteger("laser", "npulses", 0);
+  if (npulses < 0) LaserInputError("npulses must be non-negative");
+  std::vector<std::vector<Real>> pulse_times(npulses);
+  std::vector<std::vector<Real>> pulse_values(npulses);
+  for (int p = 0; p < npulses; ++p) {
+    const std::string key = "pulse" + std::to_string(p) + "_";
+    const int nsections = pin->GetInteger("laser", key + "nsections");
+    if (nsections < 2) {
+      LaserInputError(key + "nsections must be at least 2");
+    }
+    const Real time_scale = pin->GetOrAddReal("laser", key + "time_scale", 1.0);
+    const Real power_scale = pin->GetOrAddReal("laser", key + "power_scale", 1.0);
+    if (!Finite(time_scale) || time_scale <= 0.0 ||
+        !Finite(power_scale) || power_scale < 0.0) {
+      LaserInputError(key + "time_scale must be positive and " + key +
+                      "power_scale non-negative");
+    }
+    pulse_times[p].reserve(nsections);
+    pulse_values[p].reserve(nsections);
+    for (int s = 0; s < nsections; ++s) {
+      const Real time = time_scale*
+          pin->GetReal("laser", key + "time_" + std::to_string(s));
+      const Real value = power_scale*
+          pin->GetReal("laser", key + "power_" + std::to_string(s));
+      if (!Finite(time) || !Finite(value) || value < 0.0) {
+        LaserInputError(key + "sections require finite times and finite "
+                        "non-negative powers");
+      }
+      if (!pulse_times[p].empty() && time <= pulse_times[p].back()) {
+        LaserInputError(key + "times must be strictly increasing");
+      }
+      pulse_times[p].push_back(time);
+      pulse_values[p].push_back(value);
+    }
+  }
+
   int nbeams = pin->GetOrAddInteger("laser", "nbeams", 1);
   if (nbeams <= 0) LaserInputError("nbeams must be positive");
   beams_.reserve(nbeams);
@@ -439,9 +478,18 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
                       " must be 'direction' or 'lens'");
     }
 
+    // A referenced shared pulse is an absolute power table unless the deck says
+    // otherwise, matching FLASH's ed_pulseNumber semantics.
+    const int pulse_number = pin->GetOrAddInteger(
+        "laser", BeamKey(b, "pulse_number"), -1);
+    if (pulse_number < -1 || pulse_number >= npulses) {
+      LaserInputError(BeamKey(b, "pulse_number") +
+                      " must name a pulse defined by npulses");
+    }
     beam.pulse_is_absolute = false;
     std::string pulse_mode = pin->GetOrAddString(
-        "laser", BeamKey(b, "pulse_mode"), "relative");
+        "laser", BeamKey(b, "pulse_mode"),
+        (pulse_number >= 0) ? "absolute" : "relative");
     if (pulse_mode == "relative" || pulse_mode == "multiplier") {
       beam.pulse_is_absolute = false;
     } else if (pulse_mode == "absolute" || pulse_mode == "power") {
@@ -470,7 +518,15 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     }
     std::string pulse_file = pin->GetOrAddString(
         "laser", BeamKey(b, "pulse_file"), "");
-    if (!pulse_file.empty()) {
+    if (!pulse_file.empty() && pulse_number >= 0) {
+      LaserInputError(BeamKey(b, "pulse_file") + " and " +
+                      BeamKey(b, "pulse_number") + " are mutually exclusive");
+    }
+    if (pulse_number >= 0) {
+      // Each beam owns its copy: unit conversion below must not alias tables.
+      beam.pulse_time = pulse_times[pulse_number];
+      beam.pulse_value = pulse_values[pulse_number];
+    } else if (!pulse_file.empty()) {
       LoadPulseFile(pulse_file, pulse_time_scale, pulse_power_scale,
                     beam.pulse_time, beam.pulse_value);
     }
