@@ -61,12 +61,21 @@ def sorted_tab(path):
             for name, values in data.items() if np.ndim(values) > 0}
 
 
-def run_source_case(basename, material0_fraction):
+def formatted_table_time(path):
+    with open(path, encoding="ascii") as stream:
+        match = re.search(r"time=([^\s]+)", stream.readline())
+    assert match is not None
+    return float(match.group(1))
+
+
+def run_source_case(basename, material0_fraction, extra_flags=None):
     flags = [
         f"job/basename={basename}",
         f"problem/yl={material0_fraction}",
         f"problem/yr={material0_fraction}",
     ]
+    if extra_flags is not None:
+        flags.extend(extra_flags)
     assert testutils.run(str(input_file), flags=flags), f"{basename} failed."
     return (sorted_tab(f"tab/{basename}.mhd_3t.00000.tab"),
             sorted_tab(f"tab/{basename}.mhd_3t.00001.tab"))
@@ -98,6 +107,55 @@ def check_source_update(initial, final, material0_fraction):
         assert np.all(final[field] >= 0.0)
 
     assert np.all(final["eele"] >= 0.0)
+    initial_total = initial["eion"]+initial["eele"]+initial["erad"]
+    final_total = final["eion"]+final["eele"]+final["erad"]
+    assert np.allclose(final_total, initial_total,
+                       rtol=4.0e-13, atol=4.0e-13)
+
+
+def check_nonlinear_source_update(initial, final, material0_fraction,
+                                  light_speed, source_dt):
+    """Reference the scalar coupled solve for the ideal mixed-material EOS."""
+    density = 1.0
+    gamma_minus_one = 2.0/3.0
+    electron_fraction = electron_heat_capacity_fraction(material0_fraction)
+    electron_capacity = density*electron_fraction/gamma_minus_one
+    group_fields = [f"erad{group:02d}" for group in range(NGROUPS)]
+    old_groups = [density*initial[field][0] for field in group_fields]
+    local_energy = density*initial["eele"][0]+sum(old_groups)
+    coupling_depth = source_dt*light_speed*density
+
+    def state(temperature):
+        blackbody = 0.1*temperature**4
+        groups = []
+        for group, old in enumerate(old_groups):
+            equilibrium = blackbody*planck_group_fraction(
+                GROUP_BOUNDS[group], GROUP_BOUNDS[group+1], temperature)
+            kappaa = mixed_opacity(
+                "absorption", group, density, material0_fraction)
+            kappae = mixed_opacity(
+                "emission", group, density, material0_fraction)
+            groups.append((old+coupling_depth*kappae*equilibrium)/
+                          (1.0+coupling_depth*kappaa))
+        residual = electron_capacity*temperature+sum(groups)-local_energy
+        return residual, groups
+
+    low = 0.0
+    high = local_energy/electron_capacity
+    for _ in range(160):
+        temperature = 0.5*(low+high)
+        if state(temperature)[0] > 0.0:
+            high = temperature
+        else:
+            low = temperature
+    temperature = 0.5*(low+high)
+    _, expected_groups = state(temperature)
+
+    assert np.allclose(final["tele"], temperature,
+                       rtol=1.0e-9, atol=3.0e-12)
+    for field, expected in zip(group_fields, expected_groups):
+        assert np.allclose(final[field], expected/density,
+                           rtol=3.0e-7, atol=1.0e-11), field
     initial_total = initial["eion"]+initial["eele"]+initial["erad"]
     final_total = final["eion"]+final["eele"]+final["erad"]
     assert np.allclose(final_total, initial_total,
@@ -207,15 +265,16 @@ def test_run():
     try:
         prepare_case(input_file, material0_table, material1_table)
 
-        # Transport consumes the synchronized temperature field.  The only material-EOS
-        # inversion in this module is the once-per-cell refresh after source coupling.
+        # Transport consumes the synchronized temperature field.  The nonlinear source
+        # solve uses the forward electron caloric EOS rather than repeatedly inverting
+        # electron energy at every trial temperature.
         source = Path("../../../src/two_temperature/thermal_radiation.cpp").read_text()
-        assert source.count("mixture.ElectronTemperature(") == 1
         transport = source.split("void ThermalRadiation::AddFluxes", 1)[1]
         transport = transport.split("void ThermalRadiation::Couple", 1)[0]
         timestep = source.split("void ThermalRadiation::NewTimeStep", 1)[1]
         assert "ElectronTemperature(" not in transport
         assert "ElectronTemperature(" not in timestep
+        assert "ElectronSpecificEnergyFromRhoTemperature" in source
         assert "w0, temperature" in transport
         assert "temperature(m, 1" in timestep
 
@@ -230,6 +289,18 @@ def test_run():
         initial_temperatures = [results[name][0]["tele"][0]
                                 for name in ("ch", "he", "mixed")]
         assert len(set(initial_temperatures)) == 3
+
+        nonlinear_light_speed = 1.0e6
+        nonlinear_basename = "mixed_radiation_nonlinear"
+        nonlinear_result = run_source_case(
+            nonlinear_basename, 0.25,
+            ["thermal_radiation/source_integrator=nonlinear",
+             "thermal_radiation/source_report=true",
+             f"thermal_radiation/c_light={nonlinear_light_speed}"])
+        nonlinear_dt = formatted_table_time(
+            f"tab/{nonlinear_basename}.mhd_3t.00001.tab")
+        check_nonlinear_source_update(
+            *nonlinear_result, 0.25, nonlinear_light_speed, nonlinear_dt)
 
         # Exercise prepared mixed-opacity locations in the source-CFL reduction at
         # both pure-material endpoints and in a genuinely mixed cell.

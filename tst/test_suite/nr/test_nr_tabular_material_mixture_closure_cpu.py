@@ -346,13 +346,16 @@ def test_cached_flux_and_exchange_sources():
         "void TwoTemperature::RefreshMaterialThermodynamics", 1)[1].split(
             "void TwoTemperature::CloseBiermannStage", 1)[0]
     assert refresh_source.count("StateFromRhoSpecificEnergies(") == 1
-    # Radiation coupling consumes only the electron floor energy.
+    # Radiation coupling consumes only the electron floor energy and uses the reduced
+    # forward caloric EOS during its temperature-space nonlinear solve.
     assert radiation_source.count("mixture.MinimumPressureEnergyState(") == 1
     assert "mixture.MinimumStateNoSound(" not in radiation_source
     assert "density, composition, pressure_floor, temperature_floor" in (
         radiation_source)
+    assert "mixture.ElectronSpecificEnergyFromRhoTemperature(" in radiation_source
     assert "closed.composition" in exchange_source
-    assert "eele_old-eele_floor-negative" in radiation_source
+    assert "result.electron_energy-electron_energy_floor-negative" in (
+        radiation_source)
     assert '"eos_flags"' in output_source
     assert "TwoTemperature::eos_query_flags" in output_source
 

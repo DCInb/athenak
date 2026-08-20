@@ -1,14 +1,15 @@
-# Uniform 3T relaxation using density- and electron-temperature-dependent opacities.
-# Run from the repository root so opacity_table_file resolves as written below.
+# Uniform one-group source problem with an intentionally non-monotonic temperature
+# residual.  Run through run_nonlinear_coupling_nonmonotonic.py so the opacity path and
+# output directory are staged independently of the caller's working directory.
 
 <job>
-basename = two_temperature_opacity_table
+basename = nonlinear_coupling_nonmonotonic
 
 <mesh>
 nghost = 2
 nx1 = 8
-x1min = -0.5
-x1max = 0.5
+x1min = -16.0
+x1max = 16.0
 ix1_bc = periodic
 ox1_bc = periodic
 nx2 = 1
@@ -32,8 +33,9 @@ evolution = dynamic
 integrator = rk2
 cfl_number = 0.4
 nlim = 1
-tlim = 0.01
+tlim = 1.0
 ndiag = 1
+initial_dt = 1.0
 
 <hydro>
 eos = ideal
@@ -47,22 +49,26 @@ t_ei = -1.0
 
 <thermal_radiation>
 enabled = true
-n_groups = 2
-arad = 0.1
+n_groups = 1
+arad = 1.0
 c_light = 1.0
-initial_radiation_temperature = 0.5
-flux_limiter = levermore-pomraning
+initial_radiation_temperature = 0.1
+flux_limiter = none
+transport_integrator = implicit
+implicit_preconditioner = jacobi
+implicit_tolerance = 1.0e-10
+implicit_max_iterations = 200
+implicit_report = false
 source_cfl = 0.0
 source_integrator = nonlinear
-source_report = false
+source_report = true
 couple_matter = true
 
 group_bound_0 = 0.0
-group_bound_1 = 1.0
-group_bound_2 = 100.0
+group_bound_1 = 100.0
 
 opacity_model = table
-opacity_table_file = inputs/hydro/two_temperature_opacity_table.dat
+opacity_table_file = test-2t/nonlinear_coupling_nonmonotonic.opacity
 opacity_interpolation = linear
 opacity_coordinate_interpolation = linear
 opacity_density_scale = 1.0
@@ -74,13 +80,13 @@ opacity_value_scale = 1.0
 pgen_name = shock_tube
 shock_dir = 1
 xshock = 0.0
-dl = 2.0
-pl = 3.0
+dl = 1.0
+pl = 1.0
 ul = 0.0
 vl = 0.0
 wl = 0.0
-dr = 2.0
-pr = 3.0
+dr = 1.0
+pr = 1.0
 ur = 0.0
 vr = 0.0
 wr = 0.0
@@ -89,6 +95,15 @@ wr = 0.0
 file_type = tab
 variable = hydro_3t
 data_format = %20.16e
-dt = 0.01
+dt = 1.0
+slice_x2 = 0.0
+slice_x3 = 0.0
+
+<output2>
+file_type = tab
+variable = hydro_w_d
+id = density
+data_format = %20.16e
+dt = 1.0
 slice_x2 = 0.0
 slice_x3 = 0.0

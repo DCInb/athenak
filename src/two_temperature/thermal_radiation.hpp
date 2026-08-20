@@ -46,6 +46,9 @@ class ThermalRadiation {
   Real dtnew;
   int implicit_iterations_last_solve = 0;
   Real implicit_residual_last_solve = 0.0;
+  int source_iterations_last_solve = 0;
+  int source_fallbacks_last_solve = 0;
+  Real source_residual_last_solve = 0.0;
   // Rank-local, step-averaged outward diffusive power through physical boundaries.
   Real implicit_boundary_power = 0.0;
 
@@ -85,6 +88,12 @@ class ThermalRadiation {
   Real initial_radiation_x1_;
   Real energy_floor_;
   Real source_cfl_;
+  bool nonlinear_source_ = true;
+  bool source_report_ = false;
+  Real source_nonlinear_tolerance_ = 1.0e-10;
+  Real source_nonlinear_absolute_tolerance_ = 0.0;
+  int source_max_iterations_ = 80;
+  int source_fallback_substeps_ = 8;
   Real ap_streaming_threshold_;
   Real ap_optical_depth_threshold_;
   int initial_profile_mode_;
@@ -118,6 +127,8 @@ class ThermalRadiation {
   DualArray1D<Real> kappa_transport_;
   DualArray1D<Real> kappa_absorption_;
   DualArray1D<Real> kappa_emission_;
+  DualArray1D<int> source_integer_stats_;
+  DualArray1D<Real> source_real_stats_;
 
   // One component is solved at a time so the storage cost does not scale with ngroups.
   DvceArray5D<Real> implicit_old_;

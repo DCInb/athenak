@@ -751,6 +751,9 @@ int main(int argc, char **argv) {
           const auto inverse1 = single_mixture.StateFromRhoSpecificEnergies(
               density, state1.ion_specific_internal_energy,
               state1.electron_specific_internal_energy, mix1);
+          const Real forward_electron1 =
+              single_mixture.ElectronSpecificEnergyFromRhoTemperature(
+                  density, 100.0, mix1);
           const auto pure_ch = mixture.StateFromRhoTemperatures(
               density, 100.0, 100.0, 1.0);
           if (mix1.count != 1 || mix1[0] != 1.0 || zero1[0] != 1.0 ||
@@ -761,6 +764,8 @@ int main(int argc, char **argv) {
               !NearlyEqual(state1.ion_pressure, pure_ch.ion_pressure) ||
               !NearlyEqual(state1.electron_pressure,
                            pure_ch.electron_pressure) ||
+              !NearlyEqual(forward_electron1,
+                           state1.electron_specific_internal_energy) ||
               !NearlyEqual(inverse1.ion_temperature, 100.0) ||
               !NearlyEqual(inverse1.electron_temperature, 100.0)) {
             ++local_failures;
@@ -806,8 +811,14 @@ int main(int argc, char **argv) {
               mixed4.electron_specific_internal_energy, mix4);
           const auto electron4 = many_mixture.ElectronStateFromRhoSpecificEnergy(
               density, mixed4.electron_specific_internal_energy, mix4);
+          const Real forward_electron4 =
+              many_mixture.ElectronSpecificEnergyFromRhoTemperature(
+                  density, 100.0, mix4);
           const auto ideal4 = ideal_many_mixture.StateFromRhoTemperaturesNoSound(
               density, 2.5, 1.5, mix4);
+          const Real ideal_forward_electron4 =
+              ideal_many_mixture.ElectronSpecificEnergyFromRhoTemperature(
+                  density, 1.5, mix4);
           Real overshoot_fractions[4] = {0.8, 0.7, 0.3, 0.2};
           const auto overshoot =
               many_mixture.CompositionFromFractions(overshoot_fractions);
@@ -822,6 +833,7 @@ int main(int argc, char **argv) {
                            expected_ion_energy) ||
               !NearlyEqual(mixed4.electron_specific_internal_energy,
                            expected_electron_energy) ||
+              !NearlyEqual(forward_electron4, expected_electron_energy) ||
               !NearlyEqual(mixed4.ion_pressure, expected_ion_pressure) ||
               !NearlyEqual(mixed4.electron_pressure,
                            expected_electron_pressure) ||
@@ -841,6 +853,8 @@ int main(int argc, char **argv) {
                                ideal4.electron_specific_internal_energy,
                                mix4),
                            1.5) ||
+              !NearlyEqual(ideal_forward_electron4,
+                           ideal4.electron_specific_internal_energy) ||
               !NearlyEqual(overshoot[0], 0.4) ||
               !NearlyEqual(overshoot[1], 0.35) ||
               !NearlyEqual(overshoot[2], 0.15) ||

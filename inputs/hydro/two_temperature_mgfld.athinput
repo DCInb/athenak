@@ -54,6 +54,8 @@ initial_radiation_temperature = 0.2
 flux_limiter = levermore-pomraning
 flux_limit_coefficient = 1.0
 source_cfl = 0.1
+source_integrator = nonlinear
+source_report = false
 couple_matter = true
 
 # Photon energies h*nu/k_B in the same code-temperature units as Te.

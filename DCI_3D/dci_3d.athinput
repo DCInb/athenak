@@ -183,8 +183,11 @@ implicit_x3_inner_boundary = vacuum
 implicit_x3_outer_boundary = vacuum
 ap_streaming_threshold = 5.0e-1
 ap_optical_depth_threshold = 1.0
-# Only the explicit c*dt/dx transport restriction is disabled.  AthenaK time-lags its
-# local emission source, so retain an independent 10% source-splitting accuracy guard.
+# The local backward-Euler source solve couples temperature-dependent EOS, opacity,
+# and all radiation groups nonlinearly.  Retain an independent 10% source guard while
+# validating the new integration path in production.
+source_integrator = nonlinear
+source_report = false
 source_cfl = 0.1
 couple_matter = true
 opacity_model = mixed-table

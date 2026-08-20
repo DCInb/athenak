@@ -1,6 +1,7 @@
 """Regression tests for 2T multigroup thermal radiation on CPUs."""
 
 import math
+import re
 
 import numpy as np
 import pytest
@@ -46,6 +47,47 @@ def planck_group_fraction(lower, upper, temperature):
              - planck_integral(lower/temperature))/infinity)
 
 
+def coupled_source_reference(electron_energy, group_energies, density, dt,
+                             light_speed, arad, bounds, absorption, emission,
+                             electron_heat_capacity):
+    """Solve the same scalar backward-Euler energy residual at high precision."""
+    local_energy = electron_energy + sum(group_energies)
+    coupling_depth = dt*light_speed*density
+
+    def state(temperature):
+        blackbody = arad*temperature**4
+        groups = []
+        for group, old in enumerate(group_energies):
+            equilibrium = blackbody*planck_group_fraction(
+                bounds[group], bounds[group+1], temperature)
+            groups.append(
+                (old + coupling_depth*emission[group]*equilibrium)
+                / (1.0 + coupling_depth*absorption[group]))
+        residual = electron_heat_capacity*temperature + sum(groups)-local_energy
+        return residual, groups
+
+    low = 0.0
+    high = local_energy/electron_heat_capacity
+    for _ in range(160):
+        temperature = 0.5*(low+high)
+        residual, _ = state(temperature)
+        if residual > 0.0:
+            high = temperature
+        else:
+            low = temperature
+    temperature = 0.5*(low+high)
+    _, groups = state(temperature)
+    return temperature, groups
+
+
+def tab_time(path):
+    """Read the simulation time from an Athena formatted-table header."""
+    with open(path, encoding="ascii") as stream:
+        match = re.search(r"time=([^\s]+)", stream.readline())
+    assert match is not None
+    return float(match.group(1))
+
+
 def test_run():
     try:
         assert testutils.run(relax_input), "Matter-radiation relaxation run failed."
@@ -65,6 +107,53 @@ def test_run():
         assert np.all(final["erad00"] >= 0.0)
         assert np.all(final["erad01"] >= 0.0)
         assert np.all(final["erad02"] >= 0.0)
+
+        # A source step over 10^4 times the absorption time should land directly on the
+        # mutually consistent final matter/radiation state, rather than the spectrum
+        # associated with the old electron temperature.
+        basename = "thermal_radiation_nonlinear_stiff"
+        stiff_opacity = 1.0e6
+        flags = [
+            f"job/basename={basename}",
+            "time/nlim=1",
+            "thermal_radiation/source_cfl=0",
+            "thermal_radiation/source_integrator=nonlinear",
+            "thermal_radiation/source_report=true",
+        ]
+        for group in range(3):
+            flags.extend([
+                f"thermal_radiation/kappa_absorption_{group}={stiff_opacity}",
+                f"thermal_radiation/kappa_emission_{group}={stiff_opacity}",
+            ])
+        assert testutils.run(relax_input, flags=flags), (
+            "Stiff nonlinear matter-radiation source run failed.")
+        initial_path = f"tab/{basename}.hydro_3t.00000.tab"
+        final_path = f"tab/{basename}.hydro_3t.00001.tab"
+        stiff_initial = athena_read.tab(initial_path)
+        stiff_final = athena_read.tab(final_path)
+        source_dt = tab_time(final_path)-tab_time(initial_path)
+        density = 1.0
+        old_groups = [
+            density*stiff_initial[f"erad0{group}"][0]
+            for group in range(3)
+        ]
+        expected_temperature, expected_groups = coupled_source_reference(
+            density*stiff_initial["eele"][0], old_groups, density, source_dt,
+            1.0, 0.1, [0.0, 0.5, 2.0, 100.0],
+            [stiff_opacity]*3, [stiff_opacity]*3,
+            density*0.5/(2.0/3.0))
+        assert np.allclose(stiff_final["tele"], expected_temperature,
+                           rtol=3.0e-10, atol=3.0e-12)
+        for group, expected in enumerate(expected_groups):
+            assert np.allclose(stiff_final[f"erad0{group}"], expected/density,
+                               rtol=1.0e-9, atol=3.0e-11)
+        stiff_initial_total = (
+            stiff_initial["eion"] + stiff_initial["eele"]
+            + stiff_initial["erad"])
+        stiff_final_total = (
+            stiff_final["eion"] + stiff_final["eele"] + stiff_final["erad"])
+        assert np.allclose(stiff_final_total, stiff_initial_total,
+                           rtol=3.0e-11, atol=3.0e-12)
 
         assert testutils.run(diffusion_input), "Multigroup FLD transport run failed."
         initial = athena_read.tab("tab/mgfld_diffusion.hydro_3t.00000.tab")
@@ -101,6 +190,7 @@ def test_run():
             basename = f"opacity_{interpolation}"
             flags = [
                 f"job/basename={basename}",
+                "thermal_radiation/source_integrator=lagged",
                 f"thermal_radiation/opacity_interpolation={interpolation}",
                 f"thermal_radiation/opacity_table_file={opacity_table}",
             ]
@@ -138,6 +228,7 @@ def test_run():
         basename = "opacity_emission_limited"
         flags = [
             f"job/basename={basename}",
+            "thermal_radiation/source_integrator=lagged",
             "thermal_radiation/opacity_interpolation=linear",
             f"thermal_radiation/opacity_table_file={opacity_table}",
             "thermal_radiation/arad=100.0",

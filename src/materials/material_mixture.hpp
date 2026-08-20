@@ -1599,6 +1599,22 @@ struct MaterialMixtureDevice {
            ElectronHeatCapacityFraction(mix);
   }
 
+  //! Electron caloric EOS in the forward (rho, Te) direction.  Source operators that
+  //! root-find directly in electron temperature use this reduced query to avoid also
+  //! interpolating the unchanged ion component on every nonlinear iteration.
+  KOKKOS_INLINE_FUNCTION
+  Real ElectronSpecificEnergyFromRhoTemperature(
+      const Real density, const Real electron_temperature,
+      const MaterialComposition &mix) const {
+    if (use_tabular_eos) {
+      return MixtureComponentFromRhoTemperature(
+          IonmixComponent::electron, density, electron_temperature,
+          mix).specific_internal_energy;
+    }
+    return ElectronHeatCapacityFraction(mix)*electron_temperature/
+           gamma_minus_one;
+  }
+
   KOKKOS_INLINE_FUNCTION
   Real ElectronNumberDensity(const Real density,
                              const MaterialComposition &mix) const {

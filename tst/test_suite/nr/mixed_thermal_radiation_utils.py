@@ -127,7 +127,8 @@ def write_mixed_input(path, material0_table, material1_table):
         "flux_limiter = levermore-pomraning", "flux_limit_coefficient = 1.0",
         "transport_discretization = asymptotic-preserving",
         "ap_streaming_threshold = 0.5", "ap_optical_depth_threshold = 1.0",
-        "source_cfl = 0.0", "couple_matter = true", "opacity_model = table",
+        "source_cfl = 0.0", "source_integrator = lagged", "source_report = false",
+        "couple_matter = true", "opacity_model = table",
     ]
     radiation.extend(
         f"group_bound_{group} = {bound}"

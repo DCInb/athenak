@@ -1,0 +1,29 @@
+# AthenaK native multigroup opacity table, format version 1.
+#
+# This is an intentionally adversarial, but valid, source-coupling table.  The narrow
+# emission-opacity peak around Te=0.5 makes the backward-Euler conservative temperature
+# residual non-monotonic.  Absorption remains smooth and positive, and the constructed
+# source problem has one admissible root.
+
+athenak_opacity_table 1
+dimensions 1 6 1
+
+density
+1.0
+
+temperature
+0.1 0.3 0.5 0.6 1.0 2.0
+
+group_bound
+0.0 100.0
+
+transport
+1.0 1.0 1.0 1.0 1.0 1.0
+
+absorption
+0.1 0.1 0.1 0.1 0.1 0.1
+
+emission
+0.825 0.825 6.0 0.825 0.825 0.825
+
+end

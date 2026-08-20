@@ -455,6 +455,208 @@ Real PlanckGroupFraction(Real lower_bound, Real upper_bound, Real temperature) {
   return fmin(fmax(fraction, 0.0), 1.0);
 }
 
+struct CoupledSourceEvaluation {
+  Real electron_energy = 0.0;
+  Real radiation_energy = 0.0;
+  Real residual = 0.0;
+};
+
+struct LaggedSourceResult {
+  Real electron_energy = 0.0;
+  Real radiation_energy = 0.0;
+  Real electron_temperature = 0.0;
+};
+
+// Algebraically equivalent forms of the backward-Euler group elimination.  Dividing by
+// the coupling depth in the stiff branch prevents an otherwise avoidable inf/inf when a
+// source step is intentionally much longer than the microscopic exchange time.
+KOKKOS_INLINE_FUNCTION
+Real BackwardEulerGroupEnergy(const Real old_energy, const Real equilibrium,
+                              const Real absorption_opacity,
+                              const Real emission_opacity,
+                              const Real coupling_depth) {
+  if (!(absorption_opacity > 0.0)) {
+    const Real emission = emission_opacity*equilibrium;
+    return (emission > 0.0) ? old_energy+coupling_depth*emission : old_energy;
+  }
+  if (coupling_depth > 1.0) {
+    const Real inverse_depth = 1.0/coupling_depth;
+    return (inverse_depth*old_energy+emission_opacity*equilibrium)/
+           (inverse_depth+absorption_opacity);
+  }
+  return (old_energy+coupling_depth*emission_opacity*equilibrium)/
+         (1.0+coupling_depth*absorption_opacity);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ElectronEnergyDensityFromTemperature(
+    const Real density, const Real electron_temperature,
+    const Real gamma_minus_one, const Real fixed_electron_fraction,
+    const bool use_materials,
+    const materials::MaterialMixtureDevice &mixture,
+    const materials::MaterialComposition &composition) {
+  if (use_materials) {
+    return density*mixture.ElectronSpecificEnergyFromRhoTemperature(
+        density, electron_temperature, composition);
+  }
+  return density*fixed_electron_fraction*electron_temperature/gamma_minus_one;
+}
+
+// Evaluate the scalar conservative residual after analytically eliminating all group
+// energies.  The optional cache is used only once, after convergence; root iterations
+// therefore need no per-group scratch storage.
+KOKKOS_INLINE_FUNCTION
+CoupledSourceEvaluation EvaluateCoupledSource(
+    const Real electron_temperature, const Real local_energy,
+    const Real density, const Real coupling_depth, const Real arad,
+    const Real gamma_minus_one, const Real fixed_electron_fraction,
+    const int ngroups, const int first_group, const int m, const int k,
+    const int j, const int i, const DvceArray5D<Real> &cons,
+    const DvceArray5D<Real> &prim, const DvceArray1D<Real> &bounds,
+    const DvceArray1D<Real> &constant_absorption,
+    const DvceArray1D<Real> &constant_emission, const bool use_table,
+    const OpacityTableDevice &opacity, const bool use_mixed_table,
+    const MixedOpacityTableDevice &mixed_opacity, const bool use_materials,
+    const materials::MaterialMixtureDevice &mixture,
+    const materials::MaterialComposition &composition,
+    const bool cache_groups) {
+  CoupledSourceEvaluation result;
+  result.electron_energy = ElectronEnergyDensityFromTemperature(
+      density, electron_temperature, gamma_minus_one,
+      fixed_electron_fraction, use_materials, mixture, composition);
+
+  OpacityTableLocation opacity_location;
+  if (use_table) {
+    opacity_location = opacity.Locate(density, electron_temperature);
+  }
+  MixedOpacityTableLocation mixed_location;
+  if (use_mixed_table) {
+    mixed_location = mixed_opacity.Locate(
+        density, electron_temperature, composition);
+  }
+
+  const Real temperature2 = electron_temperature*electron_temperature;
+  const Real blackbody = arad*temperature2*temperature2;
+  Real lower_planck = (electron_temperature > 0.0)
+      ? PlanckIntegral(bounds(0)/electron_temperature) : 0.0;
+  for (int g = 0; g < ngroups; ++g) {
+    const Real old = fmax(cons(m, first_group+g, k, j, i), 0.0);
+    const Real kappaa = use_mixed_table ? mixed_opacity.Get(
+        opacity_absorption, g, mixed_location) : (use_table ? opacity.Get(
+        opacity_absorption, g, opacity_location) : constant_absorption(g));
+    const Real kappae = use_mixed_table ? mixed_opacity.Get(
+        opacity_emission, g, mixed_location) : (use_table ? opacity.Get(
+        opacity_emission, g, opacity_location) : constant_emission(g));
+    Real fraction = 0.0;
+    if (electron_temperature > 0.0) {
+      const Real upper_planck =
+          PlanckIntegral(bounds(g+1)/electron_temperature);
+      fraction = fmin(fmax(
+          (upper_planck-lower_planck)/kPlanckIntegralInfinity, 0.0), 1.0);
+      lower_planck = upper_planck;
+    }
+    const Real updated = BackwardEulerGroupEnergy(
+        old, blackbody*fraction, kappaa, kappae, coupling_depth);
+    if (cache_groups) prim(m, first_group+g, k, j, i) = updated;
+    result.radiation_energy += updated;
+  }
+  result.residual = result.electron_energy+result.radiation_energy-local_energy;
+  return result;
+}
+
+// The compatibility source update and the nonlinear failure path share this bounded
+// lagged substep implementation.  Radiation slots in prim are temporary energy-density
+// scratch until each substep is committed as a specific energy.
+KOKKOS_INLINE_FUNCTION
+LaggedSourceResult ApplyLaggedSourceSubsteps(
+    const int substeps, const Real dt, const Real density,
+    const Real initial_electron_energy, const Real electron_energy_floor,
+    const Real initial_electron_temperature, const Real chat, const Real arad,
+    const Real gamma_minus_one, const Real fixed_electron_fraction,
+    const int ngroups, const int first_group, const int m, const int k,
+    const int j, const int i, const DvceArray5D<Real> &cons,
+    const DvceArray5D<Real> &prim, const DvceArray1D<Real> &bounds,
+    const DvceArray1D<Real> &constant_absorption,
+    const DvceArray1D<Real> &constant_emission, const bool use_table,
+    const OpacityTableDevice &opacity, const bool use_mixed_table,
+    const MixedOpacityTableDevice &mixed_opacity, const bool use_materials,
+    const materials::MaterialMixtureDevice &mixture,
+    const materials::MaterialComposition &composition) {
+  LaggedSourceResult result;
+  result.electron_energy = initial_electron_energy;
+  result.electron_temperature = initial_electron_temperature;
+  const Real substep_dt = dt/static_cast<Real>(substeps);
+  const Real coupling_depth = substep_dt*chat*density;
+
+  for (int step = 0; step < substeps; ++step) {
+    const Real tele = result.electron_temperature;
+    OpacityTableLocation opacity_location;
+    if (use_table) opacity_location = opacity.Locate(density, tele);
+    MixedOpacityTableLocation mixed_location;
+    if (use_mixed_table) {
+      mixed_location = mixed_opacity.Locate(density, tele, composition);
+    }
+    const Real temperature2 = tele*tele;
+    const Real blackbody = arad*temperature2*temperature2;
+    Real positive = 0.0;
+    Real negative = 0.0;
+    Real lower_planck =
+        (tele > 0.0) ? PlanckIntegral(bounds(0)/tele) : 0.0;
+    for (int g = 0; g < ngroups; ++g) {
+      const Real old = fmax(cons(m, first_group+g, k, j, i), 0.0);
+      const Real kappaa = use_mixed_table ? mixed_opacity.Get(
+          opacity_absorption, g, mixed_location) : (use_table ? opacity.Get(
+          opacity_absorption, g, opacity_location) : constant_absorption(g));
+      const Real kappae = use_mixed_table ? mixed_opacity.Get(
+          opacity_emission, g, mixed_location) : (use_table ? opacity.Get(
+          opacity_emission, g, opacity_location) : constant_emission(g));
+      Real fraction = 0.0;
+      if (tele > 0.0) {
+        const Real upper_planck = PlanckIntegral(bounds(g+1)/tele);
+        fraction = fmin(fmax(
+            (upper_planck-lower_planck)/kPlanckIntegralInfinity, 0.0), 1.0);
+        lower_planck = upper_planck;
+      }
+      const Real updated = BackwardEulerGroupEnergy(
+          old, blackbody*fraction, kappaa, kappae, coupling_depth);
+      prim(m, first_group+g, k, j, i) = updated;
+      const Real delta = updated-old;
+      if (delta > 0.0) positive += delta;
+      if (delta < 0.0) negative += delta;
+    }
+
+    // Absorbed energy is available during the same substep.  Scale only net-positive
+    // group changes when unconstrained emission would cross the material floor.
+    const Real available = fmax(
+        result.electron_energy-electron_energy_floor-negative, 0.0);
+    const Real emission_scale = (positive > available && positive > 0.0)
+        ? available/positive : 1.0;
+    Real total_delta = 0.0;
+    result.radiation_energy = 0.0;
+    for (int g = 0; g < ngroups; ++g) {
+      const Real old = fmax(cons(m, first_group+g, k, j, i), 0.0);
+      const Real raw = prim(m, first_group+g, k, j, i);
+      Real delta = raw-old;
+      if (delta > 0.0) delta *= emission_scale;
+      const Real updated = old+delta;
+      cons(m, first_group+g, k, j, i) = updated;
+      prim(m, first_group+g, k, j, i) = updated/density;
+      total_delta += delta;
+      result.radiation_energy += updated;
+    }
+    result.electron_energy = fmax(
+        result.electron_energy-total_delta, electron_energy_floor);
+    if (use_materials) {
+      result.electron_temperature = mixture.ElectronTemperature(
+          density, result.electron_energy/density, composition);
+    } else {
+      result.electron_temperature = gamma_minus_one*result.electron_energy/
+          (density*fixed_electron_fraction);
+    }
+  }
+  return result;
+}
+
 // mode: 0=none, 1=FLASH harmonic, 2=FLASH Larsen, 3=FLASH min/max,
 // 4=Levermore-Pomraning.  D has units of length and the physical diffusion coefficient
 // multiplying grad(E) is c_hat*D.
@@ -784,7 +986,9 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
     group_bounds_("thermal-radiation-bounds", 1),
     kappa_transport_("thermal-radiation-kappa-transport", 1),
     kappa_absorption_("thermal-radiation-kappa-absorption", 1),
-    kappa_emission_("thermal-radiation-kappa-emission", 1) {
+    kappa_emission_("thermal-radiation-kappa-emission", 1),
+    source_integer_stats_("thermal-radiation-source-integer-stats", 1),
+    source_real_stats_("thermal-radiation-source-real-stats", 1) {
   if (use_material_mixture_) material_mixture_ = material_mixture->DeviceData();
   if (ngroups < 1 || ngroups > 100) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -804,6 +1008,47 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   energy_floor_ = pin->GetOrAddReal("thermal_radiation", "energy_floor", 1.0e-30);
   source_cfl_ = pin->GetOrAddReal("thermal_radiation", "source_cfl", 0.1);
   couple_matter_ = pin->GetOrAddBoolean("thermal_radiation", "couple_matter", true);
+  const std::string source_integrator = pin->GetOrAddString(
+      "thermal_radiation", "source_integrator", "nonlinear");
+  if (source_integrator == "nonlinear" || source_integrator == "coupled") {
+    nonlinear_source_ = true;
+  } else if (source_integrator == "lagged" || source_integrator == "frozen" ||
+             source_integrator == "time-lagged") {
+    nonlinear_source_ = false;
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Unknown <thermal_radiation>/source_integrator='"
+              << source_integrator << "'; expected nonlinear or lagged" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const Real minimum_source_tolerance = 64.0*kRealEpsilon;
+  const Real default_source_tolerance =
+      std::max(static_cast<Real>(1.0e-10), minimum_source_tolerance);
+  source_nonlinear_tolerance_ = pin->GetOrAddReal(
+      "thermal_radiation", "source_nonlinear_tolerance",
+      default_source_tolerance);
+  source_nonlinear_absolute_tolerance_ = pin->GetOrAddReal(
+      "thermal_radiation", "source_nonlinear_absolute_tolerance", 0.0);
+  source_max_iterations_ = pin->GetOrAddInteger(
+      "thermal_radiation", "source_max_iterations", 80);
+  source_fallback_substeps_ = pin->GetOrAddInteger(
+      "thermal_radiation", "source_fallback_substeps", 8);
+  source_report_ = pin->GetOrAddBoolean(
+      "thermal_radiation", "source_report", false);
+  if (!std::isfinite(source_nonlinear_tolerance_) ||
+      source_nonlinear_tolerance_ < minimum_source_tolerance ||
+      source_nonlinear_tolerance_ >= 1.0 ||
+      !std::isfinite(source_nonlinear_absolute_tolerance_) ||
+      source_nonlinear_absolute_tolerance_ < 0.0 ||
+      source_max_iterations_ <= 0 || source_fallback_substeps_ <= 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Nonlinear radiation-source tolerance must be finite, "
+              << "at least " << minimum_source_tolerance
+              << ", and less than one; the absolute tolerance must be finite and "
+              << "non-negative; iteration and fallback-substep counts must be positive"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   const std::string transport_integrator = pin->GetOrAddString(
       "thermal_radiation", "transport_integrator", "explicit");
   if (transport_integrator == "explicit") {
@@ -977,6 +1222,8 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   Kokkos::realloc(kappa_transport_, ngroups);
   Kokkos::realloc(kappa_absorption_, ngroups);
   Kokkos::realloc(kappa_emission_, ngroups);
+  Kokkos::realloc(source_integer_stats_, 2);
+  Kokkos::realloc(source_real_stats_, 1);
 
   for (int g = 0; g <= ngroups; ++g) {
     group_bounds_.h_view(g) = pin->GetReal(
@@ -3132,10 +3379,13 @@ void ThermalRadiation::SolveImplicitTransport(
 }
 
 //----------------------------------------------------------------------------------------
-//! Apply FLASH-style time-lagged Planck emission and implicit group absorption.
+//! Apply the local matter-radiation source update.
 //!
-//! The sum of radiation changes is removed from the electron and material total energies.
-//! Positive emission is scaled only when necessary to prevent a negative electron energy.
+//! In nonlinear mode every group is analytically eliminated at a trial end-of-step
+//! electron temperature.  A safeguarded bracketed scalar solve then enforces the
+//! local electron-plus-radiation energy invariant.  The compatibility mode retains
+//! the original time-lagged Planck/emission coefficients.  A failed nonlinear cell
+//! uses bounded lagged substeps instead of committing a partially converged state.
 
 void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
     DvceArray5D<Real> &prim, DvceArray5D<Real> &temperature,
@@ -3154,6 +3404,7 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
   Real fe = cv_e_fraction_;
   Real arad = arad_;
   Real chat = chat_;
+  Real energy_floor = energy_floor_;
   auto bounds = group_bounds_.d_view;
   auto ka = kappa_absorption_.d_view;
   auto ke = kappa_emission_.d_view;
@@ -3168,102 +3419,354 @@ void ThermalRadiation::Couple(Real dt, DvceArray5D<Real> &cons,
   auto diag = diagnostics;
   const Real pressure_floor = material_pressure_floor;
   const Real temperature_floor = material_temperature_floor;
+  const bool nonlinear_source = nonlinear_source_;
+  const Real nonlinear_tolerance = source_nonlinear_tolerance_;
+  const Real nonlinear_absolute_tolerance =
+      source_nonlinear_absolute_tolerance_;
+  const int max_iterations = source_max_iterations_;
+  const int fallback_substeps = source_fallback_substeps_;
+  const bool source_report = source_report_ && nonlinear_source_;
+  auto integer_stats = source_integer_stats_.d_view;
+  auto real_stats = source_real_stats_.d_view;
+
+  source_iterations_last_solve = 0;
+  source_fallbacks_last_solve = 0;
+  source_residual_last_solve = 0.0;
+  if (source_report) {
+    Kokkos::deep_copy(source_integer_stats_.d_view, 0);
+    Kokkos::deep_copy(source_real_stats_.d_view, 0.0);
+  }
 
   par_for("thermal_rad_couple", DevExeSpace(), 0, nmb1, kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    Real density = cons(m, IDN, k, j, i);
-    Real eele_old = fmax(cons(m, ie, k, j, i), 0.0);
+    const Real density = cons(m, IDN, k, j, i);
+    const Real eele_old = fmax(cons(m, ie, k, j, i), 0.0);
     materials::MaterialComposition composition;
-    Real tele;
+    Real tele_old;
     if (use_materials) {
       composition = mixture.CompositionFromConserved(cons, m, k, j, i);
-      tele = temperature(m, 1, k, j, i);
+      tele_old = temperature(m, 1, k, j, i);
     } else {
-      tele = gm1*eele_old/(density*fe);
-    }
-    OpacityTableLocation opacity_location;
-    if (use_table) opacity_location = opacity.Locate(density, tele);
-    MixedOpacityTableLocation mixed_location;
-    if (use_mixed_table) {
-      mixed_location = mixed_opacity.Locate(density, tele, composition);
-    }
-    Real blackbody = arad*tele*tele*tele*tele;
-    Real positive = 0.0;
-    Real negative = 0.0;
-    // Each group boundary is shared with its neighbour, so rolling the lower Planck
-    // integral forward evaluates 21 integrals for 20 groups instead of 40.  Identical
-    // construction to the source-limit reducer further down this file.
-    Real lower_planck = (tele > 0.0) ? PlanckIntegral(bounds(0)/tele) : 0.0;
-
-    for (int g = 0; g < ng; ++g) {
-      Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real kappaa = use_mixed_table ? mixed_opacity.Get(
-          opacity_absorption, g, mixed_location) : (use_table ? opacity.Get(
-          opacity_absorption, g, opacity_location) : ka(g));
-      Real kappae = use_mixed_table ? mixed_opacity.Get(
-          opacity_emission, g, mixed_location) : (use_table ? opacity.Get(
-          opacity_emission, g, opacity_location) : ke(g));
-      Real siga = density*kappaa;
-      Real sige = density*kappae;
-      Real group_fraction = 0.0;
-      if (tele > 0.0) {
-        const Real upper_planck = PlanckIntegral(bounds(g+1)/tele);
-        group_fraction = fmin(fmax(
-            (upper_planck-lower_planck)/kPlanckIntegralInfinity, 0.0), 1.0);
-        lower_planck = upper_planck;
-      }
-      Real source = sige*blackbody*group_fraction;
-      Real updated = (old + dt*chat*source)/(1.0 + dt*chat*siga);
-      // Cache the unscaled update in the primitive slot.  Radiation-group
-      // primitives are not read in Couple(), and every slot is overwritten
-      // with its final specific energy in the second loop below.
-      prim(m, i0+g, k, j, i) = updated;
-      Real delta = updated-old;
-      if (delta > 0.0) positive += delta;
-      if (delta < 0.0) negative += delta;
+      tele_old = gm1*eele_old/(density*fe);
     }
 
     Real eele_floor = 0.0;
-    if (use_materials && mixture.UsesTabularEOS()) {
+    if (use_materials &&
+        (nonlinear_source || mixture.UsesTabularEOS())) {
       const materials::MaterialPressureEnergyState floor_state =
           mixture.MinimumPressureEnergyState(
               density, composition, pressure_floor, temperature_floor);
       eele_floor = density*floor_state.electron_specific_internal_energy;
     }
-    // Absorbed radiation is immediately available, but tabular emission may not draw
-    // the electron component below the same table/pressure/temperature floor as Sync.
-    Real available = fmax(eele_old-eele_floor-negative, 0.0);
-    Real emission_scale = (positive > available && positive > 0.0)
-        ? available/positive : 1.0;
-    Real total_delta = 0.0;
-    Real total_radiation = 0.0;
-    for (int g = 0; g < ng; ++g) {
-      Real old = fmax(cons(m, i0+g, k, j, i), 0.0);
-      Real updated = prim(m, i0+g, k, j, i);
-      Real delta = updated-old;
-      if (delta > 0.0) delta *= emission_scale;
-      Real value = old+delta;
-      cons(m, i0+g, k, j, i) = value;
-      prim(m, i0+g, k, j, i) = value/density;
-      total_delta += delta;
-      total_radiation += value;
+
+    LaggedSourceResult source_result;
+    bool used_fallback = false;
+    int iterations = 0;
+    Real relative_residual = 0.0;
+
+    if (!nonlinear_source) {
+      source_result = ApplyLaggedSourceSubsteps(
+          1, dt, density, eele_old, eele_floor, tele_old, chat, arad,
+          gm1, fe, ng, i0, m, k, j, i, cons, prim, bounds, ka, ke,
+          use_table, opacity, use_mixed_table, mixed_opacity,
+          use_materials, mixture, composition);
+    } else {
+      Real old_radiation = 0.0;
+      for (int g = 0; g < ng; ++g) {
+        old_radiation += fmax(cons(m, i0+g, k, j, i), 0.0);
+      }
+      const Real local_energy = eele_old+old_radiation;
+      const Real residual_scale = fmax(fabs(local_energy), energy_floor);
+      const Real energy_tolerance = nonlinear_absolute_tolerance+
+          nonlinear_tolerance*residual_scale;
+      const Real coupling_depth = dt*chat*density;
+
+      Real temperature_low = 0.0;
+      Real temperature_high = 0.0;
+      if (use_materials && mixture.UsesTabularEOS()) {
+        temperature_low = fmax(
+            mixture.MinimumTransportTemperature(composition), temperature_floor);
+        if (eele_floor > 0.0) {
+          temperature_low = fmax(temperature_low, mixture.ElectronTemperature(
+              density, eele_floor/density, composition));
+        }
+        temperature_high = mixture.MaximumTransportTemperature(composition);
+      } else {
+        const Real local_fraction = use_materials
+            ? mixture.ElectronHeatCapacityFraction(composition) : fe;
+        const Real heat_capacity = density*local_fraction/gm1;
+        temperature_low = (heat_capacity > 0.0)
+            ? eele_floor/heat_capacity : 0.0;
+        temperature_high = (heat_capacity > 0.0)
+            ? local_energy/heat_capacity : 0.0;
+      }
+
+      bool converged = false;
+      bool bracketed = false;
+      Real root_temperature = fmin(fmax(
+          tele_old, temperature_low), temperature_high);
+      Real previous_temperature = root_temperature;
+      Real previous_residual = 1.0/kRealEpsilon;
+      bool have_previous_temperature = false;
+      CoupledSourceEvaluation low;
+      CoupledSourceEvaluation high;
+      if (Kokkos::isfinite(temperature_low) &&
+          Kokkos::isfinite(temperature_high) &&
+          temperature_high >= temperature_low && temperature_high >= 0.0) {
+        low = EvaluateCoupledSource(
+            temperature_low, local_energy, density, coupling_depth, arad,
+            gm1, fe, ng, i0, m, k, j, i, cons, prim, bounds, ka, ke,
+            use_table, opacity, use_mixed_table, mixed_opacity,
+            use_materials, mixture, composition, false);
+        high = EvaluateCoupledSource(
+            temperature_high, local_energy, density, coupling_depth, arad,
+            gm1, fe, ng, i0, m, k, j, i, cons, prim, bounds, ka, ke,
+            use_table, opacity, use_mixed_table, mixed_opacity,
+            use_materials, mixture, composition, false);
+        const bool finite_low = Kokkos::isfinite(low.residual);
+        const bool finite_high = Kokkos::isfinite(high.residual);
+        if (finite_low && fabs(low.residual) <= energy_tolerance) {
+          converged = true;
+          root_temperature = temperature_low;
+        } else if (finite_high && fabs(high.residual) <= energy_tolerance) {
+          converged = true;
+          root_temperature = temperature_high;
+        } else if (finite_low && finite_high &&
+                   ((low.residual < 0.0 && high.residual > 0.0) ||
+                    (low.residual > 0.0 && high.residual < 0.0))) {
+          bracketed = true;
+        }
+      }
+
+      // The synchronized old temperature is normally close to the root for a resolved
+      // source step.  Probe it once to tighten the bracket before false-position steps.
+      if (!converged && bracketed && tele_old > temperature_low &&
+          tele_old < temperature_high && Kokkos::isfinite(tele_old)) {
+        const CoupledSourceEvaluation warm = EvaluateCoupledSource(
+            tele_old, local_energy, density, coupling_depth, arad,
+            gm1, fe, ng, i0, m, k, j, i, cons, prim, bounds, ka, ke,
+            use_table, opacity, use_mixed_table, mixed_opacity,
+            use_materials, mixture, composition, false);
+        ++iterations;
+        if (Kokkos::isfinite(warm.residual)) {
+          if (fabs(warm.residual) <= energy_tolerance) {
+            converged = true;
+            root_temperature = tele_old;
+          } else if ((warm.residual > 0.0) == (low.residual > 0.0)) {
+            temperature_low = tele_old;
+            low = warm;
+          } else {
+            temperature_high = tele_old;
+            high = warm;
+          }
+          previous_temperature = tele_old;
+          previous_residual = fabs(warm.residual);
+          have_previous_temperature = true;
+        }
+      }
+
+      // Illinois-weighted false position retains a sign-changing bracket but avoids
+      // repeatedly pinning the same endpoint on strongly curved EOS/T^4 residuals.
+      Real weighted_low_residual = low.residual;
+      Real weighted_high_residual = high.residual;
+      int previously_moved_endpoint = -1;
+      for (; iterations < max_iterations && !converged && bracketed;
+           ++iterations) {
+        const Real low_magnitude = fabs(weighted_low_residual);
+        const Real high_magnitude = fabs(weighted_high_residual);
+        Real secant_fraction = 0.5;
+        if (low_magnitude > 0.0 && high_magnitude > 0.0) {
+          if (low_magnitude < high_magnitude) {
+            const Real ratio = low_magnitude/high_magnitude;
+            secant_fraction = ratio/(1.0+ratio);
+          } else {
+            const Real ratio = high_magnitude/low_magnitude;
+            secant_fraction = 1.0/(1.0+ratio);
+          }
+        }
+        Real trial_temperature = (temperature_low > 0.0)
+            ? exp(0.5*(log(temperature_low)+log(temperature_high)))
+            : 0.5*(temperature_low+temperature_high);
+        const Real secant_temperature = temperature_low+
+            secant_fraction*(temperature_high-temperature_low);
+        if (Kokkos::isfinite(secant_temperature) &&
+            secant_temperature > temperature_low &&
+            secant_temperature < temperature_high) {
+          trial_temperature = secant_temperature;
+        }
+        if (!(trial_temperature > temperature_low) ||
+            !(trial_temperature < temperature_high) ||
+            !Kokkos::isfinite(trial_temperature)) {
+          if (have_previous_temperature &&
+              previous_residual <= energy_tolerance) {
+            converged = true;
+            root_temperature = previous_temperature;
+          } else {
+            bracketed = false;
+          }
+          break;
+        }
+        const CoupledSourceEvaluation trial = EvaluateCoupledSource(
+            trial_temperature, local_energy, density, coupling_depth, arad,
+            gm1, fe, ng, i0, m, k, j, i, cons, prim, bounds, ka, ke,
+            use_table, opacity, use_mixed_table, mixed_opacity,
+            use_materials, mixture, composition, false);
+        root_temperature = trial_temperature;
+        if (!Kokkos::isfinite(trial.residual)) {
+          bracketed = false;
+          break;
+        }
+        if (trial.residual == 0.0) {
+          converged = true;
+          break;
+        }
+        const Real temperature_scale = fmax(
+            fabs(trial_temperature), fmax(temperature_low, 1.0e-30));
+        const Real relative_step = have_previous_temperature
+            ? fabs(trial_temperature-previous_temperature)/temperature_scale
+            : 1.0/kRealEpsilon;
+        if ((trial.residual > 0.0) == (low.residual > 0.0)) {
+          temperature_low = trial_temperature;
+          low = trial;
+          weighted_low_residual = trial.residual;
+          weighted_high_residual = (previously_moved_endpoint == 0)
+              ? 0.5*weighted_high_residual : high.residual;
+          previously_moved_endpoint = 0;
+        } else {
+          temperature_high = trial_temperature;
+          high = trial;
+          weighted_high_residual = trial.residual;
+          weighted_low_residual = (previously_moved_endpoint == 1)
+              ? 0.5*weighted_low_residual : low.residual;
+          previously_moved_endpoint = 1;
+        }
+        if (fabs(trial.residual) <= energy_tolerance &&
+            relative_step <= nonlinear_tolerance) {
+          converged = true;
+        }
+        previous_temperature = trial_temperature;
+        previous_residual = fabs(trial.residual);
+        have_previous_temperature = true;
+      }
+
+      CoupledSourceEvaluation final_state;
+      if (converged) {
+        final_state = EvaluateCoupledSource(
+            root_temperature, local_energy, density, coupling_depth, arad,
+            gm1, fe, ng, i0, m, k, j, i, cons, prim, bounds, ka, ke,
+            use_table, opacity, use_mixed_table, mixed_opacity,
+            use_materials, mixture, composition, true);
+        relative_residual = fabs(final_state.residual)/residual_scale;
+        const Real eele_candidate =
+            local_energy-final_state.radiation_energy;
+        bool valid = Kokkos::isfinite(final_state.electron_energy) &&
+            Kokkos::isfinite(final_state.radiation_energy) &&
+            Kokkos::isfinite(eele_candidate) &&
+            fabs(final_state.residual) <= energy_tolerance &&
+            eele_candidate >= eele_floor-energy_tolerance;
+        for (int g = 0; g < ng; ++g) {
+          const Real value = prim(m, i0+g, k, j, i);
+          valid = valid && Kokkos::isfinite(value) && value >= 0.0;
+        }
+
+        if (valid) {
+          source_result.electron_energy = fmax(eele_candidate, eele_floor);
+          Real target_radiation =
+              local_energy-source_result.electron_energy;
+          // A floor correction can be at most the nonlinear tolerance.  Rescale the
+          // cached spectrum by that tiny amount so local conservation remains exact.
+          if (target_radiation < 0.0 ||
+              (final_state.radiation_energy <= 0.0 && target_radiation > 0.0)) {
+            valid = false;
+          } else {
+            const Real radiation_scale = (final_state.radiation_energy > 0.0)
+                ? target_radiation/final_state.radiation_energy : 1.0;
+            valid = Kokkos::isfinite(radiation_scale) && radiation_scale >= 0.0;
+            if (valid) {
+              source_result.radiation_energy = 0.0;
+              for (int g = 0; g < ng; ++g) {
+                const Real value = radiation_scale*prim(m, i0+g, k, j, i);
+                cons(m, i0+g, k, j, i) = value;
+                prim(m, i0+g, k, j, i) = value/density;
+                source_result.radiation_energy += value;
+              }
+              source_result.electron_temperature = root_temperature;
+            }
+          }
+        }
+        converged = valid;
+      }
+
+      if (!converged) {
+        used_fallback = true;
+        Real endpoint_residual = 1.0/kRealEpsilon;
+        if (Kokkos::isfinite(low.residual)) {
+          endpoint_residual = fabs(low.residual)/residual_scale;
+        }
+        if (Kokkos::isfinite(high.residual)) {
+          endpoint_residual = fmin(
+              endpoint_residual, fabs(high.residual)/residual_scale);
+        }
+        relative_residual = endpoint_residual;
+        source_result = ApplyLaggedSourceSubsteps(
+            fallback_substeps, dt, density, eele_old, eele_floor,
+            tele_old, chat, arad, gm1, fe, ng, i0, m, k, j, i,
+            cons, prim, bounds, ka, ke, use_table, opacity,
+            use_mixed_table, mixed_opacity, use_materials, mixture,
+            composition);
+      }
     }
 
-    Real eele_new = fmax(eele_old-total_delta, eele_floor);
+    const Real eele_new = source_result.electron_energy;
     Real matter_delta = eele_new-eele_old;
     cons(m, ie, k, j, i) = eele_new;
     prim(m, ie, k, j, i) = eele_new/density;
     cons(m, IEN, k, j, i) += matter_delta;
     prim(m, IEN, k, j, i) += matter_delta;
-    if (!use_materials) {
+    if (nonlinear_source && !used_fallback &&
+        use_materials && mixture.UsesTabularEOS()) {
+      temperature(m, 1, k, j, i) = source_result.electron_temperature;
+    } else if (use_materials) {
+      temperature(m, 1, k, j, i) = mixture.ElectronTemperature(
+          density, eele_new/density, composition);
+    } else {
       temperature(m, 1, k, j, i) = gm1*eele_new/(density*fe);
-    } else if (!mixture.UsesTabularEOS()) {
-      temperature(m, 1, k, j, i) =
-          mixture.ElectronTemperature(density, eele_new/density, composition);
     }
-    diag(m, 0, k, j, i) = total_radiation/density;
-    diag(m, 1, k, j, i) = pow(total_radiation/arad, 0.25);
+    if (source_report) {
+      Kokkos::atomic_max(&integer_stats(0), iterations);
+      if (used_fallback) Kokkos::atomic_add(&integer_stats(1), 1);
+      const Real bounded_residual = Kokkos::isfinite(relative_residual)
+          ? relative_residual : 1.0/kRealEpsilon;
+      Kokkos::atomic_max(&real_stats(0), bounded_residual);
+    }
+    diag(m, 0, k, j, i) = source_result.radiation_energy/density;
+    diag(m, 1, k, j, i) = pow(source_result.radiation_energy/arad, 0.25);
   });
+
+  if (source_report) {
+    source_integer_stats_.modify_device();
+    source_real_stats_.modify_device();
+    source_integer_stats_.sync_host();
+    source_real_stats_.sync_host();
+    source_iterations_last_solve = source_integer_stats_.h_view(0);
+    source_fallbacks_last_solve = source_integer_stats_.h_view(1);
+    source_residual_last_solve = source_real_stats_.h_view(0);
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &source_iterations_last_solve, 1, MPI_INT,
+                  MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &source_fallbacks_last_solve, 1, MPI_INT,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &source_residual_last_solve, 1,
+                  MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+#endif
+    if (global_variable::my_rank == 0) {
+      std::cout << "# nonlinear thermal radiation source: max_iterations="
+                << source_iterations_last_solve
+                << " fallback_cells=" << source_fallbacks_last_solve
+                << " max_relative_residual=" << source_residual_last_solve
+                << std::endl;
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------
