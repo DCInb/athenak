@@ -46,6 +46,8 @@ class ThermalRadiation {
   Real dtnew;
   int implicit_iterations_last_solve = 0;
   Real implicit_residual_last_solve = 0.0;
+  int implicit_residual_replacements_last_solve = 0;
+  Real implicit_backward_error_last_solve = 0.0;
   int source_iterations_last_solve = 0;
   int source_fallbacks_last_solve = 0;
   Real source_residual_last_solve = 0.0;
@@ -103,6 +105,7 @@ class ThermalRadiation {
   bool implicit_report_ = false;
   Real implicit_tolerance_ = 1.0e-10;
   int implicit_max_iterations_ = 400;
+  int implicit_residual_check_interval_ = 50;
   // 0=point Jacobi, 1=factor-three global Galerkin V-cycle with symmetric red/black
   // Gauss-Seidel smoothing and an exact global MeshBlock-root solve.  Incompatible
   // MeshBlock sizes fall back to point Jacobi.
@@ -175,6 +178,9 @@ class ThermalRadiation {
                              DvceArray5D<Real> &result, Real dt);
   Real ImplicitGlobalDot(const DvceArray5D<Real> &lhs,
                          const DvceArray5D<Real> &rhs) const;
+  Real ImplicitComponentwiseBackwardError(
+      const DvceArray5D<Real> &field, const DvceArray5D<Real> &rhs,
+      const DvceArray5D<Real> &residual, Real dt) const;
   void BuildImplicitBlockCoarsePreconditioner(Real dt);
   void ExchangeImplicitMultilevelFaces(const DvceArray5D<Real> &field, int level);
   void SolveImplicitBlockRootSystem();

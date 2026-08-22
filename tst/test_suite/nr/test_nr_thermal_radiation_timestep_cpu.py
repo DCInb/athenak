@@ -18,7 +18,7 @@ relax_input = "../../../inputs/hydro/two_temperature_mgfld.athinput"
 opacity_table = "../../../inputs/hydro/two_temperature_opacity_table.dat"
 
 
-def run_case(input_file, flags, timeout=60.0):
+def run_case_with_output(input_file, flags, timeout=60.0):
     """Run AthenaK directly so the cycle diagnostics (including dt) are available."""
     command = ["./athena", "-i", input_file, *flags]
     result = subprocess.run(
@@ -33,7 +33,12 @@ def run_case(input_file, flags, timeout=60.0):
     ]
     if not timesteps:
         pytest.fail(f"No timestep diagnostics found in output:\n{result.stdout}")
-    return timesteps
+    return timesteps, result.stdout
+
+
+def run_case(input_file, flags, timeout=60.0):
+    """Return only timesteps for the common case that does not inspect reports."""
+    return run_case_with_output(input_file, flags, timeout)[0]
 
 
 def transport_flags(basename, resolution=64, opacity=1.0e-8, nlim=0):
@@ -288,6 +293,19 @@ def test_run():
         assert "Implicit radiation tolerance must be finite" in (
             invalid_tolerance.stdout + invalid_tolerance.stderr)
 
+        invalid_interval_input = input_variant(
+            diffusion_input, variants, "invalid_implicit_residual_check_interval",
+            {"thermal_radiation": {
+                "transport_integrator": "implicit",
+                "implicit_residual_check_interval": "0",
+            }})
+        invalid_interval = subprocess.run(
+            ["./athena", "-i", invalid_interval_input],
+            text=True, capture_output=True, timeout=60.0, check=False)
+        assert invalid_interval.returncode != 0
+        assert "residual-check interval must be positive" in (
+            invalid_interval.stdout + invalid_interval.stderr)
+
         invalid_preconditioner_input = input_variant(
             diffusion_input, variants, "invalid_implicit_preconditioner",
             {"thermal_radiation": {
@@ -378,6 +396,62 @@ def test_run():
         variance_c2 = sum(
             (value - mean_radiation)**2 for value in implicit_results[2.0])
         assert variance_c2 < variance_c1
+
+        # Force reliable residual updates in a stiff block-coarse solve.  The large
+        # dt*D/dx^2 makes recursive residual drift observable, while checking every two
+        # iterations guarantees this regression exercises a genuine residual replacement
+        # rather than only the terminal validation path.
+        stiff_resolution = 90
+        stiff_step = 1.0
+        stiff_opacity = 1.0
+        stiff_basename = "fld_implicit_stiff_reliable_update"
+        stiff_input = input_variant(
+            diffusion_input, variants, "implicit_stiff_reliable_update",
+            {"thermal_radiation": {
+                "implicit_tolerance": "1.0e-10",
+                "implicit_max_iterations": "2000",
+                "implicit_residual_check_interval": "2",
+                "implicit_report": "true",
+            }})
+        stiff_flags = transport_flags(
+            stiff_basename, resolution=stiff_resolution,
+            opacity=stiff_opacity, nlim=1)
+        stiff_flags.extend([
+            "meshblock/nx1=45",
+            f"time/tlim={stiff_step}",
+            f"output1/dt={stiff_step}",
+            "output1/data_format=%24.17e",
+            "thermal_radiation/transport_integrator=implicit",
+            "thermal_radiation/implicit_preconditioner=block-coarse",
+            "thermal_radiation/source_cfl=0",
+            "thermal_radiation/flux_limiter=none",
+            "thermal_radiation/c_light=1.0",
+        ])
+        stiff_timesteps, stiff_stdout = run_case_with_output(
+            stiff_input, stiff_flags, timeout=120.0)
+        assert stiff_timesteps[0] == pytest.approx(stiff_step)
+        reports = re.findall(
+            r"# implicit thermal radiation:.*?max_residual_replacements=(\d+)"
+            r".*?max_componentwise_backward_error=([^\s]+)", stiff_stdout)
+        assert reports, stiff_stdout
+        assert max(int(replacements) for replacements, _ in reports) >= 1, stiff_stdout
+        assert all(math.isfinite(float(error)) for _, error in reports)
+
+        stiff_initial = read_tab(
+            f"tab/{stiff_basename}.hydro_3t.00000.tab")
+        stiff_final = read_tab(
+            f"tab/{stiff_basename}.hydro_3t.00001.tab")
+        stiff_stencil = (stiff_step*stiff_resolution**2
+                         / (3.0*stiff_opacity))
+        assert stiff_stencil > 1.0e3
+        for group in ("erad00", "erad01"):
+            reference = periodic_backward_euler(
+                stiff_initial[group], stiff_stencil)
+            assert stiff_final[group] == pytest.approx(
+                reference, rel=3.0e-7, abs=3.0e-11)
+            assert min(stiff_final[group]) >= 0.0
+            assert sum(stiff_final[group]) == pytest.approx(
+                sum(stiff_initial[group]), rel=3.0e-10, abs=3.0e-11)
 
         # A resolved optically thin gradient must retain harmonic FLD's
         # D~E/|grad(E)| coefficient.  Only roundoff-flat cells receive the grid-scale

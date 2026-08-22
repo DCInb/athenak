@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 
 #include "athena.hpp"
@@ -1068,6 +1069,8 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
       "thermal_radiation", "implicit_tolerance", default_implicit_tolerance);
   implicit_max_iterations_ = pin->GetOrAddInteger(
       "thermal_radiation", "implicit_max_iterations", 400);
+  implicit_residual_check_interval_ = pin->GetOrAddInteger(
+      "thermal_radiation", "implicit_residual_check_interval", 50);
   implicit_report_ = pin->GetOrAddBoolean(
       "thermal_radiation", "implicit_report", false);
   const std::string implicit_preconditioner = pin->GetOrAddString(
@@ -1086,11 +1089,11 @@ ThermalRadiation::ThermalRadiation(MeshBlockPack *ppack, ParameterInput *pin,
   if (!std::isfinite(implicit_tolerance_) ||
       implicit_tolerance_ < minimum_implicit_tolerance ||
       implicit_tolerance_ >= 1.0 ||
-      implicit_max_iterations_ <= 0) {
+      implicit_max_iterations_ <= 0 || implicit_residual_check_interval_ <= 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "Implicit radiation tolerance must be finite, at least "
               << minimum_implicit_tolerance << ", and less than one; iteration limit "
-              << "must be positive" << std::endl;
+              << "and residual-check interval must be positive" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (implicit_transport_ && ppack->pmesh->multilevel) {
@@ -1977,6 +1980,116 @@ Real ThermalRadiation::ImplicitGlobalDot(
 }
 
 //----------------------------------------------------------------------------------------
+//! Return max_i |b-Ax|_i/(|b_i|+(|A||x|)_i).  For the diffusion part, each
+//! face contributes |K_face*x_i|+|K_face*x_neighbor|.  Keeping these matrix
+//! terms separate is essential: using |K_face*(x_neighbor-x_i)| would cancel
+//! the very large opposing terms whose roundoff this backward error measures.
+//! The caller must first exchange `field`, so this uses exactly the same internal,
+//! periodic, and physical ghosts as ApplyImplicitOperator().
+
+Real ThermalRadiation::ImplicitComponentwiseBackwardError(
+    const DvceArray5D<Real> &field, const DvceArray5D<Real> &rhs,
+    const DvceArray5D<Real> &residual, const Real dt) const {
+  auto &indcs = pmy_pack_->pmesh->mb_indcs;
+  const int is = indcs.is, nx1 = indcs.nx1;
+  const int js = indcs.js, nx2 = indcs.nx2;
+  const int ks = indcs.ks, nx3 = indcs.nx3;
+  const int ie = indcs.ie, je = indcs.je, ke = indcs.ke;
+  const int nkji = nx3*nx2*nx1;
+  const int nji = nx2*nx1;
+  const int ncell = pmy_pack_->nmb_thispack*nkji;
+  const bool multi_d = pmy_pack_->pmesh->multi_d;
+  const bool three_d = pmy_pack_->pmesh->three_d;
+  auto size = pmy_pack_->pmb->mb_size;
+  auto mb_bcs = pmy_pack_->pmb->mb_bcs;
+  const int b0 = implicit_boundary_type_[0];
+  const int b1 = implicit_boundary_type_[1];
+  const int b2 = implicit_boundary_type_[2];
+  const int b3 = implicit_boundary_type_[3];
+  const int b4 = implicit_boundary_type_[4];
+  const int b5 = implicit_boundary_type_[5];
+  const Real vacuum_cap_coefficient = 0.5*chat_*flux_limit_coefficient_;
+  const Real invalid_error = std::numeric_limits<Real>::max();
+  auto coefficient = implicit_coefficient_;
+  auto f = field;
+  auto b = rhs;
+  auto r = residual;
+
+  Real maximum_error = 0.0;
+  Kokkos::parallel_reduce("thermal_rad_impl_backward_error",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+  KOKKOS_LAMBDA(const int idx, Real &local_maximum) {
+    const int m = idx/nkji;
+    const int local = idx-m*nkji;
+    const int k = local/nji+ks;
+    const int j = (local-(k-ks)*nji)/nx1+js;
+    const int i = local-(k-ks)*nji-(j-js)*nx1+is;
+    const Real center = f(m, 0, k, j, i);
+    const Real kc = coefficient(m, 0, k, j, i);
+    const Real dx1 = size.d_view(m).dx1;
+    const bool vacuum_p1 = i == ie && b1 == 2 && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::outer_x1));
+    const bool vacuum_m1 = i == is && b0 == 2 && IsPhysicalBoundary(
+        mb_bcs.d_view(m, BoundaryFace::inner_x1));
+    const Real kp1 = ImplicitFrozenFaceCoefficient(
+        kc, coefficient(m, 0, k, j, i+1), vacuum_p1,
+        vacuum_cap_coefficient*dx1);
+    const Real km1 = ImplicitFrozenFaceCoefficient(
+        kc, coefficient(m, 0, k, j, i-1), vacuum_m1,
+        vacuum_cap_coefficient*dx1);
+    Real face_sum = (fabs(kp1*center)+fabs(kp1*f(m, 0, k, j, i+1))+
+                     fabs(km1*center)+fabs(km1*f(m, 0, k, j, i-1)))/(dx1*dx1);
+    if (multi_d) {
+      const Real dx2 = size.d_view(m).dx2;
+      const bool vacuum_p2 = j == je && b3 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x2));
+      const bool vacuum_m2 = j == js && b2 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x2));
+      const Real kp2 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j+1, i), vacuum_p2,
+          vacuum_cap_coefficient*dx2);
+      const Real km2 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k, j-1, i), vacuum_m2,
+          vacuum_cap_coefficient*dx2);
+      face_sum += (fabs(kp2*center)+fabs(kp2*f(m, 0, k, j+1, i))+
+                   fabs(km2*center)+fabs(km2*f(m, 0, k, j-1, i)))/(dx2*dx2);
+    }
+    if (three_d) {
+      const Real dx3 = size.d_view(m).dx3;
+      const bool vacuum_p3 = k == ke && b5 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::outer_x3));
+      const bool vacuum_m3 = k == ks && b4 == 2 && IsPhysicalBoundary(
+          mb_bcs.d_view(m, BoundaryFace::inner_x3));
+      const Real kp3 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k+1, j, i), vacuum_p3,
+          vacuum_cap_coefficient*dx3);
+      const Real km3 = ImplicitFrozenFaceCoefficient(
+          kc, coefficient(m, 0, k-1, j, i), vacuum_m3,
+          vacuum_cap_coefficient*dx3);
+      face_sum += (fabs(kp3*center)+fabs(kp3*f(m, 0, k+1, j, i))+
+                   fabs(km3*center)+fabs(km3*f(m, 0, k-1, j, i)))/(dx3*dx3);
+    }
+    const Real numerator = fabs(r(m, 0, k, j, i));
+    const Real denominator = fabs(b(m, 0, k, j, i))+fabs(center)+dt*face_sum;
+    Real error = 0.0;
+    if (!Kokkos::isfinite(numerator) || !Kokkos::isfinite(denominator) ||
+        denominator < 0.0) {
+      error = invalid_error;
+    } else if (denominator > 0.0) {
+      error = numerator/denominator;
+    } else if (numerator > 0.0) {
+      error = invalid_error;
+    }
+    local_maximum = fmax(local_maximum, error);
+  }, Kokkos::Max<Real>(maximum_error));
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &maximum_error, 1, MPI_ATHENA_REAL,
+                MPI_MAX, MPI_COMM_WORLD);
+#endif
+  return maximum_error;
+}
+
+//----------------------------------------------------------------------------------------
 //! Assemble and factor E=Z^T A Z for piecewise-constant MeshBlock basis functions.
 //! Internal faces cancel exactly.  Consequently the coarse matrix needs only the mass
 //! term, inter-MeshBlock face conductances, and homogeneous physical-boundary terms.
@@ -2576,6 +2689,31 @@ void ThermalRadiation::ApplyImplicitPreconditioner(
   });
   ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
 
+  // A second fine-grid sweep damps the strongly heterogeneous cell-scale modes that
+  // remain after one red/black pass in very stiff multigroup systems.  Its matching
+  // transpose sweep below keeps the V-cycle linear and symmetric for ordinary PCG.
+  for (int color = 0; color <= 1; ++color) {
+    par_for("thermal_rad_impl_vcycle_fine_forward_polish", DevExeSpace(), 0, nmb1,
+            ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const int parity = (i-is)+(j-js)+(k-ks)+block_parity(gid0+m, 0);
+      if (parity%2 == color) {
+        const Real neighbor_sum = ImplicitFineGlobalNeighborSum(
+            coefficient, preconditioned, remote_faces, neighbor_gid, neighbor_rank,
+            m, gid0+m, gid0, my_rank, k, j, i, is, ie, js, je, ks, ke,
+            fine_nx1, fine_nx2, dt, size.d_view(m).dx1,
+            multi_d ? size.d_view(m).dx2 : 1.0,
+            three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+        const Real x = preconditioned(m, 0, k, j, i);
+        const Real fine_residual = residual(m, 0, k, j, i)-
+            (diagonal(m, 0, k, j, i)*x-neighbor_sum);
+        preconditioned(m, 0, k, j, i) =
+            x+fine_residual/diagonal(m, 0, k, j, i);
+      }
+    });
+    ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
+  }
+
   par_for("thermal_rad_impl_vcycle_restrict_fine", DevExeSpace(), 0, nmb1,
           0, level1_nx3-1, 0, level1_nx2-1, 0, level1_nx1-1,
   KOKKOS_LAMBDA(int m, int ck, int cj, int ci) {
@@ -2844,26 +2982,30 @@ void ThermalRadiation::ApplyImplicitPreconditioner(
   // fine transpose sweep, then exchange the newly prolonged correction.
   build_fine_diagonal();
   ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
-  for (int color = 1; color >= 0; --color) {
-    par_for("thermal_rad_impl_vcycle_fine_backward", DevExeSpace(), 0, nmb1,
-            ks, ke, js, je, is, ie,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      const int parity = (i-is)+(j-js)+(k-ks)+block_parity(gid0+m, 0);
-      if (parity%2 == color) {
-        const Real neighbor_sum = ImplicitFineGlobalNeighborSum(
-            coefficient, preconditioned, remote_faces, neighbor_gid, neighbor_rank,
-            m, gid0+m, gid0, my_rank, k, j, i, is, ie, js, je, ks, ke,
-            fine_nx1, fine_nx2, dt, size.d_view(m).dx1,
-            multi_d ? size.d_view(m).dx2 : 1.0,
-            three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
-        const Real x = preconditioned(m, 0, k, j, i);
-        const Real fine_residual = residual(m, 0, k, j, i)-
-            (diagonal(m, 0, k, j, i)*x-neighbor_sum);
-        preconditioned(m, 0, k, j, i) =
-            x+fine_residual/diagonal(m, 0, k, j, i);
+  for (int sweep = 0; sweep < 2; ++sweep) {
+    for (int color = 1; color >= 0; --color) {
+      par_for("thermal_rad_impl_vcycle_fine_backward", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        const int parity = (i-is)+(j-js)+(k-ks)+block_parity(gid0+m, 0);
+        if (parity%2 == color) {
+          const Real neighbor_sum = ImplicitFineGlobalNeighborSum(
+              coefficient, preconditioned, remote_faces, neighbor_gid, neighbor_rank,
+              m, gid0+m, gid0, my_rank, k, j, i, is, ie, js, je, ks, ke,
+              fine_nx1, fine_nx2, dt, size.d_view(m).dx1,
+              multi_d ? size.d_view(m).dx2 : 1.0,
+              three_d ? size.d_view(m).dx3 : 1.0, multi_d, three_d);
+          const Real x = preconditioned(m, 0, k, j, i);
+          const Real fine_residual = residual(m, 0, k, j, i)-
+              (diagonal(m, 0, k, j, i)*x-neighbor_sum);
+          preconditioned(m, 0, k, j, i) =
+              x+fine_residual/diagonal(m, 0, k, j, i);
+        }
+      });
+      if (sweep != 1 || color != 0) {
+        ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
       }
-    });
-    if (color == 1) ExchangeImplicitMultilevelFaces(output_preconditioned, 0);
+    }
   }
 }
 
@@ -2931,6 +3073,8 @@ void ThermalRadiation::SolveImplicitTransport(
 
   implicit_iterations_last_solve = 0;
   implicit_residual_last_solve = 0.0;
+  implicit_residual_replacements_last_solve = 0;
+  implicit_backward_error_last_solve = 0.0;
   implicit_boundary_power = 0.0;
   for (int g = 0; g < ngroups; ++g) {
     const int group_index = ifirst+g;
@@ -3070,81 +3214,143 @@ void ThermalRadiation::SolveImplicitTransport(
         std::numeric_limits<Real>::min()*static_cast<Real>(ncell));
     Real rz = ImplicitGlobalDot(implicit_residual_, implicit_preconditioned_);
     int iterations = 0;
-    while (residual_norm > tolerance_squared*scale &&
-           iterations < implicit_max_iterations_) {
-      ExchangeImplicitField(implicit_direction_, pbval, true);
-      ApplyImplicitOperator(implicit_direction_, implicit_operator_, dt);
-      const Real pap = ImplicitGlobalDot(implicit_direction_, implicit_operator_);
-      if (!(pap > 0.0) || !std::isfinite(pap) || !std::isfinite(rz)) {
-        ImplicitRadiationError("Implicit radiation operator is not positive definite");
+    int residual_replacements = 0;
+    Real recursive_relative_residual = sqrt(residual_norm/scale);
+    Real relative_residual = std::numeric_limits<Real>::infinity();
+    Real componentwise_backward_error = std::numeric_limits<Real>::infinity();
+    constexpr Real true_residual_factor = 16.0;
+    constexpr Real replacement_gap_fraction = 0.25;
+    bool converged = false;
+    bool recursive_claims_convergence = residual_norm <= tolerance_squared*scale;
+    bool check_residual = recursive_claims_convergence;
+    while (!converged) {
+      if (!check_residual) {
+        ExchangeImplicitField(implicit_direction_, pbval, true);
+        ApplyImplicitOperator(implicit_direction_, implicit_operator_, dt);
+        const Real pap = ImplicitGlobalDot(implicit_direction_, implicit_operator_);
+        if (!(pap > 0.0) || !std::isfinite(pap) || !std::isfinite(rz)) {
+          ImplicitRadiationError("Implicit radiation operator is not positive definite");
+        }
+        const Real step = rz/pap;
+        par_for("thermal_rad_impl_cg_update", DevExeSpace(), 0, nmb1,
+                ks, ke, js, je, is, ie,
+        KOKKOS_LAMBDA(int m, int k, int j, int i) {
+          solution(m, 0, k, j, i) += step*direction(m, 0, k, j, i);
+          residual(m, 0, k, j, i) -= step*applied(m, 0, k, j, i);
+        });
+        residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
+        ++iterations;
+        recursive_relative_residual = sqrt(residual_norm/scale);
+        recursive_claims_convergence =
+            residual_norm <= tolerance_squared*scale;
+        check_residual = recursive_claims_convergence ||
+            iterations%implicit_residual_check_interval_ == 0 ||
+            iterations == implicit_max_iterations_;
+
+        if (!check_residual) {
+          ApplyImplicitPreconditioner(
+              implicit_residual_, implicit_preconditioned_, dt);
+          const Real rz_new = ImplicitGlobalDot(
+              implicit_residual_, implicit_preconditioned_);
+          const Real beta = rz_new/rz;
+          par_for("thermal_rad_impl_direction", DevExeSpace(), 0, nmb1,
+                  ks, ke, js, je, is, ie,
+          KOKKOS_LAMBDA(int m, int k, int j, int i) {
+            direction(m, 0, k, j, i) = preconditioned(m, 0, k, j, i)+
+                beta*direction(m, 0, k, j, i);
+          });
+          rz = rz_new;
+          continue;
+        }
       }
-      const Real step = rz/pap;
-      par_for("thermal_rad_impl_cg_update", DevExeSpace(), 0, nmb1,
+
+      // Reliable update: validate the recursively updated residual against b-Ax using
+      // the actual solution ghosts.  If neither convergence measure passes, continue
+      // PCG from this true residual without resetting the global iteration count.
+      ExchangeImplicitField(implicit_solution_, pbval, false);
+      ApplyImplicitOperator(implicit_solution_, implicit_operator_, dt);
+      par_for("thermal_rad_impl_true_residual", DevExeSpace(), 0, nmb1,
               ks, ke, js, je, is, ie,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
-        solution(m, 0, k, j, i) += step*direction(m, 0, k, j, i);
-        residual(m, 0, k, j, i) -= step*applied(m, 0, k, j, i);
+        applied(m, 0, k, j, i) =
+            old(m, 0, k, j, i)-applied(m, 0, k, j, i);
       });
-      residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
-      ++iterations;
-      if (residual_norm <= tolerance_squared*scale) break;
+      const Real true_residual_norm = ImplicitGlobalDot(
+          implicit_operator_, implicit_operator_);
+      relative_residual = sqrt(true_residual_norm/scale);
+      componentwise_backward_error = ImplicitComponentwiseBackwardError(
+          implicit_solution_, implicit_old_, implicit_operator_, dt);
+      converged = std::isfinite(relative_residual) &&
+          (relative_residual <= true_residual_factor*implicit_tolerance_ ||
+           componentwise_backward_error <= implicit_tolerance_);
+      if (converged || iterations >= implicit_max_iterations_) break;
 
+      // Replace the recursive residual after every failed check.  A small replacement
+      // gap is just the finite-precision correction to the ordinary PCG recurrence, so
+      // retain its search direction in that case.  Restart from the preconditioned true
+      // residual only after material drift, or when the recurrence falsely claimed
+      // convergence.  Unconditionally discarding a healthy Krylov basis at every fixed
+      // interval can prevent a stiff system from making enough conjugate-gradient steps.
+      par_for("thermal_rad_impl_residual_gap", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        preconditioned(m, 0, k, j, i) =
+            residual(m, 0, k, j, i)-applied(m, 0, k, j, i);
+      });
+      const Real residual_gap_norm = ImplicitGlobalDot(
+          implicit_preconditioned_, implicit_preconditioned_);
+      const Real residual_reference_norm = fmax(
+          residual_norm, true_residual_norm);
+      const bool restart_direction = recursive_claims_convergence ||
+          residual_gap_norm > replacement_gap_fraction*replacement_gap_fraction*
+              residual_reference_norm;
+      ++residual_replacements;
+      par_for("thermal_rad_impl_replace_residual", DevExeSpace(), 0, nmb1,
+              ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        residual(m, 0, k, j, i) = applied(m, 0, k, j, i);
+      });
+      residual_norm = true_residual_norm;
       ApplyImplicitPreconditioner(
           implicit_residual_, implicit_preconditioned_, dt);
       const Real rz_new = ImplicitGlobalDot(
           implicit_residual_, implicit_preconditioned_);
-      const Real beta = rz_new/rz;
-      par_for("thermal_rad_impl_direction", DevExeSpace(), 0, nmb1,
-              ks, ke, js, je, is, ie,
-      KOKKOS_LAMBDA(int m, int k, int j, int i) {
-        direction(m, 0, k, j, i) = preconditioned(m, 0, k, j, i)+
-            beta*direction(m, 0, k, j, i);
-      });
+      if (restart_direction) {
+        par_for("thermal_rad_impl_replacement_direction", DevExeSpace(), 0, nmb1,
+                ks, ke, js, je, is, ie,
+        KOKKOS_LAMBDA(int m, int k, int j, int i) {
+          direction(m, 0, k, j, i) = preconditioned(m, 0, k, j, i);
+        });
+      } else {
+        const Real beta = rz_new/rz;
+        par_for("thermal_rad_impl_checked_direction", DevExeSpace(), 0, nmb1,
+                ks, ke, js, je, is, ie,
+        KOKKOS_LAMBDA(int m, int k, int j, int i) {
+          direction(m, 0, k, j, i) = preconditioned(m, 0, k, j, i)+
+              beta*direction(m, 0, k, j, i);
+        });
+      }
       rz = rz_new;
+      recursive_relative_residual = relative_residual;
+      recursive_claims_convergence = false;
+      check_residual = false;
     }
-    const Real recursive_relative_residual = sqrt(residual_norm/scale);
-    if (residual_norm > tolerance_squared*scale ||
-        !std::isfinite(recursive_relative_residual)) {
-      ImplicitRadiationError("Implicit radiation solve failed to converge for group "+
-          std::to_string(g)+" after "+std::to_string(iterations)+
-          " iterations (relative residual="+
-          std::to_string(recursive_relative_residual)+")");
+    if (!converged) {
+      std::ostringstream message;
+      message << std::scientific << std::setprecision(17)
+              << "Implicit radiation solve failed to converge: group=" << g
+              << " iterations=" << iterations
+              << " replacements=" << residual_replacements
+              << " recursive_residual=" << recursive_relative_residual
+              << " true_residual=" << relative_residual
+              << " backward_error=" << componentwise_backward_error
+              << " tolerance=" << implicit_tolerance_;
+      ImplicitRadiationError(message.str());
     }
     implicit_iterations_last_solve =
         std::max(implicit_iterations_last_solve, iterations);
-
-    // Recursive CG residuals can drift from b-Ax.  Validate the actual matrix residual
-    // before any positivity repair, using the same exchanged ghosts and boundary
-    // operator as the solve itself.
-    ExchangeImplicitField(implicit_solution_, pbval, false);
-    ApplyImplicitOperator(implicit_solution_, implicit_operator_, dt);
-    par_for("thermal_rad_impl_true_residual", DevExeSpace(), 0, nmb1,
-            ks, ke, js, je, is, ie,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      residual(m, 0, k, j, i) =
-          old(m, 0, k, j, i)-applied(m, 0, k, j, i);
-    });
-    residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
-    Real relative_residual = sqrt(residual_norm/scale);
-    // Roundoff in the three-term CG recurrence can make its recursively updated
-    // residual slightly more optimistic than a fresh matrix application.  Bound that
-    // drift tightly while avoiding a redundant Krylov restart for an already converged
-    // solve.
-    constexpr Real true_residual_factor = 16.0;
-    if (!std::isfinite(relative_residual) ||
-        relative_residual > true_residual_factor*implicit_tolerance_) {
-      if (global_variable::my_rank == 0) {
-        std::cerr << std::scientific << std::setprecision(17)
-                  << "# implicit radiation true-residual diagnostic: group=" << g
-                  << " recursive=" << recursive_relative_residual
-                  << " true=" << relative_residual
-                  << " tolerance=" << implicit_tolerance_ << std::endl;
-      }
-      ImplicitRadiationError(
-          "Implicit radiation true residual exceeds tolerance for group "+
-          std::to_string(g)+" (relative residual="+
-          std::to_string(relative_residual)+")");
-    }
+    implicit_residual_replacements_last_solve = std::max(
+        implicit_residual_replacements_last_solve, residual_replacements);
 
     int negative_solution_cells = 0;
     int nonfinite_solution_cells = 0;
@@ -3229,26 +3435,19 @@ void ThermalRadiation::SolveImplicitTransport(
     }
     if (negative_solution_cells != 0) {
       // The exact backward-Euler diffusion matrix is an M-matrix, so a finite negative
-      // value can only be iterative roundoff.  Repair only tolerance-scale undershoots,
-      // and preserve the volume-integrated group energy by rescaling positive cells.
-      constexpr Real positivity_tolerance_factor = 64.0;
-      const Real amplitude_scale = fmax(maximum_rhs, floor);
-      const Real undershoot_limit = positivity_tolerance_factor*
-          implicit_tolerance_*amplitude_scale;
-      const Real energy_limit = positivity_tolerance_factor*
-          implicit_tolerance_*positive_solution_energy;
-      if (-minimum_solution > undershoot_limit ||
-          negative_solution_energy > energy_limit ||
-          !(positive_solution_energy > negative_solution_energy)) {
+      // value can only be iterative error.  Preserve the volume-integrated group energy
+      // while projecting onto the nonnegative cone.  A separate amplitude cutoff is
+      // unreliable for nearly extinguished groups: roundoff may be concentrated in one
+      // cell or spread across many.  The authoritative guard is the full-stencil true
+      // residual and componentwise backward error recomputed after projection below.
+      if (!(positive_solution_energy > negative_solution_energy)) {
         if (global_variable::my_rank == 0) {
           std::cerr << std::scientific << std::setprecision(17)
                     << "# implicit radiation positivity diagnostic: group=" << g
                     << " minimum=" << minimum_solution
                     << " maximum_rhs=" << maximum_rhs
                     << " negative_energy=" << negative_solution_energy
-                    << " positive_energy=" << positive_solution_energy
-                    << " undershoot_limit=" << undershoot_limit
-                    << " energy_limit=" << energy_limit << std::endl;
+                    << " positive_energy=" << positive_solution_energy << std::endl;
         }
         ImplicitRadiationError(
             "Implicit radiation negativity exceeds the solver tolerance in group "+
@@ -3277,16 +3476,28 @@ void ThermalRadiation::SolveImplicitTransport(
       });
       residual_norm = ImplicitGlobalDot(implicit_residual_, implicit_residual_);
       relative_residual = sqrt(residual_norm/scale);
+      componentwise_backward_error = ImplicitComponentwiseBackwardError(
+          implicit_solution_, implicit_old_, implicit_residual_, dt);
       constexpr Real projection_residual_factor = 16.0;
       if (!std::isfinite(relative_residual) ||
-          relative_residual > projection_residual_factor*implicit_tolerance_) {
-        ImplicitRadiationError(
-            "Implicit radiation positivity projection violates the residual tolerance "
-            "in group "+std::to_string(g));
+          (relative_residual > projection_residual_factor*implicit_tolerance_ &&
+           componentwise_backward_error > implicit_tolerance_)) {
+        std::ostringstream message;
+        message << std::scientific << std::setprecision(17)
+                << "Implicit radiation positivity projection failed convergence: group="
+                << g << " iterations=" << iterations
+                << " replacements=" << residual_replacements
+                << " recursive_residual=" << recursive_relative_residual
+                << " true_residual=" << relative_residual
+                << " backward_error=" << componentwise_backward_error
+                << " tolerance=" << implicit_tolerance_;
+        ImplicitRadiationError(message.str());
       }
     }
     implicit_residual_last_solve =
         std::max(implicit_residual_last_solve, relative_residual);
+    implicit_backward_error_last_solve = std::max(
+        implicit_backward_error_last_solve, componentwise_backward_error);
 
     // Refresh the converged ghosts once, both for the next conserved-state boundary
     // fill and for a conservative boundary-loss diagnostic.  This is a rank-local
@@ -3373,7 +3584,11 @@ void ThermalRadiation::SolveImplicitTransport(
   if (implicit_report_ && global_variable::my_rank == 0) {
     std::cout << "# implicit thermal radiation: groups=" << ngroups
               << " max_iterations=" << implicit_iterations_last_solve
+              << " max_residual_replacements="
+              << implicit_residual_replacements_last_solve
               << " max_relative_residual=" << implicit_residual_last_solve
+              << " max_componentwise_backward_error="
+              << implicit_backward_error_last_solve
               << std::endl;
   }
 }
