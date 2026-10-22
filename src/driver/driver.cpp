@@ -11,6 +11,7 @@
 #include <iomanip>    // std::setprecision()
 #include <limits>
 #include <algorithm>
+#include <sstream>
 #include <string> // string
 
 #include "athena.hpp"
@@ -19,8 +20,12 @@
 #include "mesh/mesh.hpp"
 #include "outputs/outputs.hpp"
 #include "hydro/hydro.hpp"
+#include "diffusion/conduction.hpp"
 #include "mhd/mhd.hpp"
+#include "fast_electrons/fast_electrons.hpp"
+#include "nuclear/dt_fusion.hpp"
 #include "two_temperature/two_temperature.hpp"
+#include "two_temperature/thermal_radiation.hpp"
 #include "z4c/z4c.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "ion-neutral/ion-neutral.hpp"
@@ -32,6 +37,23 @@
 #endif
 
 namespace {
+
+bool HasImplicitThermalRadiation(const Mesh *pm) {
+  auto *phydro = pm->pmb_pack->phydro;
+  auto *pmhd = pm->pmb_pack->pmhd;
+  auto *ptwo = phydro != nullptr ? phydro->ptwo_temp :
+      (pmhd != nullptr ? pmhd->ptwo_temp : nullptr);
+  return ptwo != nullptr && ptwo->pradiation != nullptr &&
+      ptwo->pradiation->IsImplicit();
+}
+
+bool HasImplicitConduction(const Mesh *pm) {
+  auto *phydro = pm->pmb_pack->phydro;
+  auto *pmhd = pm->pmb_pack->pmhd;
+  auto *pcond = phydro != nullptr ? phydro->pcond :
+      (pmhd != nullptr ? pmhd->pcond : nullptr);
+  return pcond != nullptr && pcond->IsImplicit();
+}
 
 Real OutputTimeTolerance(const Real time, const Real interval) {
   const Real spacing = std::nextafter(
@@ -517,18 +539,41 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
 
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
+  if (pmesh->pmb_pack->pfast_electrons != nullptr) {
+    pmesh->pmb_pack->pfast_electrons->DepositMoments();
+    if (pmesh->pmb_pack->pfast_electrons->Electromagnetic()) {
+      pmesh->pmb_pack->pfast_electrons->BuildFields();
+    }
+  }
 
   //---- Step 2.  Compute time step (if problem involves time evolution)
+  if (pmesh->pmb_pack->pdt_fusion != nullptr) {
+    pmesh->pmb_pack->pdt_fusion->DepositMoments();
+    (void)pmesh->pmb_pack->pdt_fusion->SourceTimeStep();
+  }
   hydro::Hydro *phydro = pmesh->pmb_pack->phydro;
   mhd::MHD *pmhd = pmesh->pmb_pack->pmhd;
   radiation::Radiation *prad = pmesh->pmb_pack->prad;
   z4c::Z4c *pz4c = pmesh->pmb_pack->pz4c;
   if (time_evolution != TimeEvolution::tstatic) {
-    // A restart may have been written after a deliberately tiny terminal-alignment
-    // step. Recompute its first physical timestep from the restored state instead of
-    // applying the normal 2x growth limiter to that event remainder.
+    // Restore the previous unconstrained step for the normal 2x growth limiter.
+    // Using the saved mesh dt would instead grow an output-alignment remainder.
+    // Terminal checkpoints also discard the growth base: Mesh::NewTimeStep clips it
+    // to the old tlim, and extending the run must recover the physical step. Older
+    // checkpoints did not store that history, so retain their uncapped fallback.
     if (res_flag && align_outputs) {
       pmesh->dt = std::numeric_limits<float>::max();
+      if (pin->DoesParameterExist("time", "restart_growth_dt") &&
+          pin->DoesParameterExist("time", "restart_growth_cycle") &&
+          pin->GetInteger("time", "restart_growth_cycle") == pmesh->ncycle) {
+        const Real growth_dt = pin->GetReal("time", "restart_growth_dt");
+        const bool terminal =
+            pin->DoesParameterExist("time", "restart_growth_terminal") &&
+            pin->GetBoolean("time", "restart_growth_terminal");
+        if (!terminal && std::isfinite(growth_dt) && growth_dt > 0.0) {
+          pmesh->dt = growth_dt;
+        }
+      }
     }
     if (phydro != nullptr) {
       (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
@@ -607,6 +652,14 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (wall_time < 0. || elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
+      // Symmetric nuclear source/transport split around the existing macro operator.
+      // Its local source subcycles update active cells then rebuild the shared halos.
+      if (pmesh->pmb_pack->pdt_fusion != nullptr) {
+        pmesh->pmb_pack->pdt_fusion->DepositMoments();
+        pmesh->dt = std::min(pmesh->dt, pmesh->pmb_pack->pdt_fusion->SourceTimeStep());
+        pmesh->pmb_pack->pdt_fusion->Advance(0.5*pmesh->dt, this);
+      }
+
       // Execute TaskLists
       // Work before time integrator indicated by "0" in stage
       ExecuteTaskList(pmesh, "before_timeintegrator", 0);
@@ -657,11 +710,52 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         pmesh->time = macro_start_time;
       }
 
+      // Particle trajectories span the complete physical timestep; advancing them at
+      // every RK stage would inject and transport the same population multiple times.
+      if (pmesh->pmb_pack->pfast_electrons != nullptr) {
+        pmesh->pmb_pack->pfast_electrons->Advance(macro_start_time, pmesh->dt, this);
+        // Deposition changes both total and electron energy after the fluid source
+        // tasks. Refresh ghosts, thermodynamics, and the next fluid CFL limit using
+        // the endpoint time for any non-autonomous user boundary conditions.
+        pmesh->time = macro_start_time + pmesh->dt;
+        InitBoundaryValuesAndPrimitives(pmesh);
+        if (pmesh->pmb_pack->phydro != nullptr) {
+          (void)pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
+        }
+        if (pmhd != nullptr) {
+          (void)pmhd->NewTimeStep(this, nexp_stages);
+        }
+        pmesh->time = macro_start_time;
+      }
+
+      if (pmesh->pmb_pack->pdt_fusion != nullptr) {
+        pmesh->time = macro_start_time+pmesh->dt;
+        pmesh->pmb_pack->pdt_fusion->Advance(0.5*pmesh->dt, this);
+        if (pmesh->pmb_pack->phydro != nullptr) {
+          (void)pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
+        }
+        if (pmhd != nullptr) (void)pmhd->NewTimeStep(this, nexp_stages);
+        pmesh->time = macro_start_time;
+      }
+
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
+      if (align_outputs && std::isfinite(physics_dt_) && physics_dt_ > 0.0) {
+        // Snapshot the completed cycle's growth base before scheduled checkpoints.
+        // Finalize reuses these parameters after physics_dt_ advances to the next
+        // step; saving that upcoming value would apply the growth limiter twice.
+        // SetReal serializes with default stream precision; retain every Real bit
+        // so a restart does not perturb the timestep sequence.
+        std::ostringstream growth_dt;
+        growth_dt << std::setprecision(std::numeric_limits<Real>::max_digits10)
+                  << physics_dt_;
+        pin->SetString("time", "restart_growth_dt", growth_dt.str());
+        pin->SetInteger("time", "restart_growth_cycle", pmesh->ncycle);
+        pin->SetBoolean("time", "restart_growth_terminal", pmesh->time >= tlim);
+      }
       nmb_updated_ += pmesh->nmb_total;
       npart_updated_ += pmesh->nprtcl_total;
       // load balancing efficiency
@@ -700,12 +794,14 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // boundary.  Otherwise the uninterrupted run refines immediately after writing
       // the file while the resumed run advances once on the stale topology.  Keep all
       // other output ordering unchanged, including the legacy path.
-      const bool defer_adaptive_biermann_restart =
-          pmesh->adaptive && pmhd != nullptr && pmhd->BiermannSubcycleActive();
+      const bool defer_adaptive_restart = pmesh->adaptive &&
+          (biermann_active || HasImplicitThermalRadiation(pmesh) ||
+           HasImplicitConduction(pmesh) ||
+           pmesh->pmb_pack->pfast_electrons != nullptr);
 
       // Test for/make outputs
       for (auto &out : pout->pout_list) {
-        if (defer_adaptive_biermann_restart &&
+        if (defer_adaptive_restart &&
             out->out_params.file_type == "rst") continue;
         if (output_due(out)) {
           out->LoadOutputData(pmesh);
@@ -715,7 +811,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // AMR
       if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
-      if (defer_adaptive_biermann_restart) {
+      if (defer_adaptive_restart) {
         for (auto &out : pout->pout_list) {
           if (out->out_params.file_type == "rst" && output_due(out)) {
             out->LoadOutputData(pmesh);

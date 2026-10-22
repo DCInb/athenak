@@ -58,7 +58,7 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-PRODUCTION_INPUT = CASE_DIR / "dci_3d.athinput"
+PRODUCTION_INPUT = CASE_DIR / "dci_3d_v100_legacy.athinput"
 MATERIAL_TABLE_DIR = CASE_DIR / "material_tables"
 ENV_SCRIPT = Path("/home/mengqi/Research/bashrc_athenaK")
 DEFAULT_WORK_DIR = CASE_DIR / "convergence_gate_runs"

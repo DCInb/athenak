@@ -1,9 +1,12 @@
-# DCI_3D production deck: tabulated CH/Au/He 3T MHD, 20-group AP-FLD, and the archived
-# FLASH 3d_zb drive: four collimated uniform 3-omega beams sharing the 13-section
-# picket pulse (7.0982 kJ total).  DCI_3D/run_case.py keeps production locked until the
-# evidence manifest described in README.md verifies compact/restart/convergence and
-# seven-GPU memory gates.
-
+# DCI_3D AMR cell-AMG on 16 A100 40-GiB GPUs, up to four radiation groups at a time.
+# 84^3 base: CH reaches 672^3-equivalent (1.786 um), Au 336^3-equivalent (3.571 um).
+# 12^3 blocks; one initial level-2 seed region is retained below.
+# Refine above 1 g/cc; an extra level follows the advected dense CH material.
+# AMR capacity is 1024 blocks/rank (16384 on 16 ranks); later growth can hit this limit.
+# Hierarchy budget is 3520 MiB/group; memory checks include all four lanes and GMRES.
+# Full 20-group physics, light speed and 1e-10 tolerance; original output cadence.
+# Evolve to 8 ns without a cycle limit; the laser pulse retains its original duration.
+# Material-AMR checks and capacity estimate: performance/amr-ch16-20261010/.
 <job>
 basename = dci_3d
 
@@ -18,64 +21,77 @@ mu = 1.4444444444444444
 #   z [-0.045, 0.075] cm -> x1 [-0.45, 0.75] mm
 #   x [-0.06, 0.06] cm  -> x2 [-0.6, 0.6] mm
 #   y [-0.06, 0.06] cm  -> x3 [-0.6, 0.6] mm
-# Cubic 3.81 um cells put about 8 cells across both the 30 um CH shell and the 31 um
-# Au cone wall.  Measured at 61.4 percent of every one of the seven available V100s.
+# Cell AMG follows the actual coefficient graph without fixed geometric aggregates.
 <mesh>
-nghost = 2
-nx1 = 315
+nghost = 4  # PPM needs >=3 ghost cells; SMR/AMR requires an even count.
+nx1 = 84
 x1min = -0.45
 x1max = 0.75
 ix1_bc = outflow
 ox1_bc = outflow
 
-nx2 = 315
+nx2 = 84
 x2min = -0.6
 x2max = 0.6
 ix2_bc = outflow
 ox2_bc = outflow
 
-nx3 = 315
+nx3 = 84
 x3min = -0.6
 x3max = 0.6
 ix3_bc = outflow
 ox3_bc = outflow
 
-# Keep each rank's 49 MeshBlocks in complete x1-directed tubes, so no rank boundary cuts
-# a ray's path along the drive axis.  One x3 slab per rank measured fastest over 60
-# cycles on the seven available V100s: 110.2 s versus 120.2 s for plain z_order, despite
-# about twice the cross-rank ray transfers.  A radially interleaved map balances the
-# near-axis work more evenly on paper but was the slowest of the three (3.7x the
-# transfers, 9 waves), so tube locality dominates column-level load balance here.
-meshblock_order = x1_rank_map
-meshblock_rank_map_x3_0 = 0,0,0,0,0,0,0
-meshblock_rank_map_x3_1 = 1,1,1,1,1,1,1
-meshblock_rank_map_x3_2 = 2,2,2,2,2,2,2
-meshblock_rank_map_x3_3 = 3,3,3,3,3,3,3
-meshblock_rank_map_x3_4 = 4,4,4,4,4,4,4
-meshblock_rank_map_x3_5 = 5,5,5,5,5,5,5
-meshblock_rank_map_x3_6 = 6,6,6,6,6,6,6
+meshblock_order = z_order
 
-# 7x7x7 = 343 blocks, exactly 49 per rank on the seven available GPUs.
 <meshblock>
-nx1 = 45
-nx2 = 45
-nx3 = 45
+nx1 = 12
+nx2 = 12
+nx3 = 12
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 4  # Total levels, including the root: physical levels 0, 1, 2, 3.
+max_nmb_per_rank = 1024
+communication_buffers = dynamic  # Reserve only actual AMR migration payloads.
+ncycle_check = 1
+refinement_interval = 2
+
+# Initial seed region. Density-driven AMR can refine or coarsen the mesh after startup.
+
+<refined_region1>
+level = 2
+x1min = -0.0214285704286
+x1max = 0.235714284714
+x2min = -0.171428570429
+x2max = -0.0857142867143
+x3min = -0.0857142847143
+x3max = 0.0857142847143
+
+<amr_criterion0>
+# DCI material-aware criterion. One code density unit is 1.1 g/cm^3.
+# Total density selects dense_level; rho*Y_CH and rho*Y_Au select their own levels.
+method = user
+value_max = 0.9090909090909091  # Strictly above 1 g/cm^3.
+dense_level = 2
+ch_level = 3    # Four total levels, 1.786 um; follows the imploding CH shell.
+gold_level = 2  # Three total levels, 3.571 um; follows the gold cone.
 
 <time>
 evolution = dynamic
 integrator = rk2
 cfl_number = 0.25
 nlim = -1
-tlim = 5.0
-ndiag = 10
+tlim = 8.0
+ndiag = 1
 align_outputs = true
 initial_dt = 5.0e-5
 walltime_restart_only = true
 
 <hydro>
 eos = ideal
-reconstruct = plm
-rsolver = llf
+reconstruct = ppm4
+rsolver = hllc
 gamma = 1.6666666666666667
 dfloor = 1.0e-8
 pfloor = 1.0e-14
@@ -91,6 +107,22 @@ t_ei_model = spitzer
 t_ei_coulomb_log = 1.0e1
 t_ei_spitzer_multiplier = 1.0
 t_ei_temperature_floor_kelvin = 1.0
+
+# Electron-only SpitzerHighZ conduction, implicit on the composite AMR mesh.
+# Match the archived Larsen flux limiter; physical faces default to zero heat flux.
+alpha_spitzer = true
+conduction_integrator = implicit
+conduction_theta = 1.0
+conduction_coulomb_log = 10.0
+conduction_spitzer_multiplier = 1.0
+conduction_flux_limiter = larsen
+conduction_flux_limit_coefficient = 0.06
+conduction_linear_tolerance = 1.0e-10
+conduction_nonlinear_tolerance = 1.0e-8
+conduction_max_iterations = 2000
+conduction_max_nonlinear_iterations = 80  # Cold tabular mixtures need damped Newton steps.
+conduction_report = true
+
 biermann_battery = true
 biermann_coefficient = 2.7875722321043606e-4
 biermann_minimum_electron_fraction = 1.0e-12
@@ -124,16 +156,16 @@ material2_zeff = 2.0
 
 # The tables are generated locally from the audited archive.  The launcher stages
 # byte-identical copies in each run directory and overrides these repo-relative paths.
-material0_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch.2t_eos
-material1_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au.2t_eos
-material2_eos_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he.2t_eos
+material0_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/ch.2t_eos
+material1_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/au.2t_eos
+material2_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/he.2t_eos
 eos_mixing_rule = partial_density_additive
 eos_table_bounds = flash-extrapolate
 eos_table_interpolation = geometric
 
-material0_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/ch_20g.opacity
-material1_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/au_20g.opacity
-material2_opacity_table_file = /home/mengqi/Research/athenak-2t/DCI_3D/material_tables/he_20g.opacity
+material0_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/ch_20g.opacity
+material1_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/au_20g.opacity
+material2_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_3D/material_tables/he_20g.opacity
 material0_opacity_interpolation = geometric
 material1_opacity_interpolation = geometric
 material2_opacity_interpolation = geometric
@@ -171,10 +203,20 @@ flux_limiter = harmonic
 flux_limit_coefficient = 1.0
 transport_discretization = asymptotic-preserving
 transport_integrator = implicit
-implicit_preconditioner = block-coarse
+implicit_preconditioner = cell-amg
+implicit_amr_coarse_solver = auto
+implicit_group_batch_size = 4
+implicit_amr_amg_max_mib = 3520
+implicit_halo_exchange = packed
+implicit_halo_faces = true
+implicit_amr_order = 2
+implicit_amr_inner_iterations = 0
+solver_timers = false
+solver_summary = true
+implicit_gmres_orthogonalization = cgs2
 implicit_tolerance = 1.0e-10
 implicit_max_iterations = 2000
-implicit_report = false
+implicit_report = true
 implicit_x1_inner_boundary = vacuum
 implicit_x1_outer_boundary = vacuum
 implicit_x2_inner_boundary = vacuum
@@ -184,11 +226,11 @@ implicit_x3_outer_boundary = vacuum
 ap_streaming_threshold = 5.0e-1
 ap_optical_depth_threshold = 1.0
 # The local backward-Euler source solve couples temperature-dependent EOS, opacity,
-# and all radiation groups nonlinearly.  Retain an independent 10% source guard while
-# validating the new integration path in production.
+# and all radiation groups nonlinearly.  At this stage, do not impose an independent
+# matter-radiation source timestep constraint.
 source_integrator = nonlinear
 source_report = false
-source_cfl = 0.1
+source_cfl = 0.0
 couple_matter = true
 opacity_model = mixed-table
 group_bound_0 = 6.679753382762794e-5
@@ -212,6 +254,7 @@ group_bound_17 = 2.070723548656466e-1
 group_bound_18 = 2.337913683966978e-1
 group_bound_19 = 2.671901353105118e-1
 group_bound_20 = 6.679753382762794e-1
+implicit_gmres_restart = 30
 
 <laser>
 model = straight

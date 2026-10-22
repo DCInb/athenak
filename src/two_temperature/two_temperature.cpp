@@ -25,6 +25,33 @@
 
 namespace {
 
+// Mean-ion impact-parameter models documented in FLASH 4.8, section 18.5.
+// Evaluate in log space so cold/dilute states cannot overflow b_max/b_min.
+KOKKOS_INLINE_FUNCTION
+Real ExchangeCoulombLog(const Real ne, const Real ti, const Real te,
+                        const Real zbar, const int model, const Real floor) {
+  if (!(ne > 0.0) || !(te > 0.0) || !(zbar > 0.0)) return floor;
+  constexpr Real me = 9.1093837015e-28;
+  constexpr Real charge = 4.803204712570263e-10;
+  constexpr Real kb = 1.3806488e-16;
+  constexpr Real hbar = 1.054571817e-27;
+  constexpr Real pi = 3.141592653589793238462643383279502884;
+  const Real log_te = log(te);
+  Real log_bmax = 0.5*(log(kb/(4.0*pi*SQR(charge)))+log_te-log(ne));
+  if (model == 2) {
+    if (!(ti > 0.0)) return floor;
+    // Debye-Huckel screening includes ions: n_i Zbar^2 = n_e Zbar.
+    const Real r = log(zbar)+log_te-log(ti);
+    log_bmax -= 0.5*(fmax(r, 0.0)+log1p(exp(-fabs(r))));
+  }
+  const Real log_classical = log(zbar)+log(SQR(charge)/(3.0*kb))-log_te;
+  const Real log_quantum = log(hbar/(2.0*sqrt(3.0*kb*me)))-0.5*log_te;
+  const Real r = log_bmax-fmax(log_classical, log_quantum);
+  const Real exponent = (model == 2) ? 2.0*r : r;
+  const Real value = fmax(exponent, 0.0)+log1p(exp(-fabs(exponent)));
+  return fmax((model == 2) ? 0.5*value : value, floor);
+}
+
 // Electron temperature-relaxation time from the classical Spitzer binary-collision
 // result.  The mixture identity n_i Z^2 = n_e Z_eff avoids inventing a single ion charge.
 KOKKOS_INLINE_FUNCTION
@@ -161,17 +188,35 @@ TwoTemperature::TwoTemperature(const std::string &block, MeshBlockPack *ppack,
     }
     spitzer_coulomb_log_ =
         pin->GetOrAddReal(block, "t_ei_coulomb_log", 10.0);
+    const std::string log_model =
+        pin->GetOrAddString(block, "t_ei_coulomb_log_model", "constant");
+    if (log_model == "constant") {
+      spitzer_coulomb_log_model_ = 0;
+    } else if (log_model == "spitzer") {
+      spitzer_coulomb_log_model_ = 1;
+    } else if (log_model == "lee_more") {
+      spitzer_coulomb_log_model_ = 2;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<" << block
+                << "> t_ei_coulomb_log_model must be constant, spitzer, or lee_more"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    spitzer_coulomb_log_floor_ = pin->GetOrAddReal(
+        block, "t_ei_coulomb_log_floor", spitzer_coulomb_log_model_ == 2 ? 2.0 : 1.0);
     spitzer_multiplier_ =
         pin->GetOrAddReal(block, "t_ei_spitzer_multiplier", 1.0);
     spitzer_temperature_floor_ =
         pin->GetOrAddReal(block, "t_ei_temperature_floor_kelvin", 1.0);
     if (!std::isfinite(spitzer_coulomb_log_) || spitzer_coulomb_log_ <= 0.0 ||
+        !std::isfinite(spitzer_coulomb_log_floor_) || spitzer_coulomb_log_floor_ <= 0.0 ||
         !std::isfinite(spitzer_multiplier_) || spitzer_multiplier_ <= 0.0 ||
         !std::isfinite(spitzer_temperature_floor_) ||
         spitzer_temperature_floor_ < 0.0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<" << block
-                << "> Spitzer Coulomb log and multiplier must be positive and the "
+                << "> Spitzer Coulomb log, log floor, and multiplier must be positive; "
                 << "temperature floor non-negative" << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -473,9 +518,11 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
     Real fi = cv_i_fraction_;
     Real fe = cv_e_fraction_;
     Real decay = 0.0;
+    Real relaxed = 1.0;
     if (t_ei_ > 0.0) {
       // FLASH: Delta T decays as exp[-(1 + cv_e/cv_i) dt/t_ei].
       decay = exp(-(1.0 + fe/fi)*dt/t_ei_);
+      relaxed = -expm1(-(1.0 + fe/fi)*dt/t_ei_);
     }
     auto temp = temperature;
 
@@ -486,15 +533,16 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
       Real eele = cons(m, iele_, k, j, i);
       Real eint = eion + eele;
 
-      Real tion = gm1*eion/(density*fi);
-      Real tele = gm1*eele/(density*fe);
-      Real teq = fi*tion + fe*tele;
-      Real delta_t = (tion - tele)*decay;
-      Real tion_new = teq + fe*delta_t;
-
-      Real eion_new = density*fi*tion_new/gm1;
-      eion_new = fmin(fmax(eion_new, 0.0), eint);
-      Real eele_new = eint - eion_new;
+      // Convex energy relaxation resolves a cold component even when its energy and
+      // the transferred heat are far below an ulp of the hotter component. Computing
+      // Te as the remainder of Ti discards that energy; 1-exp(-x) also loses weak heat.
+      Real eion_new = decay*eion+relaxed*fi*eint;
+      Real eele_new = decay*eele+relaxed*fe*eint;
+      if (eion_new > eele_new) {
+        eion_new = eint-eele_new;
+      } else {
+        eele_new = eint-eion_new;
+      }
 
       cons(m, iion_, k, j, i) = eion_new;
       cons(m, iele_, k, j, i) = eele_new;
@@ -513,6 +561,8 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
     auto thermo = thermodynamics;
     bool use_spitzer = use_spitzer_exchange_;
     Real coulomb_log = spitzer_coulomb_log_;
+    int coulomb_log_model = spitzer_coulomb_log_model_;
+    Real coulomb_log_floor = spitzer_coulomb_log_floor_;
     Real spitzer_multiplier = spitzer_multiplier_;
     Real temperature_floor = spitzer_temperature_floor_;
     Real density_scale = density_scale_cgs_;
@@ -553,7 +603,11 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
           const Real exchange_seconds = SpitzerExchangeTime(
               old_state.electron_number_density_cgs,
               tion_kelvin, tele_kelvin, mixture.MeanAtomicMass(y0),
-              old_state.effective_charge, coulomb_log);
+              old_state.effective_charge, coulomb_log_model == 0 ? coulomb_log :
+              ExchangeCoulombLog(old_state.electron_number_density_cgs,
+                  tion_kelvin, tele_kelvin,
+                  thermo(m, mean_ionization, k, j, i),
+                  coulomb_log_model, coulomb_log_floor));
           exchange_time = spitzer_multiplier*exchange_seconds/time_scale;
         }
         if (exchange_time < 0.0 || !Kokkos::isfinite(exchange_time)) return;
@@ -660,22 +714,27 @@ void TwoTemperature::Exchange(Real dt, DvceArray5D<Real> &cons,
             density, density_scale, y0);
         const Real exchange_seconds = SpitzerExchangeTime(
             electron_density, tion_kelvin, tele_kelvin,
-            mixture.MeanAtomicMass(y0), mixture.EffectiveCharge(y0), coulomb_log);
+            mixture.MeanAtomicMass(y0), mixture.EffectiveCharge(y0),
+            coulomb_log_model == 0 ? coulomb_log : ExchangeCoulombLog(
+                electron_density, tion_kelvin, tele_kelvin, local_fe/local_fi,
+                coulomb_log_model, coulomb_log_floor));
         exchange_time = spitzer_multiplier*exchange_seconds/time_scale;
       }
       if (exchange_time < 0.0 || !Kokkos::isfinite(exchange_time)) return;
 
-      const Real teq = local_fi*tion+local_fe*tele;
       Real decay = 0.0;
+      Real relaxed = 1.0;
       if (exchange_time > 0.0) {
         decay = exp(-(1.0+local_fe/local_fi)*dt/exchange_time);
+        relaxed = -expm1(-(1.0+local_fe/local_fi)*dt/exchange_time);
       }
-      const Real delta_t = (tion-tele)*decay;
-      const Real tion_new = teq+local_fe*delta_t;
-
-      Real eion_new = density*local_fi*tion_new/gm1;
-      eion_new = fmin(fmax(eion_new, 0.0), eint);
-      const Real eele_new = eint-eion_new;
+      Real eion_new = decay*eion+relaxed*local_fi*eint;
+      Real eele_new = decay*eele+relaxed*local_fe*eint;
+      if (eion_new > eele_new) {
+        eion_new = eint-eele_new;
+      } else {
+        eele_new = eint-eion_new;
+      }
       cons(m, iion_, k, j, i) = eion_new;
       cons(m, iele_, k, j, i) = eele_new;
       prim(m, iion_, k, j, i) = eion_new/density;
@@ -840,8 +899,9 @@ void TwoTemperature::CloseBiermannStage(
 //----------------------------------------------------------------------------------------
 
 void TwoTemperature::AddRadiationFluxes(const DvceArray5D<Real> &prim,
-                                        DvceFaceFld5D<Real> &flx) {
-  if (pradiation != nullptr) pradiation->AddFluxes(prim, temperature, flx);
+                                        DvceFaceFld5D<Real> &flx,
+                                        const FaceFldOrigin origin) {
+  if (pradiation != nullptr) pradiation->AddFluxes(prim, temperature, flx, origin);
 }
 
 //----------------------------------------------------------------------------------------

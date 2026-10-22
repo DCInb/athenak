@@ -89,7 +89,8 @@ class TwoTemperature {
                 int il, int iu, int jl, int ju, int kl, int ku);
 
   // Add multigroup FLD fluxes and compute their explicit stability limit.
-  void AddRadiationFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx);
+  void AddRadiationFluxes(const DvceArray5D<Real> &prim, DvceFaceFld5D<Real> &flx,
+                          FaceFldOrigin origin = {});
   void SolveImplicitRadiationTransport(Real dt, DvceArray5D<Real> &cons,
                                        DvceArray5D<Real> &prim,
                                        MeshBoundaryValuesCC *pbval);
@@ -113,6 +114,8 @@ class TwoTemperature {
   materials::MaterialMixtureDevice material_mixture_;
   bool use_spitzer_exchange_ = false;
   Real spitzer_coulomb_log_ = 10.0;
+  int spitzer_coulomb_log_model_ = 0;  // 0: constant, 1: Spitzer, 2: Lee-More
+  Real spitzer_coulomb_log_floor_ = 1.0;
   Real spitzer_multiplier_ = 1.0;
   Real spitzer_temperature_floor_ = 1.0;
   Real density_scale_cgs_ = 1.0;

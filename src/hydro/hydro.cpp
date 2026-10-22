@@ -244,7 +244,12 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     int n_ccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
     int n_ccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
     Kokkos::realloc(coarse_u0, nmb, (nhydro+nscalars), n_ccells3, n_ccells2, n_ccells1);
-    Kokkos::realloc(coarse_w0, nmb, (nhydro+nscalars), n_ccells3, n_ccells2, n_ccells1);
+    // MeshRefinement is constructed after Hydro; read its optional flag here.
+    // Conserved-variable prolongation never uses the coarse primitive register.
+    if (pin->DoesParameterExist("mesh_refinement", "prolong_primitives") &&
+        pin->GetBoolean("mesh_refinement", "prolong_primitives")) {
+      Kokkos::realloc(coarse_w0, nmb, (nhydro+nscalars), n_ccells3, n_ccells2, n_ccells1);
+    }
   }
 
   // allocate boundary buffers for conserved (cell-centered) variables.  The dual-energy
@@ -328,18 +333,18 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
 
     // select Riemann solver (no default).  Test for compatibility of options
     std::string rsolver = pin->GetString("hydro","rsolver");
-    if (peos->eos_data.is_table && rsolver != "llf") {
+    if (peos->eos_data.is_table && rsolver != "llf" && rsolver != "hllc") {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<hydro>/eos=table currently requires rsolver=llf"
+                << std::endl << "<hydro>/eos=table requires rsolver=llf or hllc"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    // Only the LLF flux has a material-EOS variant that takes pressure and sound speed
+    // LLF and HLLC have material-EOS variants that take pressure and sound speed
     // from the tabulated closure rather than from the gamma-law carrier.
-    if (use_tabular_material_eos && rsolver != "llf") {
+    if (use_tabular_material_eos && rsolver != "llf" && rsolver != "hllc") {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "tabular <materials> EOS currently requires "
-                << "<hydro>/rsolver=llf" << std::endl;
+                << "<hydro>/rsolver=llf or hllc" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     // Special relativistic dynamic solvers
@@ -434,13 +439,26 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
       int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
       Kokkos::realloc(u1,       nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
-      Kokkos::realloc(uflx.x1f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
-      Kokkos::realloc(uflx.x2f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
-      Kokkos::realloc(uflx.x3f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
+      // HXJ 5aa60f3c: fluxes need the active faces, not every ghost cell.
+      // FOFC additionally tests the first ghost cell on each side of the block.
+      const int margin = use_fofc ? 1 : 0;
+      const bool multi_d = pmy_pack->pmesh->multi_d;
+      const bool three_d = pmy_pack->pmesh->three_d;
+      flux_origin = {three_d ? indcs.ks-margin : 0,
+                     multi_d ? indcs.js-margin : 0, indcs.is-margin};
+      const int nf1 = indcs.nx1 + 2*margin;
+      const int nf2 = multi_d ? indcs.nx2 + 2*margin : 1;
+      const int nf3 = three_d ? indcs.nx3 + 2*margin : 1;
+      // Inactive directions do not need a far face in 1D/2D simulations.
+      const int nf2f = multi_d ? nf2+1 : 1;
+      const int nf3f = three_d ? nf3+1 : 1;
+      Kokkos::realloc(uflx.x1f, nmb, (nhydro+nscalars), nf3, nf2, nf1+1);
+      Kokkos::realloc(uflx.x2f, nmb, (nhydro+nscalars), nf3, nf2f, nf1);
+      Kokkos::realloc(uflx.x3f, nmb, (nhydro+nscalars), nf3f, nf2, nf1);
       if (use_dual_energy) {
-        Kokkos::realloc(dual_vf.x1f, nmb, 1, ncells3, ncells2, ncells1);
-        Kokkos::realloc(dual_vf.x2f, nmb, 1, ncells3, ncells2, ncells1);
-        Kokkos::realloc(dual_vf.x3f, nmb, 1, ncells3, ncells2, ncells1);
+        Kokkos::realloc(dual_vf.x1f, nmb, 1, nf3, nf2, nf1+1);
+        Kokkos::realloc(dual_vf.x2f, nmb, 1, nf3, nf2f, nf1);
+        Kokkos::realloc(dual_vf.x3f, nmb, 1, nf3f, nf2, nf1);
       }
 
       // allocate array of flags used with FOFC

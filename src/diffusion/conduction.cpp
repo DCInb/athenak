@@ -24,8 +24,10 @@
 #include "mhd/mhd.hpp"
 #include "eos/eos.hpp"
 #include "conduction.hpp"
+#include "diffusion/native_diffusion_solver.hpp"
 #include "materials/material_mixture.hpp"
 #include "two_temperature/two_temperature.hpp"
+#include "two_temperature/thermal_radiation_halo.hpp"
 #include "units/units.hpp"
 
 namespace {
@@ -105,10 +107,6 @@ Conduction::Conduction(std::string block, MeshBlockPack *pp, ParameterInput *pin
     ConductionError("Implicit thermal conduction requires <"+block+
                     ">/two_temperature=true");
   }
-  if (pp->pmesh->multilevel) {
-    ConductionError("Implicit thermal conduction does not yet support SMR/AMR; "
-                    "the matrix operator currently requires a uniform-level mesh");
-  }
   if (alpha_aniso != 0.0) {
     ConductionError("Implicit thermal conduction currently supports isotropic "
                     "conductivity only");
@@ -134,6 +132,24 @@ Conduction::Conduction(std::string block, MeshBlockPack *pp, ParameterInput *pin
   max_nonlinear_iterations_ = pin->GetOrAddInteger(
       block, "conduction_max_nonlinear_iterations", 8);
   report_ = pin->GetOrAddBoolean(block, "conduction_report", false);
+  const std::string preconditioner = pin->GetOrAddString(
+      block, "conduction_preconditioner", "jacobi");
+  if (preconditioner != "jacobi" && preconditioner != "native-mg") {
+    ConductionError("conduction_preconditioner must be jacobi or native-mg");
+  }
+  native_mg_ = preconditioner == "native-mg";
+  if (native_mg_) {
+    const int max_mib = pin->GetOrAddInteger(block, "conduction_native_mg_max_mib", 1024);
+    if (max_mib <= 0) ConductionError("conduction_native_mg_max_mib must be positive");
+    native_max_bytes_ = static_cast<std::size_t>(max_mib)*1024*1024;
+    native_device_mpi_ = pin->GetOrAddBoolean(block, "conduction_native_mg_device_mpi", false);
+  }
+  const std::string halo = pin->GetOrAddString(block, "conduction_halo_exchange", "packed");
+  if (halo == "legacy") halo_exchange_ = 0;
+  else if (halo == "packed") halo_exchange_ = 1;
+  else if (halo == "host") halo_exchange_ = 2;
+  else ConductionError("conduction_halo_exchange must be legacy, packed, or host");
+  compact_halo_ = pin->GetOrAddBoolean(block, "conduction_halo_compact", true);
   coulomb_log_ =
       pin->GetOrAddReal(block, "conduction_coulomb_log", 10.0);
   spitzer_multiplier_ =
@@ -224,12 +240,26 @@ Conduction::Conduction(std::string block, MeshBlockPack *pp, ParameterInput *pin
   allocate(operator_direction_);
   allocate(correction_);
   allocate(coarse_scratch_);
+  if (pp->pmesh->multilevel) {
+    allocate(amr_diagonal_);
+    amr_face_origin_ = {indcs.ks, indcs.js, indcs.is};
+    const int nf1 = indcs.nx1, nf2 = indcs.nx2, nf3 = indcs.nx3;
+    const int nf2f = pp->pmesh->multi_d ? nf2+1 : 1;
+    const int nf3f = pp->pmesh->three_d ? nf3+1 : 1;
+    for (auto *faces : {&amr_conductance_, &amr_flux_}) {
+      Kokkos::realloc(faces->x1f, nmb, 1, nf3, nf2, nf1+1);
+      Kokkos::realloc(faces->x2f, nmb, 1, nf3, nf2f, nf1);
+      Kokkos::realloc(faces->x3f, nmb, 1, nf3f, nf2, nf1);
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------
 //! \brief Conduction destructor
 
 Conduction::~Conduction() {
+  delete native_solver_;
+  delete implicit_halo_;
 }
 
 //----------------------------------------------------------------------------------------
@@ -238,15 +268,15 @@ Conduction::~Conduction() {
 //! conduction to face-centered fluxes of conserved variables
 
 void Conduction::AddHeatFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
   if (alpha_iso != 0) {
-    AddHeatFluxIso(w0, eos, flx);
+    AddHeatFluxIso(w0, eos, flx, origin);
   }
   if (alpha_aniso != 0) {
-    AddHeatFluxAniso(w0, eos, flx);
+    AddHeatFluxAniso(w0, eos, flx, origin);
   }
   if (alpha_spitzer) {
-    AddHeatFluxSpitzer(w0, eos, flx);
+    AddHeatFluxSpitzer(w0, eos, flx, origin);
   }
   return;
 }
@@ -257,7 +287,7 @@ void Conduction::AddHeatFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
 //! fluxes of conserved variables
 
 void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
@@ -268,7 +298,7 @@ void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos
   Real &alpha_ = alpha_iso;
 
   // fluxes in x1-direction
-  auto &flx1 = flx.x1f;
+  auto flx1 = MakeBandView(flx.x1f, origin);
   par_for("conduct1", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie+1,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     Real tempr = w0(m,IEN,k,j,i  )/w0(m,IDN,k,j,i  );
@@ -280,7 +310,7 @@ void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos
   if (pmy_pack->pmesh->one_d) {return;}
 
   // fluxes in x2-direction
-  auto &flx2 = flx.x2f;
+  auto flx2 = MakeBandView(flx.x2f, origin);
   par_for("conduct2",DevExeSpace(), 0, nmb1, ks, ke, js, je+1, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     Real tempr = w0(m,IEN,k,j  ,i)/w0(m,IDN,k,j  ,i);
@@ -292,7 +322,7 @@ void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos
   if (pmy_pack->pmesh->two_d) {return;}
 
   // fluxes in x3-direction
-  auto &flx3 = flx.x3f;
+  auto flx3 = MakeBandView(flx.x3f, origin);
   par_for("conduct3",DevExeSpace(), 0, nmb1, ks, ke+1, js, je, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     Real tempr = w0(m,IEN,k  ,j,i)/w0(m,IDN,k  ,j,i);
@@ -309,7 +339,7 @@ void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos
 //! \brief Current a no-op function, to be added later
 
 void Conduction::AddHeatFluxAniso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
   return;
 }
 
@@ -319,7 +349,7 @@ void Conduction::AddHeatFluxAniso(const DvceArray5D<Real> &w0, const EOS_Data &e
 //! temperature-dependent conductivity
 
 void Conduction::AddHeatFluxSpitzer(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-   DvceFaceFld5D<Real> &flx) {
+   DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
 /*
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
@@ -337,7 +367,7 @@ void Conduction::AddHeatFluxSpitzer(const DvceArray5D<Real> &w0, const EOS_Data 
                     pmy_pack->punit->length_cgs()/pmy_pack->punit->temperature_cgs();
 
   // fluxes in x1-direction
-  auto &flx1 = flx.x1f;
+  auto flx1 = MakeBandView(flx.x1f, origin);
   par_for("conduct1", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie+1,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Add heat fluxes into fluxes of conserved variables: energy
@@ -378,7 +408,7 @@ void Conduction::AddHeatFluxSpitzer(const DvceArray5D<Real> &w0, const EOS_Data 
   if (pmy_pack->pmesh->one_d) {return;}
 
   // fluxes in x2-direction
-  auto &flx2 = flx.x2f;
+  auto flx2 = MakeBandView(flx.x2f, origin);
   par_for("conduct2",DevExeSpace(), 0, nmb1, ks, ke, js, je+1, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Add heat fluxes into fluxes of conserved variables: energy
@@ -419,7 +449,7 @@ void Conduction::AddHeatFluxSpitzer(const DvceArray5D<Real> &w0, const EOS_Data 
   if (pmy_pack->pmesh->two_d) {return;}
 
   // fluxes in x3-direction
-  auto &flx3 = flx.x3f;
+  auto flx3 = MakeBandView(flx.x3f, origin);
   par_for("conduct3",DevExeSpace(), 0, nmb1, ks, ke+1, js, je, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Add heat fluxes into fluxes of conserved variables: energy

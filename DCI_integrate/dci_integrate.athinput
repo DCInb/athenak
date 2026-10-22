@@ -1,0 +1,572 @@
+# DCI_integrate: the newest DCI_3D cone-shell plus its reflection across x1 = 0.
+# AMR cell-AMG on 16 A100 40-GiB GPUs, requesting four-group radiation batching.
+# The memory guard selects 4, 2, or 1 active groups; the 3960-block probe selects 1.
+# 108 x 84 x 84 base: unchanged spacing, CH 1.786 um and Au 3.571 um.
+# 18 x 28 x 28 blocks reduce the four-ghost-layer overhead without changing the mesh.
+# The original initial level-2 seed and its reflection are retained below.
+# Refine above 1 g/cc; an extra level follows the advected dense CH material.
+# AMR capacity is 320 blocks/rank: 5120 blocks on the available 16 GPUs.
+# The analytic initial-material mesh estimate is 3960 blocks; later growth can hit the cap.
+# Hierarchy budget is 5120 MiB per group; admission checks include all active groups.
+# Full 20-group physics, light speed and 1e-10 tolerance; original output cadence.
+# Evolve to 8 ns without a cycle limit; the laser pulse retains its original duration.
+# The single-target capacity estimate does not qualify this doubled target.
+<job>
+basename = dci_integrate
+
+<units>
+length_cgs = 1.0e-1
+mass_cgs = 1.1e-3
+time_cgs = 1.0e-9
+mu = 1.4444444444444444
+
+# The cone axis is x1 (the archive's z axis); x2 and x3 are transverse.
+# Extend the axial domain symmetrically to contain the original domain and its
+# reflection. Retain dx = 1.2/84 mm and the original 108 x 84 x 84 base mesh.
+# Larger MeshBlocks partition it into 6 x 3 x 3 blocks; transverse bounds stay +/-0.6 mm.
+# Cell AMG follows the actual coefficient graph without fixed geometric aggregates.
+<mesh>
+nghost = 4  # PPM needs >=3 ghost cells; SMR/AMR requires an even count.
+nx1 = 108
+x1min = -0.7714285714285714
+x1max = 0.7714285714285714
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 84
+x2min = -0.6
+x2max = 0.6
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 84
+x3min = -0.6
+x3max = 0.6
+ix3_bc = outflow
+ox3_bc = outflow
+
+meshblock_order = z_order
+
+<meshblock>
+nx1 = 18
+nx2 = 28
+nx3 = 28
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 4  # Total levels, including the root: physical levels 0, 1, 2, 3.
+max_nmb_per_rank = 320
+communication_buffers = dynamic  # Reserve only actual AMR migration payloads.
+ncycle_check = 1
+refinement_interval = 2
+
+# Original seed plus its reflection. Material AMR follows both targets after startup.
+
+<refined_region1>
+level = 2
+x1min = -0.0214285704286
+x1max = 0.235714284714
+x2min = -0.171428570429
+x2max = -0.0857142867143
+x3min = -0.0857142847143
+x3max = 0.0857142847143
+
+# Reflection of the original seed across x1 = 0.
+<refined_region2>
+level = 2
+x1min = -0.235714284714
+x1max = 0.0214285704286
+x2min = -0.171428570429
+x2max = -0.0857142867143
+x3min = -0.0857142847143
+x3max = 0.0857142847143
+
+<amr_criterion0>
+# DCI material-aware criterion. One code density unit is 1.1 g/cm^3.
+# Total density selects dense_level; rho*Y_CH and rho*Y_Au select their own levels.
+method = user
+value_max = 0.9090909090909091  # Strictly above 1 g/cm^3.
+dense_level = 2
+ch_level = 3    # Four total levels, 1.786 um; follows the imploding CH shell.
+gold_level = 2  # Three total levels, 3.571 um; follows the gold cone.
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.25
+nlim = -1
+tlim = 8.0
+ndiag = 1
+align_outputs = true
+initial_dt = 5.0e-5
+walltime_restart_only = true
+
+<hydro>
+eos = ideal
+reconstruct = ppm4
+rsolver = hllc
+gamma = 1.6666666666666667
+dfloor = 1.0e-8
+pfloor = 1.0e-14
+tfloor = 1.0e-12
+nscalars = 3
+two_temperature = true
+dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+electron_heat_capacity_fraction = 0.7777777777777778
+initial_electron_temperature_ratio = 1.0
+t_ei_model = spitzer
+t_ei_coulomb_log = 1.0e1
+t_ei_spitzer_multiplier = 1.0
+t_ei_temperature_floor_kelvin = 1.0
+
+# Electron-only SpitzerHighZ conduction, implicit on the composite AMR mesh.
+# Match the archived Larsen flux limiter; physical faces default to zero heat flux.
+alpha_spitzer = true
+conduction_integrator = implicit
+conduction_theta = 1.0
+conduction_coulomb_log = 10.0
+conduction_spitzer_multiplier = 1.0
+conduction_flux_limiter = larsen
+conduction_flux_limit_coefficient = 0.06
+conduction_linear_tolerance = 1.0e-10
+conduction_nonlinear_tolerance = 1.0e-8
+conduction_max_iterations = 2000
+conduction_max_nonlinear_iterations = 80  # Cold tabular mixtures need damped Newton steps.
+conduction_report = true
+
+biermann_battery = true
+biermann_coefficient = 2.7875722321043606e-4
+biermann_minimum_electron_fraction = 1.0e-12
+biermann_shock_suppression = true
+biermann_shock_threshold = 8.0e-1
+
+biermann_subcycle = true
+biermann_subcycle_cfl = 0.15
+biermann_subcycle_max_steps = 100000
+biermann_reduced_closure = true
+
+# Three components: both CH shells, both Au cones, and the shared He ambient. The closure
+# explicitly advects all three mass fractions starting at scalar_index.
+<materials>
+nmaterials = 3
+scalar_index = 0
+material0_name = CH
+material0_abar = 6.5
+material0_zbar = 3.5
+material0_zeff = 5.285714285714286
+
+material1_name = Au
+material1_abar = 196.96655
+material1_zbar = 79.0
+material1_zeff = 79.0
+
+material2_name = He
+material2_abar = 4.002602
+material2_zbar = 2.0
+material2_zeff = 2.0
+
+# These tables are byte-identical copies of the newest DCI_3D material tables.
+# The launcher stages them in each run directory and makes these paths portable.
+material0_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_integrate/material_tables/ch.2t_eos
+material1_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_integrate/material_tables/au.2t_eos
+material2_eos_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_integrate/material_tables/he.2t_eos
+eos_mixing_rule = partial_density_additive
+eos_table_bounds = flash-extrapolate
+eos_table_interpolation = geometric
+
+material0_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_integrate/material_tables/ch_20g.opacity
+material1_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_integrate/material_tables/au_20g.opacity
+material2_opacity_table_file = /home/bingxing2/home/scx9fy6/mengqi/athenak/DCI_integrate/material_tables/he_20g.opacity
+material0_opacity_interpolation = geometric
+material1_opacity_interpolation = geometric
+material2_opacity_interpolation = geometric
+material0_opacity_coordinate_interpolation = log
+material1_opacity_coordinate_interpolation = log
+material2_opacity_coordinate_interpolation = log
+material0_opacity_density_scale = 1.1
+material1_opacity_density_scale = 1.1
+material2_opacity_density_scale = 1.1
+material0_opacity_temperature_scale = 1.7372674493486121e8
+material1_opacity_temperature_scale = 1.7372674493486121e8
+material2_opacity_temperature_scale = 1.7372674493486121e8
+material0_opacity_group_bound_scale = 5.756166100820859e-9
+material1_opacity_group_bound_scale = 5.756166100820859e-9
+material2_opacity_group_bound_scale = 5.756166100820859e-9
+material0_opacity_transport_scale = 1.1e-1
+material1_opacity_transport_scale = 1.1e-1
+material2_opacity_transport_scale = 1.1e-1
+material0_opacity_absorption_scale = 1.1e-1
+material1_opacity_absorption_scale = 1.1e-1
+material2_opacity_absorption_scale = 1.1e-1
+material0_opacity_emission_scale = 1.1e-1
+material1_opacity_emission_scale = 1.1e-1
+material2_opacity_emission_scale = 1.1e-1
+
+<thermal_radiation>
+enabled = true
+n_groups = 20
+arad = 6.265030089603521e2
+# Physical light speed in mm/ns.  Frozen-coefficient backward-Euler FLD removes the
+# explicit dx/c transport restriction without changing emission or absorption rates.
+c_light = 2.99792458e2
+initial_radiation_temperature = 6.680606376612690e-5
+flux_limiter = harmonic
+flux_limit_coefficient = 1.0
+transport_discretization = asymptotic-preserving
+transport_integrator = implicit
+implicit_preconditioner = cell-amg
+implicit_amr_coarse_solver = auto
+implicit_group_batch_size = 4  # Request four groups; automatically fall back to 2 or 1.
+implicit_amr_amg_max_mib = 5120  # More active cells per GPU on the 16-GPU allocation.
+implicit_halo_exchange = packed
+implicit_halo_faces = true
+implicit_amr_order = 2
+implicit_amr_inner_iterations = 0
+solver_timers = false
+solver_summary = true
+implicit_gmres_orthogonalization = cgs2
+implicit_tolerance = 1.0e-10
+implicit_max_iterations = 2000
+implicit_report = true
+implicit_x1_inner_boundary = vacuum
+implicit_x1_outer_boundary = vacuum
+implicit_x2_inner_boundary = vacuum
+implicit_x2_outer_boundary = vacuum
+implicit_x3_inner_boundary = vacuum
+implicit_x3_outer_boundary = vacuum
+ap_streaming_threshold = 5.0e-1
+ap_optical_depth_threshold = 1.0
+# The local backward-Euler source solve couples temperature-dependent EOS, opacity,
+# and all radiation groups nonlinearly.  At this stage, do not impose an independent
+# matter-radiation source timestep constraint.
+source_integrator = nonlinear
+source_report = false
+source_cfl = 0.0
+couple_matter = true
+opacity_model = mixed-table
+group_bound_0 = 6.679753382762794e-5
+group_bound_1 = 6.679753382762794e-4
+group_bound_2 = 3.339876691381397e-3
+group_bound_3 = 6.679753382762794e-3
+group_bound_4 = 1.001963007414419e-2
+group_bound_5 = 1.669938345690699e-2
+group_bound_6 = 2.671901353105118e-2
+group_bound_7 = 3.673864360519537e-2
+group_bound_8 = 4.675827367933956e-2
+group_bound_9 = 6.011778044486515e-2
+group_bound_10 = 8.015704059315353e-2
+group_bound_11 = 1.068760541242047e-1
+group_bound_12 = 1.335950676552559e-1
+group_bound_13 = 1.469545744207815e-1
+group_bound_14 = 1.603140811863071e-1
+group_bound_15 = 1.736735879518326e-1
+group_bound_16 = 1.870330947173582e-1
+group_bound_17 = 2.070723548656466e-1
+group_bound_18 = 2.337913683966978e-1
+group_bound_19 = 2.671901353105118e-1
+group_bound_20 = 6.679753382762794e-1
+implicit_gmres_restart = 30
+
+<laser>
+model = straight
+deposition_target = electron
+electron_temperature_model = two_temperature
+absorption_model = inverse_bremsstrahlung
+unit_system = cgs
+inverse_bremsstrahlung_coulomb_log = 5.0
+inverse_bremsstrahlung_temperature_floor = 1.1606e4
+critical_reflection = true
+oblique_turning = true
+# Keep 64 only as a hard failure guard.  A one-percent underdense rearm band prevents
+# a reflected ray from retriggering on cell-to-cell cutoff reconstruction chatter.
+max_reflections_per_ray = 64
+reflection_offset_fraction = 1.0e-5
+reflection_hysteresis_fraction = 1.0e-2
+nbeams = 8
+max_segments_per_launch = 64
+max_transport_iterations = 256
+max_mpi_waves = 1024
+gpu_aware_mpi = false
+minimum_power_fraction = 1.0e-14
+conservation_tolerance = 1.0e-10
+periodic_transport = false
+report_diagnostics = true
+
+# Archived FLASH 3d_zb/ParDir/1l_4beam_BB.par pulse 1: three pickets and a flat main
+# drive.  Knot times are code nanoseconds; absolute powers are erg/s (1 W = 1e7 erg/s).
+# Each beam integrates to 1.774550 kJ: 7.0982 kJ per side, 14.1964 kJ total.
+npulses = 1
+pulse0_nsections = 13
+pulse0_time_0 = 0.0
+pulse0_time_1 = 0.13
+pulse0_time_2 = 0.26
+pulse0_time_3 = 0.76
+pulse0_time_4 = 0.89
+pulse0_time_5 = 1.02
+pulse0_time_6 = 1.62
+pulse0_time_7 = 1.75
+pulse0_time_8 = 1.88
+pulse0_time_9 = 2.10
+pulse0_time_10 = 2.23
+pulse0_time_11 = 4.58
+pulse0_time_12 = 4.71
+pulse0_power_0 = 0.0
+pulse0_power_1 = 8.75e17
+pulse0_power_2 = 0.0
+pulse0_power_3 = 0.0
+pulse0_power_4 = 1.375e18
+pulse0_power_5 = 0.0
+pulse0_power_6 = 0.0
+pulse0_power_7 = 3.1e18
+pulse0_power_8 = 0.0
+pulse0_power_9 = 0.0
+pulse0_power_10 = 6.875e18
+pulse0_power_11 = 6.875e18
+pulse0_power_12 = 0.0
+
+# Upper-side FLASH beams mapped with cone axis +z -> +x1 (x -> x2, y -> x3, cm -> mm):
+# four collimated 0.275 mm uniform 3-omega spots inclined 50 degrees from the +x1 axis
+# at the four diagonal azimuths, all aimed at the on-axis point x1 = 0.359 mm.  The
+# lenses sit outside the mesh; lens-geometry rays enter through the domain faces.
+beam0_wavelength = 3.51e-5
+beam0_nrays = 50000
+beam0_geometry = lens
+beam0_lens_x1 = 2.037
+beam0_lens_x2 = 1.4142
+beam0_lens_x3 = 1.4142
+beam0_target_x1 = 0.359
+beam0_target_x2 = 0.0
+beam0_target_x3 = 0.0
+beam0_aperture_radius = 0.275
+beam0_target_radius = 0.275
+beam0_profile = uniform
+beam0_zeff = 5.285714285714286
+beam0_pulse_number = 0
+beam0_start_time = 0.0
+beam0_end_time = 5.0
+
+beam1_wavelength = 3.51e-5
+beam1_nrays = 50000
+beam1_geometry = lens
+beam1_lens_x1 = 2.037
+beam1_lens_x2 = -1.4142
+beam1_lens_x3 = 1.4142
+beam1_target_x1 = 0.359
+beam1_target_x2 = 0.0
+beam1_target_x3 = 0.0
+beam1_aperture_radius = 0.275
+beam1_target_radius = 0.275
+beam1_profile = uniform
+beam1_zeff = 5.285714285714286
+beam1_pulse_number = 0
+beam1_start_time = 0.0
+beam1_end_time = 5.0
+
+beam2_wavelength = 3.51e-5
+beam2_nrays = 50000
+beam2_geometry = lens
+beam2_lens_x1 = 2.037
+beam2_lens_x2 = -1.4142
+beam2_lens_x3 = -1.4142
+beam2_target_x1 = 0.359
+beam2_target_x2 = 0.0
+beam2_target_x3 = 0.0
+beam2_aperture_radius = 0.275
+beam2_target_radius = 0.275
+beam2_profile = uniform
+beam2_zeff = 5.285714285714286
+beam2_pulse_number = 0
+beam2_start_time = 0.0
+beam2_end_time = 5.0
+
+beam3_wavelength = 3.51e-5
+beam3_nrays = 50000
+beam3_geometry = lens
+beam3_lens_x1 = 2.037
+beam3_lens_x2 = 1.4142
+beam3_lens_x3 = -1.4142
+beam3_target_x1 = 0.359
+beam3_target_x2 = 0.0
+beam3_target_x3 = 0.0
+beam3_aperture_radius = 0.275
+beam3_target_radius = 0.275
+beam3_profile = uniform
+beam3_zeff = 5.285714285714286
+beam3_pulse_number = 0
+beam3_start_time = 0.0
+beam3_end_time = 5.0
+
+# Lower-side drive: reflect beams 0--3 across x1 = 0, with the same pulse per beam.
+beam4_wavelength = 3.51e-5
+beam4_nrays = 50000
+beam4_geometry = lens
+beam4_lens_x1 = -2.037
+beam4_lens_x2 = 1.4142
+beam4_lens_x3 = 1.4142
+beam4_target_x1 = -0.359
+beam4_target_x2 = 0.0
+beam4_target_x3 = 0.0
+beam4_aperture_radius = 0.275
+beam4_target_radius = 0.275
+beam4_profile = uniform
+beam4_zeff = 5.285714285714286
+beam4_pulse_number = 0
+beam4_start_time = 0.0
+beam4_end_time = 5.0
+
+beam5_wavelength = 3.51e-5
+beam5_nrays = 50000
+beam5_geometry = lens
+beam5_lens_x1 = -2.037
+beam5_lens_x2 = -1.4142
+beam5_lens_x3 = 1.4142
+beam5_target_x1 = -0.359
+beam5_target_x2 = 0.0
+beam5_target_x3 = 0.0
+beam5_aperture_radius = 0.275
+beam5_target_radius = 0.275
+beam5_profile = uniform
+beam5_zeff = 5.285714285714286
+beam5_pulse_number = 0
+beam5_start_time = 0.0
+beam5_end_time = 5.0
+
+beam6_wavelength = 3.51e-5
+beam6_nrays = 50000
+beam6_geometry = lens
+beam6_lens_x1 = -2.037
+beam6_lens_x2 = -1.4142
+beam6_lens_x3 = -1.4142
+beam6_target_x1 = -0.359
+beam6_target_x2 = 0.0
+beam6_target_x3 = 0.0
+beam6_aperture_radius = 0.275
+beam6_target_radius = 0.275
+beam6_profile = uniform
+beam6_zeff = 5.285714285714286
+beam6_pulse_number = 0
+beam6_start_time = 0.0
+beam6_end_time = 5.0
+
+beam7_wavelength = 3.51e-5
+beam7_nrays = 50000
+beam7_geometry = lens
+beam7_lens_x1 = -2.037
+beam7_lens_x2 = 1.4142
+beam7_lens_x3 = -1.4142
+beam7_target_x1 = -0.359
+beam7_target_x2 = 0.0
+beam7_target_x3 = 0.0
+beam7_aperture_radius = 0.275
+beam7_target_radius = 0.275
+beam7_profile = uniform
+beam7_zeff = 5.285714285714286
+beam7_pulse_number = 0
+beam7_start_time = 0.0
+beam7_end_time = 5.0
+
+# The DCI_3D target parameters apply to each side, at local axial coordinate |x1|.
+# Densities are in the 1.1 g/cc mass unit: CH 1.1 g/cc -> 1.0, Au 19.2 g/cc -> 17.4545,
+# He 1.0e-5 g/cc -> 9.0909e-6.
+<problem>
+user_hist = true
+ambient_density = 9.090909090909091e-6
+solid_density = 1.0
+cone_density = 17.454545454545453
+temperature_kelvin = 1.1606e4
+inner_radius = 0.52
+outer_radius = 0.55
+opening_half_angle_deg = 50.0
+# Au cone: archived hcone=0.0085 cm base and lxa=0.0031 cm wall offset.
+cone_base_x1 = 0.085
+cone_wall_offset = 0.031
+transition_width = 5.0e-3
+angular_transition = 1.0e-2
+allow_laser_transport_variants = false
+
+<output1>
+file_type = hst
+user_hist_only = true
+data_format = %20.12e
+dt = 2.5e-2
+
+# Frequent, inexpensive central slices for visualization.
+<output2>
+file_type = bin
+atomic_write = true
+variable = fluid_w
+id = fluid_xy
+slice_x3 = 0.0
+dt = 1.0e-1
+
+<output3>
+file_type = bin
+atomic_write = true
+variable = fluid_3t
+id = three_t_xy
+slice_x3 = 0.0
+dt = 1.0e-1
+
+<output4>
+file_type = bin
+atomic_write = true
+variable = laser
+id = laser_xy
+slice_x3 = 0.0
+dt = 1.0e-1
+
+<output5>
+file_type = bin
+atomic_write = true
+variable = fluid_w
+id = fluid_xz
+slice_x2 = 0.0
+dt = 1.0e-1
+
+<output6>
+file_type = bin
+atomic_write = true
+variable = fluid_3t
+id = three_t_xz
+slice_x2 = 0.0
+dt = 1.0e-1
+
+<output7>
+file_type = bin
+atomic_write = true
+variable = laser
+id = laser_xz
+slice_x2 = 0.0
+dt = 1.0e-1
+
+# Full-volume fields are intentionally sparse; 0.1 ns full dumps caused long I/O stalls.
+<output8>
+file_type = bin
+atomic_write = true
+variable = fluid_w
+id = fluid
+single_file_per_rank = false
+dt = 5.0e-1
+
+<output9>
+file_type = bin
+atomic_write = true
+variable = fluid_3t
+id = three_t
+single_file_per_rank = false
+dt = 5.0e-1
+
+<output10>
+file_type = bin
+atomic_write = true
+variable = laser
+id = laser
+single_file_per_rank = false
+dt = 5.0e-1
+
+<output11>
+file_type = rst
+atomic_write = true
+dt = 1.0

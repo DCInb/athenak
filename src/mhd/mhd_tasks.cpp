@@ -12,6 +12,7 @@
 #include <iostream>
 
 #include "athena.hpp"
+#include "fast_electrons/fast_electrons.hpp"
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
@@ -21,6 +22,7 @@
 #include "diffusion/viscosity.hpp"
 #include "diffusion/resistivity.hpp"
 #include "diffusion/conduction.hpp"
+#include "driver/driver.hpp"
 #include "srcterms/srcterms.hpp"
 #include "bvals/bvals.hpp"
 #include "shearing_box/shearing_box.hpp"
@@ -29,6 +31,7 @@
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "two_temperature/two_temperature.hpp"
+#include "two_temperature/thermal_radiation.hpp"
 
 namespace mhd {
 //----------------------------------------------------------------------------------------
@@ -642,7 +645,9 @@ TaskStatus MHD::ConToPrim(Driver *pdrive, int stage) {
   // subcycled state must then be restored with the same electron-energy closure used
   // by every accepted Biermann stage; the ordinary pressure-partition projection moves
   // both components by roundoff and makes a restart follow a different microstep path.
-  const bool biermann_stage_zero = (stage == 0 && BiermannSubcycleActive());
+  const bool biermann_stage_zero = stage == 0 && (BiermannSubcycleActive() ||
+      (pmy_pack->pfast_electrons != nullptr &&
+       pmy_pack->pfast_electrons->Electromagnetic()));
   if (!biermann_stage_zero) SynchronizeDualEnergyFromTotal();
   peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
   if (ptwo_temp != nullptr) {
@@ -683,6 +688,13 @@ TaskStatus MHD::TwoTempExchange(Driver *pdrive, int stage) {
       pmy_pack->pmesh->dt, u0, w0, pbval_u);
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
+  if (pmy_pack->pmesh->multilevel &&
+      ((pcond != nullptr && pcond->IsImplicit()) ||
+       (ptwo_temp->pradiation != nullptr && ptwo_temp->pradiation->IsImplicit()))) {
+    // Split transport and sources change interiors after the last stage halo. Refresh
+    // the coarse state before AMR derefinement and ghosts before the next flux sweep.
+    pdrive->InitBoundaryValuesAndPrimitives(pmy_pack->pmesh);
+  }
   return NewTimeStep(pdrive, pdrive->nexp_stages);
 }
 

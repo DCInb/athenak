@@ -1,0 +1,137 @@
+# Implicit diffusion across coarse/fine leaf faces. The temperature jump at
+# x1=0 lies on the edge of the initial refined region. The regression scripts
+# also enable adaptive refinement to exercise topology changes during transport.
+
+<job>
+basename = thermal_radiation_amr
+
+<mesh>
+nghost = 2
+nx1 = 32
+nx2 = 1
+nx3 = 1
+x1min = -0.5
+x1max = 0.5
+x2min = -0.5
+x2max = 0.5
+x3min = -0.5
+x3max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+ix2_bc = periodic
+ox2_bc = periodic
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 1
+nx3 = 1
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+refinement_interval = 2
+max_nmb_per_rank = 256
+
+<refined_region1>
+level = 1
+x1min = 0.0
+x1max = 0.25
+x2min = -0.5
+x2max = 0.0
+x3min = -0.5
+x3max = 0.0
+
+# With uniform density this criterion derefines the initial seed region after
+# two completed steps. Lower value_max to refine instead.
+<amr_criterion0>
+method = min_max
+variable = hydro_u_d
+value_max = 2.0
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.4
+nlim = 3
+tlim = 0.0007
+initial_dt = 0.0001
+align_outputs = true
+ndiag = 1
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = hllc
+gamma = 1.6666666666666667
+two_temperature = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+
+<thermal_radiation>
+enabled = true
+n_groups = 2
+arad = 1.0
+c_light = 1000.0
+transport_integrator = implicit
+implicit_preconditioner = block-coarse
+implicit_amr_coarse_solver = auto
+implicit_amr_order = 2
+implicit_gmres_restart = 30
+implicit_gmres_metric = volume
+implicit_amr_inner_iterations = 0
+implicit_amr_inner_norm = volume
+implicit_halo_exchange = packed
+implicit_halo_faces = true
+implicit_halo_compact = true
+implicit_tolerance = 1.0e-11
+implicit_max_iterations = 1000
+implicit_report = true
+implicit_x1_inner_boundary = neumann
+implicit_x1_outer_boundary = neumann
+implicit_x2_inner_boundary = neumann
+implicit_x2_outer_boundary = neumann
+implicit_x3_inner_boundary = neumann
+implicit_x3_outer_boundary = neumann
+implicit_x1_inner_value = 0.0
+implicit_x1_outer_value = 0.0
+implicit_x2_inner_value = 0.0
+implicit_x2_outer_value = 0.0
+implicit_x3_inner_value = 0.0
+implicit_x3_outer_value = 0.0
+initial_profile = step
+initial_radiation_temperature = 1.0
+initial_radiation_temperature_right = 0.5
+initial_radiation_x1 = 0.0
+flux_limiter = none
+couple_matter = false
+source_cfl = 0.0
+group_bound_0 = 0.0
+group_bound_1 = 1.0
+group_bound_2 = 100.0
+kappa_transport_0 = 100.0
+kappa_transport_1 = 35.0
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.0
+dl = 1.0
+pl = 1.0e-8
+ul = 0.0
+vl = 0.0
+wl = 0.0
+dr = 1.0
+pr = 1.0e-8
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type = bin
+variable = hydro_u
+double_precision_binary = true
+dt = -1
+dcycle = 1

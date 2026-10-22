@@ -18,6 +18,7 @@
 
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
+#include "fast_electrons/fast_electrons.hpp"
 #include "radiation/radiation.hpp"
 #include "refinement_criteria.hpp"
 #include "utils/utils.hpp"
@@ -72,6 +73,15 @@ RefinementCriteria::RefinementCriteria(Mesh *pm, ParameterInput *pin) :
 
   // Error if class containing variable requested has not been initialized
   for (auto it = rcrit.begin(); it != rcrit.end(); ++it) {
+    if (it->rvariable.compare(0, 3, "fe_") == 0) {
+      if (pm->pmb_pack->pfast_electrons == nullptr) {
+        Kokkos::abort("Fast-electron refinement variable requires <fast_electrons>");
+      }
+      // Particle moments are deposited on interiors. They have no slope stencil halo.
+      if (it->rmethod != RefCritMethod::min_max) {
+        Kokkos::abort("Fast-electron refinement variables require method=min_max");
+      }
+    }
     if ((it->rvariable.compare(0, 5, "hydro") == 0) &&
         (pm->pmb_pack->phydro == nullptr)) {
       std::cout<<"### FATAL ERROR in "<<__FILE__<<" at line "<<__LINE__<<std::endl;
@@ -148,6 +158,16 @@ void RefinementCriteria::SetRefinementData(MeshBlockPack* pmbp, bool count_deriv
         if (!(count_derived) && !(load_derived)) {
           int n = static_cast<int>(IDN);
           it->rdata = Kokkos::subview(pmbp->pmhd->w0, ALL, n, ALL, ALL, ALL);
+        }
+      } else if (it->rvariable == "fe_q" || it->rvariable == "fe_energy" ||
+                 it->rvariable == "fe_number" || it->rvariable == "fe_kinetic" ||
+                 it->rvariable == "fe_ohmic") {
+        if (!count_derived && !load_derived) {
+          const int n = it->rvariable == "fe_q" ? 0 :
+              it->rvariable == "fe_energy" ? 1 : it->rvariable == "fe_number" ? 2 :
+              it->rvariable == "fe_kinetic" ? 3 : 4;
+          it->rdata = Kokkos::subview(pmbp->pfast_electrons->cell_data,
+                                     ALL, n, ALL, ALL, ALL);
         }
       // radiation coordinate frame energy density R^0^0
       } else if (it->rvariable.compare("rad_coord_e") == 0) {

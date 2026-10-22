@@ -34,7 +34,32 @@ endif()
 option(Athena_SINGLE_PRECISION "Compile for single precision" OFF)
 option(Athena_ENABLE_MPI "Compile with MPI parallelism enabled" OFF)
 option(Athena_ENABLE_OPENMP "Compile with OpenMP parallelism enabled" OFF)
+option(Athena_ENABLE_CHOLMOD "Enable the optional global AMR radiation aggregate solve" OFF)
+option(Athena_ENABLE_HYPRE "Enable optional AMR radiation BoomerAMG preconditioning" OFF)
+option(Athena_ENABLE_HYPRE_REUSE "Enable optional HYPRE 2.33 CUDA transfer reuse" OFF)
+set(_athena_cusparse_default OFF)
+if (Athena_ENABLE_CHOLMOD AND Kokkos_ENABLE_CUDA)
+  set(_athena_cusparse_default ON)
+endif()
+option(Athena_ENABLE_CUSPARSE "Solve AMR radiation coarse factors on CUDA devices"
+    ${_athena_cusparse_default})
+unset(_athena_cusparse_default)
 set(PROBLEM built_in_pgens CACHE STRING "Name of problem generator function")
+
+if (Athena_ENABLE_CHOLMOD)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindAthenaCHOLMOD.cmake)
+endif()
+if (Athena_ENABLE_HYPRE)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindAthenaHYPRE.cmake)
+endif()
+if (Athena_ENABLE_CUSPARSE)
+  if (NOT Athena_ENABLE_CHOLMOD OR NOT Kokkos_ENABLE_CUDA)
+    message(FATAL_ERROR "Athena_ENABLE_CUSPARSE requires Athena_ENABLE_CHOLMOD "
+        "and Kokkos_ENABLE_CUDA")
+  endif()
+  # SpSV numeric updates retain the analyzed sparsity structure across groups.
+  find_package(CUDAToolkit 12.3 REQUIRED)
+endif()
 
 #------ set macros exported to config.hpp ------------------------------------------------
 
@@ -121,6 +146,15 @@ endif()
 include_directories(${Kokkos_INCLUDE_DIRS_RET})
 
 target_link_libraries(athena PUBLIC Kokkos::kokkos)
+if (Athena_ENABLE_CHOLMOD)
+  target_link_libraries(athena PRIVATE ${CHOLMOD_LINK_LIBRARIES})
+endif()
+if (Athena_ENABLE_HYPRE)
+  target_link_libraries(athena PRIVATE HYPRE::HYPRE)
+endif()
+if (Athena_ENABLE_CUSPARSE)
+  target_link_libraries(athena PRIVATE CUDA::cusparse CUDA::cublas)
+endif()
 if (ENABLE_MPI)
   target_link_libraries(athena PUBLIC MPI::MPI_CXX)
 endif()
@@ -256,5 +290,56 @@ target_include_directories(athena PUBLIC
 
 configure_file(config.hpp.in config.hpp)
 
-install( TARGETS athena DESTINATION bin )
+add_executable(native_multigrid_driver EXCLUDE_FROM_ALL
+    tst/test_suite/nr/native_multigrid_driver.cpp src/diffusion/native_multigrid.cpp)
+target_include_directories(native_multigrid_driver PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(native_multigrid_driver PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(native_multigrid_driver PRIVATE MPI::MPI_CXX)
+endif()
 
+add_executable(native_diffusion_benchmark EXCLUDE_FROM_ALL
+    tst/benchmarks/native_diffusion_benchmark.cpp src/diffusion/native_multigrid.cpp)
+target_include_directories(native_diffusion_benchmark PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(native_diffusion_benchmark PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(native_diffusion_benchmark PRIVATE MPI::MPI_CXX)
+endif()
+if (Athena_ENABLE_HYPRE)
+  target_sources(native_diffusion_benchmark PRIVATE
+      src/two_temperature/thermal_radiation_hypre.cpp
+      src/two_temperature/thermal_radiation_batch.cpp)
+  target_compile_definitions(native_diffusion_benchmark PRIVATE ATHENA_HYPRE_ENABLED=1)
+  target_link_libraries(native_diffusion_benchmark PRIVATE HYPRE::HYPRE)
+endif()
+
+if (Athena_ENABLE_HYPRE)
+  # Standalone numerical oracle; opt in explicitly without building athena.
+  add_executable(thermal_radiation_hypre_driver EXCLUDE_FROM_ALL
+      tst/test_suite/nr/thermal_radiation_hypre_driver.cpp
+      src/two_temperature/thermal_radiation_batch.cpp
+      src/two_temperature/thermal_radiation_hypre.cpp)
+  target_compile_definitions(thermal_radiation_hypre_driver PRIVATE ATHENA_HYPRE_ENABLED=1)
+  target_include_directories(thermal_radiation_hypre_driver PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+  target_link_libraries(thermal_radiation_hypre_driver PRIVATE Kokkos::kokkos HYPRE::HYPRE)
+  if (ENABLE_MPI)
+    target_link_libraries(thermal_radiation_hypre_driver PRIVATE MPI::MPI_CXX)
+    add_executable(thermal_radiation_hypre_mpi_driver EXCLUDE_FROM_ALL
+        tst/test_suite/nr/thermal_radiation_hypre_mpi_driver.cpp
+        src/two_temperature/thermal_radiation_batch.cpp
+        src/two_temperature/thermal_radiation_hypre.cpp)
+    target_compile_definitions(thermal_radiation_hypre_mpi_driver PRIVATE
+        ATHENA_HYPRE_ENABLED=1)
+    target_include_directories(thermal_radiation_hypre_mpi_driver PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(thermal_radiation_hypre_mpi_driver PRIVATE
+        Kokkos::kokkos HYPRE::HYPRE MPI::MPI_CXX)
+  endif()
+endif()
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AthenaHYPREReuse.cmake)
+
+install( TARGETS athena DESTINATION bin )

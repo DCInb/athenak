@@ -22,7 +22,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 178
+#define NOUTPUT_CHOICES 191
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -111,7 +111,12 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   // laser deposition and ray-path diagnostics (165-177)
   "laser", "laser_q", "laser_energy", "laser_ray_count", "laser_tau", "laser_path",
   "laser_dir1", "laser_dir2", "laser_dir3", "laser_dispersion_error",
-  "laser_x1_moment", "laser_x2_moment", "laser_x3_moment"
+  "laser_x1_moment", "laser_x2_moment", "laser_x3_moment",
+
+  // fast-electron deposition and persistent population diagnostics (178-182)
+  "fast_electrons", "fe_q", "fe_energy", "fe_number", "fe_kinetic",
+  "fe_ohmic", "fe_j1", "fe_j2", "fe_j3", "fe_e1", "fe_e2", "fe_e3",
+  "dt_fusion"
 };
 
 

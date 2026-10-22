@@ -33,7 +33,7 @@
 namespace hydro {
 
 // The following three helpers mirror the ones in mhd/mhd_fluxes.cpp; keep them in sync.
-// They supply the LLF flux with a face pressure and sound speed drawn from the tabulated
+// They supply LLF/HLLC with a face pressure and sound speed drawn from the tabulated
 // material closure instead of from the gamma-law carrier EOS.
 
 KOKKOS_INLINE_FUNCTION
@@ -175,18 +175,15 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   size_t scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
                      ScrArray2D<Real>::shmem_size(nmaterial_fields_, ncells1)) * 2;
   int scr_level = 0;
-  auto &flx1_ = uflx.x1f;
-  auto &vf1_ = dual_vf.x1f;
+  auto flx1_ = FluxBand(uflx.x1f);
+  auto vf1_ = FluxBand(dual_vf.x1f);
 
   // set the loop limits for 1D/2D/3D problems
   int il = is, iu = ie+1, jl = js, ju = je, kl = ks, ku = ke;
   if (use_fofc) {
     il = is-1, iu = ie+2;
-    if (pmy_pack->pmesh->two_d) {
-      jl = js-1, ju = je+1, kl = ks, ku = ke;
-    } else {
-      jl = js-1, ju = je+1, kl = ks-1, ku = ke+1;
-    }
+    if (pmy_pack->pmesh->multi_d) { jl = js-1, ju = je+1; }
+    if (pmy_pack->pmesh->three_d) { kl = ks-1, ku = ke+1; }
   }
 
   par_for_outer("hflux_x1",DevExeSpace(), scr_size, scr_level, 0, nmb1, kl, ku, jl, ju,
@@ -240,7 +237,8 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
     } else if constexpr (rsolver_method_ == Hydro_RSolver::hlle) {
       HLLE(member, eos, indcs, size, coord, m, k, j, il, iu, IVX, wl, wr, flx1);
     } else if constexpr (rsolver_method_ == Hydro_RSolver::hllc) {
-      HLLC(member, eos, indcs, size, coord, m, k, j, il, iu, IVX, wl, wr, flx1);
+      HLLC(member, eos, use_tabular_material_eos_, indcs, size, coord,
+           m, k, j, il, iu, IVX, wl, wr, material_left, material_right, flx1);
     } else if constexpr (rsolver_method_ == Hydro_RSolver::roe) {
       Roe(member, eos, indcs, size, coord, m, k, j, il, iu, IVX, wl, wr, flx1);
     } else if constexpr (rsolver_method_ == Hydro_RSolver::llf_sr) {
@@ -280,8 +278,8 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   if (pmy_pack->pmesh->multi_d) {
     scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
                 ScrArray2D<Real>::shmem_size(nmaterial_fields_, ncells1)) * 3;
-    auto &flx2_ = uflx.x2f;
-    auto &vf2_ = dual_vf.x2f;
+    auto flx2_ = FluxBand(uflx.x2f);
+    auto vf2_ = FluxBand(dual_vf.x2f);
 
     // set the loop limits for 1D/2D/3D problems
     il = is, iu = ie, jl = js-1, ju = je+1, kl = ks, ku = ke;
@@ -363,7 +361,8 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
           } else if constexpr (rsolver_method_ == Hydro_RSolver::hlle) {
             HLLE(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
           } else if constexpr (rsolver_method_ == Hydro_RSolver::hllc) {
-            HLLC(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+            HLLC(member, eos, use_tabular_material_eos_, indcs, size, coord,
+                 m, k, j, il, iu, IVY, wl, wr, material_left, material_right, flx2);
           } else if constexpr (rsolver_method_ == Hydro_RSolver::roe) {
             Roe(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
           } else if constexpr (rsolver_method_ == Hydro_RSolver::llf_sr) {
@@ -384,8 +383,9 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
           }
         }
 
-        // calculate fluxes of scalars (if any)
-        if (nvars > nhyd_) {
+        // The first row only primes reconstruction; it has no Riemann flux and
+        // lies outside the stored face band.
+        if (j>jl && nvars > nhyd_) {
           for (int n=nhyd_; n<nvars; ++n) {
             par_for_inner(member, is, ie, [&](const int i) {
               if (flx2_(m,IDN,k,j,i) >= 0.0) {
@@ -406,8 +406,8 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   if (pmy_pack->pmesh->three_d) {
     scr_size = (ScrArray2D<Real>::shmem_size(nvars, ncells1) +
                 ScrArray2D<Real>::shmem_size(nmaterial_fields_, ncells1)) * 3;
-    auto &flx3_ = uflx.x3f;
-    auto &vf3_ = dual_vf.x3f;
+    auto flx3_ = FluxBand(uflx.x3f);
+    auto vf3_ = FluxBand(dual_vf.x3f);
 
     // set the loop limits
     il = is, iu = ie, jl = js, ju = je, kl = ks-1, ku = ke+1;
@@ -482,7 +482,8 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
           } else if constexpr (rsolver_method_ == Hydro_RSolver::hlle) {
             HLLE(member, eos, indcs, size, coord, m, k, j, il, iu, IVZ, wl, wr, flx3);
           } else if constexpr (rsolver_method_ == Hydro_RSolver::hllc) {
-            HLLC(member, eos, indcs, size, coord, m, k, j, il, iu, IVZ, wl, wr, flx3);
+            HLLC(member, eos, use_tabular_material_eos_, indcs, size, coord,
+                 m, k, j, il, iu, IVZ, wl, wr, material_left, material_right, flx3);
           } else if constexpr (rsolver_method_ == Hydro_RSolver::roe) {
             Roe(member, eos, indcs, size, coord, m, k, j, il, iu, IVZ, wl, wr, flx3);
           } else if constexpr (rsolver_method_ == Hydro_RSolver::llf_sr) {
@@ -503,8 +504,9 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
           }
         }
 
-        // calculate fluxes of scalars (if any)
-        if (nvars > nhyd_) {
+        // The first plane only primes reconstruction; it has no Riemann flux and
+        // lies outside the stored face band.
+        if (k>kl && nvars > nhyd_) {
           for (int n=nhyd_; n<nvars; ++n) {
             par_for_inner(member, is, ie, [&](const int i) {
               if (flx3_(m,IDN,k,j,i) >= 0.0) {

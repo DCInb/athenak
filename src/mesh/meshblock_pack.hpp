@@ -36,6 +36,8 @@ namespace adm {class ADM;}
 namespace particles {class Particles;}
 namespace units {class Units;}
 namespace laser {class Laser;}
+namespace fast_electrons {class FastElectrons;}
+namespace nuclear {class DTFusion;}
 
 //----------------------------------------------------------------------------------------
 //! \class MeshBlockPack
@@ -76,6 +78,8 @@ class MeshBlockPack {
   std::vector<z4c::CCE *> pz4c_cce;
   particles::Particles *ppart=nullptr;
   laser::Laser *plaser=nullptr;
+  fast_electrons::FastElectrons *pfast_electrons=nullptr;
+  nuclear::DTFusion *pdt_fusion=nullptr;
 
   // units (needed to convert code units to cgs for, e.g., cooling or radiation)
   units::Units *punit=nullptr;

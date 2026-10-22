@@ -107,8 +107,15 @@ class Hydro {
 
   // following only used for time-evolving flow
   DvceArray5D<Real> u1;       // conserved variables at intermediate step
+  // Store active faces only, with a one-cell margin when FOFC needs ghost-cell trials.
+  // All readers/writers must use FluxBand(), or pass FluxOrigin() to shared routines.
   DvceFaceFld5D<Real> uflx;   // fluxes of conserved quantities on cell faces
   DvceFaceFld5D<Real> dual_vf;  // upwind face velocity for 2T compression work
+  FaceFldOrigin flux_origin;
+  BandView5D<Real> FluxBand(const DvceArray5D<Real> &a) const {
+    return MakeBandView(a, flux_origin);
+  }
+  FaceFldOrigin FluxOrigin() const { return flux_origin; }
   DvceArray4D<Real> dual_etot_max;  // local total-energy scale for dual-energy sync
   Real dtnew;
 

@@ -15,6 +15,8 @@
 #include <cstdio>
 
 #include "athena.hpp"
+#include "fast_electrons/fast_electrons.hpp"
+#include "nuclear/dt_fusion.hpp"
 #include "geodesic-grid/geodesic_grid.hpp"
 #include "globals.hpp"
 #include "parameter_input.hpp"
@@ -253,6 +255,39 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
               << "of Hydro, MHD, Rad, and/or Z4c arrays, restart file is broken."
               << std::endl;
     exit(EXIT_FAILURE);
+  }
+
+  // Optional AMR state follows the complete fluid payload, allowing old checkpoint
+  // files (and old readers of new files) to retain the existing record layout.
+  const int age_version = pin->DoesParameterExist("mesh_refinement",
+      "restart_age_version") ? pin->GetInteger("mesh_refinement",
+      "restart_age_version") : 0;
+  if (age_version != 0 && age_version != 1) {
+    Kokkos::abort("Unsupported AMR refinement-age restart version");
+  }
+  if (pm->adaptive && age_version == 1) {
+    Kokkos::realloc(pm->restart_refinement_ages, pm->nmb_total);
+    const IOWrapperSizeT file_blocks = single_file_per_rank ? nmb : pm->nmb_total;
+    const IOWrapperSizeT age_offset = headeroffset + data_size*file_blocks;
+    if (global_variable::my_rank == 0 || single_file_per_rank) {
+      if (resfile.Read_bytes_at(pm->restart_refinement_ages.data(), sizeof(int),
+                               pm->nmb_total, age_offset, single_file_per_rank) !=
+          static_cast<std::size_t>(pm->nmb_total)) {
+        Kokkos::abort("Incomplete AMR refinement ages in restart");
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+    if (!single_file_per_rank) {
+      MPI_Bcast(pm->restart_refinement_ages.data(), pm->nmb_total, MPI_INT,
+                0, MPI_COMM_WORLD);
+    }
+#endif
+    for (int m = 0; m < pm->nmb_total; ++m) {
+      const int age = pm->restart_refinement_ages(m);
+      if (age < 0 || age > pm->ncycle) {
+        Kokkos::abort("Invalid AMR refinement age in restart");
+      }
+    }
   }
 
   // read CC data into host array
@@ -612,6 +647,26 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
                       Kokkos::ALL, Kokkos::ALL, Kokkos::ALL), ccin);
     offset_myrank += nout1*nout2*nout3*nadm*sizeof(Real);   // adm u_adm
     myoffset = offset_myrank;
+  }
+
+  if (pm->pmb_pack->pfast_electrons != nullptr || pm->pmb_pack->pdt_fusion != nullptr) {
+    const IOWrapperSizeT blocks = single_file_per_rank ? nmb : pm->nmb_total;
+    IOWrapperSizeT offset = headeroffset+data_size*blocks+
+        (age_version == 1 ? pm->nmb_total*sizeof(int) : 0);
+    if (pm->pmb_pack->pdt_fusion != nullptr) {
+      if (!pin->DoesParameterExist("dt_fusion", "restart_version") ||
+          pin->GetInteger("dt_fusion", "restart_version") != 1) {
+        Kokkos::abort("Restart has no supported D-T alpha particle state");
+      }
+      offset = pm->pmb_pack->pdt_fusion->ReadRestart(resfile, offset, single_file_per_rank);
+    }
+    if (pm->pmb_pack->pfast_electrons != nullptr) {
+      if (!pin->DoesParameterExist("fast_electrons", "restart_version") ||
+          pin->GetInteger("fast_electrons", "restart_version") != 1) {
+        Kokkos::abort("Restart has no supported fast-electron particle state");
+      }
+      pm->pmb_pack->pfast_electrons->ReadRestart(resfile, offset, single_file_per_rank);
+    }
   }
 
   // call problem generator again to re-initialize data, fn ptrs, as needed

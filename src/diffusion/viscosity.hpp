@@ -32,11 +32,11 @@ class Viscosity {
 
   // function to add viscous fluxes to Hydro and/or MHD fluxes
   void AddViscousFluxes(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                        DvceFaceFld5D<Real> &f);
+                        DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void AddViscousFluxIso(const DvceArray5D<Real> &w,const EOS_Data &eos,
-                         DvceFaceFld5D<Real> &f);
+                         DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void AddViscousFluxAniso(const DvceArray5D<Real> &w,const EOS_Data &eos,
-                           DvceFaceFld5D<Real> &f);
+                           DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void NewTimeStep(const DvceArray5D<Real> &w, const EOS_Data &eos_data);
 
  private:

@@ -1,0 +1,126 @@
+# Uniform D-T slab; unmagnetized finite-speed alpha transport, escaping neutrons.
+# Run from the repository root: build/src/athena -i inputs/hydro/dt_fusion.athinput
+# Units: cm, g, ns. D/He/T material order matches shock_tube's first/last mixing.
+<job>
+basename = dt_fusion
+<units>
+length_cgs = 1.0
+mass_cgs = 1.0
+time_cgs = 1.0e-9
+mu = 1.25
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = 0.0
+x1max = 0.02
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 1
+x2min = -0.01
+x2max = 0.01
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 1
+x3min = -0.01
+x3max = 0.01
+ix3_bc = outflow
+ox3_bc = outflow
+<meshblock>
+nx1 = 16
+nx2 = 1
+nx3 = 1
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+tlim = 0.01
+nlim = -1
+ndiag = 1
+initial_dt = 0.001
+<hydro>
+eos = ideal
+gamma = 1.6666666666666667
+reconstruct = plm
+rsolver = hllc
+nscalars = 3
+two_temperature = true
+dual_energy = true
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+<materials>
+nmaterials = 3
+scalar_index = 0
+material0_name = D
+material0_abar = 2.0
+material0_zbar = 1.0
+material1_name = He4
+material1_abar = 4.0
+material1_zbar = 2.0
+material2_name = T
+material2_abar = 3.0
+material2_zbar = 1.0
+<dt_fusion>
+deuterium_material = 0
+helium_material = 1
+tritium_material = 2
+packets_per_cell = 8
+coulomb_log = 7.0
+enabled = true
+collisions = true
+rate_multiplier = 1.0
+scattering = true
+max_fractional_loss = 0.03
+max_scatter = 0.03
+source_fraction = 0.03
+burn_rtol = 1.0e-6
+periodic_transport = false
+report_diagnostics = true
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.01
+dl = 10.0
+dr = 10.0
+# p=(n_i+n_e) kT at T=5 keV, divided by 1e18 erg/cm^3.
+pl = 0.038594126608119
+pr = 0.038594126608119
+ul = 0.0
+ur = 0.0
+vl = 0.0
+vr = 0.0
+wl = 0.0
+wr = 0.0
+yl = 0.4
+yr = 0.4
+<output1>
+file_type = tab
+variable = dt_fusion
+id = fusion
+data_format = %24.16e
+dt = 0.002
+slice_x2 = 0.0
+slice_x3 = 0.0
+<output2>
+file_type = tab
+variable = hydro_u
+id = fluid
+data_format = %24.16e
+dt = 0.002
+slice_x2 = 0.0
+slice_x3 = 0.0
+<output3>
+file_type = tab
+variable = hydro_2t
+id = thermal
+data_format = %24.16e
+dt = 0.002
+slice_x2 = 0.0
+slice_x3 = 0.0
+<output4>
+file_type = tab
+variable = hydro_u_s
+id = species
+data_format = %24.16e
+dt = 0.002
+slice_x2 = 0.0
+slice_x3 = 0.0

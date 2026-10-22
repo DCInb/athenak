@@ -23,6 +23,7 @@ enum class BoundaryFlag {undef=-1,block, reflect, inflow, outflow, diode, user, 
 #include <vector>
 
 #include "athena.hpp"
+#include "bvals/bvals_batch.hpp"
 #include "mesh/mesh.hpp"
 #include "coordinates/coordinates.hpp"
 #include "tasklist/task_list.hpp"
@@ -128,6 +129,7 @@ class MeshBoundaryValues {
   virtual void InitSendIndices(MeshBoundaryBuffer &buf,int x,int y,int z,int a,int b)=0;
   virtual void InitRecvIndices(MeshBoundaryBuffer &buf,int x,int y,int z,int a,int b)=0;
   void InitializeBuffers(const int nvar, const int nflx=-1);
+  void EnableUniformBatch();
 
   TaskStatus InitRecv(const int nvar);
   virtual TaskStatus InitFluxRecv(const int nvar)=0;
@@ -148,6 +150,11 @@ class MeshBoundaryValues {
   // many types (Hydro, MHD, Radiation, Z4c, etc.)
   MeshBlockPack* pmy_pack;
   bool is_z4c_;   // flag to denote if this BoundaryValues is for Z4c module
+#if MPI_PARALLEL_ENABLED
+  bool batch_enabled_ = false;
+  BoundaryMPIBatch batch_vars_, batch_flux_;
+  std::vector<BoundaryMPIBatch::Segment> BatchSegments(bool sending, bool flux, int nvars);
+#endif
 };
 
 //----------------------------------------------------------------------------------------
@@ -174,13 +181,15 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
                              const int nvar_in = -1);
   // functions to communicate fluxes of CC data
   TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
-                               DvceFaceFld5D<Real> *extra_flx = nullptr);
+                               DvceFaceFld5D<Real> *extra_flx = nullptr,
+                               FaceFldOrigin origin = {});
   TaskStatus RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
-                                 DvceFaceFld5D<Real> *extra_flx = nullptr);
+                                 DvceFaceFld5D<Real> *extra_flx = nullptr,
+                                 FaceFldOrigin origin = {});
 
   // functions to prolongate conserved and primitive CC variables
   void FillCoarseInBndryCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
-       bool is_z4c=false);
+       bool is_z4c=false, int coarse_ghost_depth=-1);
   void ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, bool is_z4c=false);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, DvceArray5D<Real> &prim);
   void PrimToConsFineBndry(const DvceArray5D<Real> &prim, DvceArray5D<Real> &cons);

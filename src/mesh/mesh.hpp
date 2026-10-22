@@ -146,6 +146,10 @@ class Mesh {
   std::unique_ptr<ProblemGenerator> pgen;  // class containing functions to set ICs
   MeshRefinement *pmr=nullptr;             // mesh refinement data/functions (if needed)
 
+  // Restart ages are read before MeshRefinement exists, then transferred to it.
+  // Empty for new runs and older checkpoints without the optional AMR footer.
+  HostArray1D<int> restart_refinement_ages;
+
   // functions
   void BuildTreeFromScratch(ParameterInput *pin);
   void BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,

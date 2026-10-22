@@ -8,6 +8,7 @@
 //! load balancing when MPI is used, both for uniform grids and with SMR/AMR.
 
 #include <iostream>
+#include <cstddef> // size_t
 #include <limits> // numeric_limits<>
 #include <algorithm> // max
 #include <utility> // make_pair
@@ -17,6 +18,7 @@
 #include "mesh.hpp"
 #include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
+#include "fast_electrons/fast_electrons.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
 #include "z4c/z4c.hpp"
@@ -155,6 +157,9 @@ void MeshRefinement::InitRecvAMR(int nleaf) {
   if (pmy_mesh->pmb_pack->plaser != nullptr) {
     ncc_tosend += pmy_mesh->pmb_pack->plaser->cell_data.extent_int(1);
   }
+  if (pmy_mesh->pmb_pack->pfast_electrons != nullptr) {
+    ncc_tosend += pmy_mesh->pmb_pack->pfast_electrons->cell_data.extent_int(1);
+  }
 
   // Step 2. (InitRecvAMR)
   // loop over new MBs on this rank, initialize recv buffer metadata
@@ -266,7 +271,15 @@ void MeshRefinement::InitRecvAMR(int nleaf) {
   // Sync dual array
   recvbuf.template modify<HostMemSpace>();
   recvbuf.template sync<DevExeSpace>();
-  // Note: No need to reallocate recv_data buffer as it is fixed length
+  // Size storage from the actual packed messages, including coarse/fine and
+  // face-centered payloads. Fixed-mode buffers normally already have room;
+  // dynamic mode retains only the largest transfer encountered so far.
+  const auto &last_recv = recvbuf.h_view(nmb_recv-1);
+  const std::size_t recv_count = static_cast<std::size_t>(last_recv.offset)+last_recv.cnt;
+  if (recv_data.extent(0) < recv_count) {
+    Kokkos::fence();  // finish any earlier unpack kernels before releasing storage
+    Kokkos::realloc(recv_data, recv_count);
+  }
 
   // Step 3. (InitRecvAMR)
   // loop over new MBs on this rank, post non-blocking recvs
@@ -410,6 +423,9 @@ void MeshRefinement::PackAndSendAMR(int nleaf) {
   if (pmy_mesh->pmb_pack->plaser != nullptr) {
     ncc_tosend += pmy_mesh->pmb_pack->plaser->cell_data.extent_int(1);
   }
+  if (pmy_mesh->pmb_pack->pfast_electrons != nullptr) {
+    ncc_tosend += pmy_mesh->pmb_pack->pfast_electrons->cell_data.extent_int(1);
+  }
 
   // Step 2. (PackAndSendAMR)
   // loop over old MBs on this rank, initialize send buffer metadata
@@ -523,7 +539,12 @@ void MeshRefinement::PackAndSendAMR(int nleaf) {
   // Sync dual array
   sendbuf.template modify<HostMemSpace>();
   sendbuf.template sync<DevExeSpace>();
-  // Note: No need to reallocate send_date as it is fixed length
+  const auto &last_send = sendbuf.h_view(nmb_send-1);
+  const std::size_t send_count = static_cast<std::size_t>(last_send.offset)+last_send.cnt;
+  if (send_data.extent(0) < send_count) {
+    Kokkos::fence();
+    Kokkos::realloc(send_data, send_count);
+  }
 
   // Step 3. (PackAndSendAMR)
   // Pack data into send buffers in parallel
@@ -532,6 +553,7 @@ void MeshRefinement::PackAndSendAMR(int nleaf) {
   radiation::Radiation* prad = pmy_mesh->pmb_pack->prad;
   z4c::Z4c* pz4c = pmy_mesh->pmb_pack->pz4c;
   laser::Laser* plaser = pmy_mesh->pmb_pack->plaser;
+  fast_electrons::FastElectrons* pfast_electrons = pmy_mesh->pmb_pack->pfast_electrons;
 
   int ncc_sent = 0, nfc_sent = 0;
   if (phydro != nullptr) {
@@ -556,6 +578,11 @@ void MeshRefinement::PackAndSendAMR(int nleaf) {
     PackAMRBuffersCC(
         plaser->cell_data, plaser->coarse_cell_data, ncc_sent, nfc_sent);
     ncc_sent += plaser->cell_data.extent_int(1);
+  }
+  if (pfast_electrons != nullptr) {
+    PackAMRBuffersCC(
+        pfast_electrons->cell_data, pfast_electrons->coarse_cell_data, ncc_sent, nfc_sent);
+    ncc_sent += pfast_electrons->cell_data.extent_int(1);
   }
 
   // Step 4. (PackAndSendAMR)
@@ -827,6 +854,7 @@ void MeshRefinement::ClearRecvAndUnpackAMR() {
   radiation::Radiation* prad = pmy_mesh->pmb_pack->prad;
   z4c::Z4c* pz4c = pmy_mesh->pmb_pack->pz4c;
   laser::Laser* plaser = pmy_mesh->pmb_pack->plaser;
+  fast_electrons::FastElectrons* pfast_electrons = pmy_mesh->pmb_pack->pfast_electrons;
 
   int ncc_recv=0, nfc_recv=0;
 
@@ -852,6 +880,11 @@ void MeshRefinement::ClearRecvAndUnpackAMR() {
     UnpackAMRBuffersCC(
         plaser->cell_data, plaser->coarse_cell_data, ncc_recv, nfc_recv);
     ncc_recv += plaser->cell_data.extent_int(1);
+  }
+  if (pfast_electrons != nullptr) {
+    UnpackAMRBuffersCC(
+        pfast_electrons->cell_data, pfast_electrons->coarse_cell_data, ncc_recv, nfc_recv);
+    ncc_recv += pfast_electrons->cell_data.extent_int(1);
   }
 #endif
   return;

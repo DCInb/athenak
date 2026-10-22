@@ -30,6 +30,8 @@
 #include "srcterms/turb_driver.hpp"
 #include "particles/particles.hpp"
 #include "laser/laser.hpp"
+#include "fast_electrons/fast_electrons.hpp"
+#include "nuclear/dt_fusion.hpp"
 #include "units/units.hpp"
 #include "meshblock_pack.hpp"
 
@@ -40,7 +42,9 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
   pmesh(pm),
   gids(igids),
   gide(igide),
-  nmb_thispack(igide - igids + 1) {
+  nmb_thispack(igide - igids + 1),
+  pmb(nullptr),
+  pcoord(nullptr) {
   // create map for task lists
   tl_map.insert(std::make_pair("before_timeintegrator",std::make_shared<TaskList>()));
   tl_map.insert(std::make_pair("after_timeintegrator",std::make_shared<TaskList>()));
@@ -56,6 +60,8 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
 // MeshBlock destructor
 
 MeshBlockPack::~MeshBlockPack() {
+  if (pdt_fusion != nullptr) {delete pdt_fusion;}
+  if (pfast_electrons != nullptr) {delete pfast_electrons;}
   if (plaser != nullptr) {delete plaser;}
   if (ppart  != nullptr) {delete ppart;}
   if (pnr    != nullptr) {delete pnr;}
@@ -252,6 +258,19 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
     plaser->AssembleTasks(tl_map);
   } else {
     plaser = nullptr;
+  }
+
+  // (11) FAST ELECTRON TRANSPORT
+  // Persistent packets advance once per fluid cycle, after the complete macro update.
+  if (pin->DoesBlockExist("fast_electrons")) {
+    pfast_electrons = new fast_electrons::FastElectrons(this, pin);
+  } else {
+    pfast_electrons = nullptr;
+  }
+
+  if (pin->DoesBlockExist("dt_fusion") &&
+      pin->GetOrAddBoolean("dt_fusion", "enabled", true)) {
+    pdt_fusion = new nuclear::DTFusion(this, pin);
   }
 
   // Check that at least ONE is requested and initialized.

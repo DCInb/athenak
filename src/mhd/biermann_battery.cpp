@@ -1330,7 +1330,6 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         Real dx2 = size.d_view(m).dx2;
         Real dx3 = size.d_view(m).dx3;
         Real rho = fmax(w(m, IDN, k, j, i), dfloor);
-        Real local_fe = fe;
         Real ne;
         // The centre cell's log(ne) was redeclared once per direction.  It is the same
         // value in all three: hoist it, and let x2/x3 read what x1 already evaluated.
@@ -1357,7 +1356,6 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
         } else if (use_materials) {
           const auto mix_y0 = material_mixture.CompositionFromPrimitive(
               w, m, k, j, i);
-          local_fe = material_mixture.ElectronHeatCapacityFraction(mix_y0);
           ne = material_mixture.ElectronNumberDensity(rho, mix_y0);
           const Real rho_p = fmax(w(m, IDN, k, j, i+1), dfloor);
           const Real rho_m = fmax(w(m, IDN, k, j, i-1), dfloor);
@@ -1481,8 +1479,12 @@ void BiermannBattery::NewTimeStep(const DvceArray5D<Real> &prim,
               ? coeff*electron_activation*(sqrt(gm1*pe)/ne)*gradln
               : 0.0;
         } else {
-          Real tele = gm1*fmax(w(m, iele, k, j, i), 0.0)/local_fe;
-          vtm = coeff*sqrt(gm1*tele/ne)*gradln;
+          // Use pressure and the same electron-density normalization as the EMF.
+          // For a material mixture ne/rho=sum(Y Z/A), not the electron heat-capacity
+          // fraction. Substituting the normalized 2T temperature underestimates the
+          // wave speed (and overestimates dt) for heavy, weakly ionized species.
+          const Real pe = gm1*rho*fmax(w(m, iele, k, j, i), 0.0);
+          vtm = coeff*(sqrt(gm1*pe)/ne)*gradln;
         }
         Real vd1;
         Real vd2;

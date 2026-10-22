@@ -118,7 +118,7 @@ def discover_sources(
     calibration: Path,
 ) -> dict[str, Path]:
     sources = {
-        "production_input": CASE_DIR / "dci_3d.athinput",
+        "production_input": CASE_DIR / "dci_3d_v100_legacy.athinput",
         "calibration_input": CASE_DIR / "dci_3d_calibration.athinput",
         "smoke_status": smoke / "run_status.json",
         "smoke_phase1_log": smoke / "phase1.log",

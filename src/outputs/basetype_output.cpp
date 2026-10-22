@@ -24,6 +24,8 @@
 #include "globals.hpp"
 #include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
+#include "fast_electrons/fast_electrons.hpp"
+#include "nuclear/dt_fusion.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
@@ -232,8 +234,18 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl;
     exit(EXIT_FAILURE);
   }
+  if ((ivar >= 178) && (ivar < 190) && pm->pmb_pack->pfast_electrons == nullptr) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Fast-electron output requested in <output> block '"
+       << out_params.block_name << "' but no <fast_electrons> block is enabled."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
 
   // Now load STL vector of output variables
+  if (ivar == 190 && pm->pmb_pack->pdt_fusion == nullptr) {
+    Kokkos::abort("dt_fusion output requires an enabled <dt_fusion> block");
+  }
   outvars.clear();
 
   // make a vector of out_params.variables
@@ -248,6 +260,36 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
 
   for (const auto& variable : variables) {
+    if (variable == "dt_fusion") {
+      const char *names[8] = {"dt_rate", "alpha_number", "alpha_energy",
+          "alpha_eion", "alpha_eele", "alpha_dp1", "alpha_dp2", "alpha_dp3"};
+      for (int n = 0; n < 8; ++n) {
+        outvars.emplace_back(names[n], n, &(pm->pmb_pack->pdt_fusion->cell_data));
+      }
+    }
+    if (variable == "fast_electrons" || variable == "fe_q") {
+      outvars.emplace_back("fe_q", 0, &(pm->pmb_pack->pfast_electrons->cell_data));
+    }
+    if (variable == "fast_electrons" || variable == "fe_energy") {
+      outvars.emplace_back("fe_energy", 1,
+                           &(pm->pmb_pack->pfast_electrons->cell_data));
+    }
+    if (variable == "fast_electrons" || variable == "fe_number") {
+      outvars.emplace_back("fe_number", 2,
+                           &(pm->pmb_pack->pfast_electrons->cell_data));
+    }
+    if (variable == "fast_electrons" || variable == "fe_kinetic") {
+      outvars.emplace_back("fe_kinetic", 3,
+                           &(pm->pmb_pack->pfast_electrons->cell_data));
+    }
+    const char *fe_names[] = {"fe_ohmic", "fe_j1", "fe_j2", "fe_j3",
+                              "fe_e1", "fe_e2", "fe_e3"};
+    for (int n = 0; n < 7; ++n) {
+      if (variable == "fast_electrons" || variable == fe_names[n]) {
+        outvars.emplace_back(fe_names[n], 4+n,
+                             &(pm->pmb_pack->pfast_electrons->cell_data));
+      }
+    }
     if (variable == "laser" || variable == "laser_q") {
       outvars.emplace_back("laser_q", 0, &(pm->pmb_pack->plaser->cell_data));
     }

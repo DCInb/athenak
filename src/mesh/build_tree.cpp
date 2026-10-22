@@ -43,7 +43,7 @@ struct RootGridOrder {
   std::exit(EXIT_FAILURE);
 }
 
-RootGridOrder ReadRootGridOrder(ParameterInput *pin, const bool multilevel,
+RootGridOrder ReadRootGridOrder(ParameterInput *pin, const bool adaptive,
                                 const bool single_file_per_rank,
                                 const int nx1, const int nx2, const int nx3,
                                 const int nmb_total) {
@@ -55,8 +55,8 @@ RootGridOrder ReadRootGridOrder(ParameterInput *pin, const bool multilevel,
   if (order != "x1_tiled" && order != "x1_rank_map") {
     MeshBlockOrderError("expected 'z_order', 'x1_tiled', or 'x1_rank_map'");
   }
-  if (multilevel) {
-    MeshBlockOrderError("x1 ordering requires a uniform, single-level grid");
+  if (adaptive) {
+    MeshBlockOrderError("x1 ordering requires a uniform, non-adaptive root grid");
   }
   if (single_file_per_rank) {
     MeshBlockOrderError("x1 ordering requires a shared restart file");
@@ -64,6 +64,10 @@ RootGridOrder ReadRootGridOrder(ParameterInput *pin, const bool multilevel,
   if (nmb_total != nx1*nx2*nx3) {
     MeshBlockOrderError("x1 ordering requires a uniform root grid");
   }
+  // Static refinement infrastructure can be enabled without refined blocks (for
+  // example, cell AMG). Such a root grid is safe to order by complete x1 tubes.
+  // A refined tree has more leaves than the root grid and is rejected above;
+  // CreateX1RankMappedLLList also checks that every root is an unrefined leaf.
 
   result.rank_map.resize(nx2*nx3);
   if (order == "x1_tiled") {
@@ -373,7 +377,7 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   ptree->CountMeshBlocks(nmb_total);
 
   const RootGridOrder root_grid_order = ReadRootGridOrder(
-      pin, multilevel, false, nmb_rootx1, nmb_rootx2, nmb_rootx3, nmb_total);
+      pin, adaptive, false, nmb_rootx1, nmb_rootx2, nmb_rootx3, nmb_total);
 
   cost_eachmb = new float[nmb_total];
   rank_eachmb = new int[nmb_total];
@@ -529,7 +533,7 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   int current_level = root_level;
 
   const RootGridOrder root_grid_order = ReadRootGridOrder(
-      pin, multilevel, single_file_per_rank, nmb_rootx1, nmb_rootx2,
+      pin, adaptive, single_file_per_rank, nmb_rootx1, nmb_rootx2,
       nmb_rootx3, nmb_total);
 
   // Error check properties of input paraemters for SMR/AMR meshes.
@@ -591,33 +595,29 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   ptree->CreateRootGrid();
   for (int i=0; i<nmb_total; i++) {ptree->AddNodeWithoutRefinement(lloc_eachmb[i]);}
 
-  // Check the tree and assign GIDs.  A tiled restart must retain the order in which its
-  // data were written; changing an existing Z-order restart in place would misassociate
-  // MeshBlock payloads with logical locations.
+  // Check the tree and assign GIDs. A restart must retain its stored block order:
+  // changing either Z-order to tiled order or tiled order to Z-order would
+  // associate the unchanged file payloads with different logical locations.
   {
     int nnb;
+    auto expected = std::make_unique<LogicalLocation[]>(nmb_total);
     if (root_grid_order.enabled) {
-      LogicalLocation *expected = new LogicalLocation[nmb_total];
       ptree->CreateX1RankMappedLLList(
-          expected, nnb, root_grid_order.rank_map.data(), global_variable::nranks);
-      if (nnb == nmb_total) {
-        for (int gid = 0; gid < nmb_total; ++gid) {
-          if (!SameLogicalLocation(expected[gid], lloc_eachmb[gid])) {
-            delete [] expected;
-            MeshBlockOrderError("restart MeshBlock order does not match the requested "
-                                "x1 order; use a restart written with that order");
-          }
-        }
-      }
-      delete [] expected;
+          expected.get(), nnb, root_grid_order.rank_map.data(), global_variable::nranks);
     } else {
-      ptree->CreateZOrderedLLList(lloc_eachmb, nullptr, nnb);
+      ptree->CreateZOrderedLLList(expected.get(), nullptr, nnb);
     }
     if (nnb != nmb_total) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
         << std::endl << "Tree reconstruction failed. Total number of blocks in "
         << "reconstructed tree=" << nnb << ", number in file=" << nmb_total << std::endl;
       std::exit(EXIT_FAILURE);
+    }
+    for (int gid = 0; gid < nmb_total; ++gid) {
+      if (!SameLogicalLocation(expected[gid], lloc_eachmb[gid])) {
+        MeshBlockOrderError("restart MeshBlock order does not match the requested "
+                            "order; use a restart written with that order");
+      }
     }
   }
 

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "athena.hpp"
+#include "laser/laser_block_tree.hpp"
 #include "materials/material_mixture.hpp"
 #include "tasklist/task_list.hpp"
 
@@ -47,12 +48,6 @@ enum class LaserTransportState {
   unpack,
   check_global_completion,
   finished
-};
-
-struct LaserBlockInfo {
-  Real x1min, x1max, x2min, x2max, x3min, x3max;
-  Real dx1, dx2, dx3;
-  int gid, rank;
 };
 
 struct LaserRayPacket {
@@ -242,7 +237,9 @@ class Laser {
   DvceArray1D<int> active_queue_a_, active_queue_b_;
   DvceArray1D<int> ray_destination_rank_;
   DvceArray1D<LaserBlockInfo> global_block_info_;
+  DvceArray1D<LaserBlockTreeNode> global_block_tree_;
   bool global_block_info_built_ = false;
+  int global_blocks_created_ = -1, global_blocks_deleted_ = -1;
   DvceArray1D<int> mpi_send_counts_, mpi_send_offsets_, mpi_pack_cursors_;
   DvceArray1D<LaserRayPacket> mpi_send_packets_, mpi_recv_packets_;
   Kokkos::View<LaserRayPacket *, LayoutWrapper, Kokkos::SharedHostPinnedSpace>
@@ -252,7 +249,7 @@ class Laser {
   DvceArray1D<Real> device_diagnostics_;
   // Counters: total remaining, reflections, transfers, failures,
   // wave-cap remaining, reflection-cap remaining, suppressed same-surface
-  // turns, and reflection rearms.
+  // turns, reflection rearms, and invalid launches.
   DvceArray1D<int> device_counters_;
   DvceArray5D<Real> cumulative_energy_start_;
 

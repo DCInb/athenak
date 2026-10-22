@@ -26,7 +26,8 @@ from typing import Any
 
 CASE_DIR = Path(__file__).resolve().parent
 REPO = CASE_DIR.parent
-PRODUCTION_INPUT = CASE_DIR / "dci_3d.athinput"
+# Preserve the seven-V100 evidence workflow; run.slurm uses the current A100 default.
+PRODUCTION_INPUT = CASE_DIR / "dci_3d_v100_legacy.athinput"
 CALIBRATION_INPUT = CASE_DIR / "dci_3d_calibration.athinput"
 TABLE_GENERATOR = CASE_DIR / "generate_reference_tables.py"
 MATERIAL_TABLE_DIR = CASE_DIR / "material_tables"

@@ -18,6 +18,8 @@
 #include <utility> // make_pair
 
 #include "athena.hpp"
+#include "fast_electrons/fast_electrons.hpp"
+#include "nuclear/dt_fusion.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "geodesic-grid/geodesic_grid.hpp"
 #include "globals.hpp"
@@ -221,7 +223,19 @@ void RestartOutput::WriteRestartFile(Mesh *pm, ParameterInput *pin, bool checkpo
     pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
   }
 
+  // Refinement ages live in an optional binary footer.  Keeping only its version
+  // in ParameterInput avoids exceeding the text header size on large AMR meshes.
+  // A footer leaves all existing mesh and fluid payload offsets unchanged.
+  if (pm->adaptive || pin->DoesParameterExist("mesh_refinement", "restart_age_version")) {
+    pin->SetInteger("mesh_refinement", "restart_age_version", pm->adaptive ? 1 : 0);
+  }
+
+  if (pm->pmb_pack->pfast_electrons != nullptr) {
+    pin->SetInteger("fast_electrons", "restart_version", 1);
+  }
+
   // create string holding input parameters (copy of input file)
+  if (pm->pmb_pack->pdt_fusion != nullptr) pin->SetInteger("dt_fusion", "restart_version", 1);
   std::stringstream ost;
   pin->ParameterDump(ost);
   std::string sbuf = ost.str();
@@ -645,6 +659,30 @@ void RestartOutput::WriteRestartFile(Mesh *pm, ParameterInput *pin, bool checkpo
     }
     offset_myrank += nout1*nout2*nout3*nadm*sizeof(Real); // adm u_adm
     myoffset = offset_myrank;
+  }
+
+  if (pm->adaptive && (global_variable::my_rank == 0 || single_file_per_rank)) {
+    const IOWrapperSizeT file_blocks = single_file_per_rank ?
+        pm->nmb_thisrank : pm->nmb_total;
+    const IOWrapperSizeT age_offset = step1size + step2size + step3size +
+        sizeof(IOWrapperSizeT) + data_size*file_blocks;
+    if (resfile.Write_any_type_at(pm->pmr->ncyc_since_ref.data(), pm->nmb_total,
+                                 age_offset, "int", single_file_per_rank) !=
+        static_cast<std::size_t>(pm->nmb_total)) {
+      Kokkos::abort("Could not write AMR refinement ages to restart");
+    }
+  }
+
+  if (pm->pmb_pack->pfast_electrons != nullptr || pm->pmb_pack->pdt_fusion != nullptr) {
+    const IOWrapperSizeT blocks = single_file_per_rank ? pm->nmb_thisrank : pm->nmb_total;
+    IOWrapperSizeT offset = step1size+step2size+step3size+sizeof(IOWrapperSizeT)+
+        data_size*blocks+(pm->adaptive ? pm->nmb_total*sizeof(int) : 0);
+    if (pm->pmb_pack->pdt_fusion != nullptr) {
+      offset = pm->pmb_pack->pdt_fusion->WriteRestart(resfile, offset, single_file_per_rank);
+    }
+    if (pm->pmb_pack->pfast_electrons != nullptr) {
+      pm->pmb_pack->pfast_electrons->WriteRestart(resfile, offset, single_file_per_rank);
+    }
   }
 
   // close file, clean up

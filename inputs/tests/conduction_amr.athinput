@@ -1,0 +1,113 @@
+# Stationary two-temperature heat step on a composite leaf mesh. Kinematic
+# advection with zero velocity isolates electron conduction from fluid dynamics.
+<job>
+basename = conduction_amr
+
+<mesh>
+nghost = 2
+nx1 = 16
+nx2 = 1
+nx3 = 1
+x1min = -0.5
+x1max = 0.5
+x2min = -0.5
+x2max = 0.5
+x3min = -0.5
+x3max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+ix2_bc = periodic
+ox2_bc = periodic
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 1
+nx3 = 1
+
+<mesh_refinement>
+communication_buffers = dynamic
+refinement = static
+num_levels = 2
+refinement_interval = 2
+max_nmb_per_rank = 128
+
+<refined_region1>
+level = 1
+x1min = 0.0
+x1max = 0.5
+x2min = -0.5
+x2max = 0.0
+x3min = -0.5
+x3max = 0.0
+
+<amr_criterion0>
+method = min_max
+variable = hydro_u_d
+value_max = 2.0
+
+<time>
+evolution = kinematic
+integrator = rk2
+cfl_number = 0.4
+nlim = 3
+tlim = 0.07
+initial_dt = 0.01
+align_outputs = false
+ndiag = 1
+
+<hydro>
+eos = ideal
+reconstruct = dc
+rsolver = advect
+gamma = 1.6666666666666667
+two_temperature = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+alpha_iso = 0.5
+conduction_integrator = implicit
+conduction_halo_exchange = packed
+conduction_halo_compact = true
+conduction_linear_tolerance = 1.0e-12
+conduction_nonlinear_tolerance = 1.0e-11
+conduction_max_iterations = 1000
+conduction_report = true
+conduction_x1_inner_boundary = neumann
+conduction_x1_outer_boundary = neumann
+conduction_x1_inner_value = 0.0
+conduction_x1_outer_value = 0.0
+
+<units>
+length_cgs = 1.0
+mass_cgs = 1.0
+time_cgs = 1.0
+mu = 1.0
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.0
+dl = 1.0
+pl = 1.0
+ul = 0.0
+vl = 0.0
+wl = 0.0
+dr = 1.0
+pr = 0.5
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type = bin
+variable = hydro_u
+double_precision_binary = true
+dt = -1
+dcycle = 1
+
+<output2>
+file_type = rst
+dt = -1
+dcycle = 1

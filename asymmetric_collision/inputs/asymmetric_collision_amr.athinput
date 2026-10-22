@@ -1,0 +1,266 @@
+# Density-refined collision with conservative higher-order implicit radiation.
+# Build with make_amr.slurm and launch with run_amr.slurm; see AMR.md.
+# Target: one NVIDIA A100-PCIE-40GB, one MPI rank, double precision.
+# Reserve all 432 possible leaves. Single-rank AMR skips MPI migration storage.
+# Two CH caps: Ti=Te=20 eV, 10 g/cc, 30 um thick; inward 300/200 km/s.
+# Length mm, time ns, density unit 1.1 g/cc; problem parameters carry physical units.
+# Run from a directory containing material_tables/, prepared by make.slurm/run.slurm.
+
+<job>
+basename = asymmetric_collision_amr
+
+<units>
+length_cgs = 1.0e-1
+mass_cgs = 1.1e-3
+time_cgs = 1.0e-9
+mu = 1.4444444444444444
+
+
+# Upper/lower refer to +x1/-x1, the same axis as DCI_3D.
+<mesh>
+nghost = 2
+nx1 = 108
+nx2 = 108
+nx3 = 108
+x1min = -0.15
+x1max = 0.15
+x2min = -0.15
+x2max = 0.15
+x3min = -0.15
+x3max = 0.15
+ix1_bc = outflow
+ox1_bc = outflow
+ix2_bc = outflow
+ox2_bc = outflow
+ix3_bc = outflow
+ox3_bc = outflow
+
+# Two total levels: root dx=2.777778 um, finest dx=1.388889 um (effective 216^3).
+# Check density every cycle; wait at least five cycles between block level changes.
+# The capacity is preallocated and is a HARD ERROR limit, not an AMR limiter.
+# The capacity includes full-domain refinement: 54 root blocks times eight.
+<mesh_refinement>
+refinement = adaptive
+num_levels = 2
+max_nmb_per_rank = 432
+ncycle_check = 1
+refinement_interval = 5
+prolong_primitives = false
+
+# Refine when ANY active cell exceeds 1 g/cc; coarsen below the same threshold
+# when all siblings permit it. value_max is in CODE density: 1 / 1.1 g/cc.
+# Pure shells are 10 g/cc, rear corona 0.01 g/cc, ambient He 1e-5 g/cc.
+# Omit value_min: it is a low-density refinement trigger, not hysteresis.
+<amr_criterion1>
+method = min_max
+variable = hydro_u_d
+value_max = 9.090909090909091e-1
+
+# 6 x 3 x 3 = 54 root blocks; shorter blocks along the collision axis localize AMR.
+# All block dimensions are even, as required by spatial refinement.
+<meshblock>
+nx1 = 18
+nx2 = 36
+nx3 = 36
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.25
+nlim = -1
+tlim = 0.8
+ndiag = 10
+align_outputs = true
+# Resolve the initially cold radiation background before normal timestep growth.
+initial_dt = 1.0e-9
+walltime_restart_only = true
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = llf
+gamma = 1.6666666666666667
+dfloor = 1.0e-8
+pfloor = 1.0e-14
+tfloor = 1.0e-12
+# CH, He, upper-shell CH, lower-shell CH, corona CH. First two enter the EOS.
+nscalars = 5
+two_temperature = true
+dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+electron_heat_capacity_fraction = 0.7777777777777778
+initial_electron_temperature_ratio = 1.0
+t_ei_model = spitzer
+t_ei_coulomb_log = 1.0e1
+t_ei_spitzer_multiplier = 1.0
+t_ei_temperature_floor_kelvin = 1.0
+
+# The gamma-law carrier above uses these tables for the actual material thermodynamics.
+<materials>
+nmaterials = 2
+scalar_index = 0
+material0_name = CH
+material0_abar = 6.5
+material0_zbar = 3.5
+material0_zeff = 5.285714285714286
+
+material1_name = He
+material1_abar = 4.002602
+material1_zbar = 2.0
+material1_zeff = 2.0
+
+material0_eos_table_file = material_tables/ch.2t_eos
+material1_eos_table_file = material_tables/he.2t_eos
+eos_mixing_rule = partial_density_additive
+eos_table_bounds = flash-extrapolate
+eos_table_interpolation = geometric
+
+material0_opacity_table_file = material_tables/ch_20g.opacity
+material1_opacity_table_file = material_tables/he_20g.opacity
+material0_opacity_interpolation = geometric
+material1_opacity_interpolation = geometric
+material0_opacity_coordinate_interpolation = log
+material1_opacity_coordinate_interpolation = log
+material0_opacity_density_scale = 1.1
+material1_opacity_density_scale = 1.1
+material0_opacity_temperature_scale = 1.7372674493486121e8
+material1_opacity_temperature_scale = 1.7372674493486121e8
+material0_opacity_group_bound_scale = 5.756166100820859e-9
+material1_opacity_group_bound_scale = 5.756166100820859e-9
+material0_opacity_transport_scale = 1.1e-1
+material1_opacity_transport_scale = 1.1e-1
+material0_opacity_absorption_scale = 1.1e-1
+material1_opacity_absorption_scale = 1.1e-1
+material0_opacity_emission_scale = 1.1e-1
+material1_opacity_emission_scale = 1.1e-1
+
+# 20-group implicit FLD, physical light speed, nonlinear electron/radiation exchange.
+# Initial radiation is a cold 1 eV background, not in equilibrium with the hot shells.
+<thermal_radiation>
+enabled = true
+n_groups = 20
+arad = 6.265030089603521e2
+# Physical light speed in mm/ns.  Frozen-coefficient backward-Euler FLD removes the
+# explicit dx/c transport restriction without changing emission or absorption rates.
+c_light = 2.99792458e2
+initial_radiation_temperature = 6.680606376612690e-5
+flux_limiter = harmonic
+flux_limit_coefficient = 1.0
+transport_discretization = asymptotic-preserving
+transport_integrator = implicit
+implicit_preconditioner = amr-aggregate
+implicit_amr_order = 2
+implicit_gmres_restart = 30
+implicit_gmres_metric = volume
+implicit_amr_inner_iterations = 1000
+implicit_amr_inner_norm = volume
+# Relaxed, run-wide transport tolerance for the preliminary illustration run.
+implicit_tolerance = 1.0e-7
+implicit_max_iterations = 10000
+implicit_report = false
+implicit_x1_inner_boundary = vacuum
+implicit_x1_outer_boundary = vacuum
+implicit_x2_inner_boundary = vacuum
+implicit_x2_outer_boundary = vacuum
+implicit_x3_inner_boundary = vacuum
+implicit_x3_outer_boundary = vacuum
+ap_streaming_threshold = 5.0e-1
+ap_optical_depth_threshold = 1.0
+# Both transport and matter-radiation sources are implicit. Disable the radiation
+# source timestep guard too: radiation contributes no timestep restriction.
+# Hydrodynamic CFL, the initial-step cap, growth limit, and output alignment remain.
+source_integrator = nonlinear
+source_report = false
+source_cfl = 0.0
+couple_matter = true
+opacity_model = mixed-table
+group_bound_0 = 6.679753382762794e-5
+group_bound_1 = 6.679753382762794e-4
+group_bound_2 = 3.339876691381397e-3
+group_bound_3 = 6.679753382762794e-3
+group_bound_4 = 1.001963007414419e-2
+group_bound_5 = 1.669938345690699e-2
+group_bound_6 = 2.671901353105118e-2
+group_bound_7 = 3.673864360519537e-2
+group_bound_8 = 4.675827367933956e-2
+group_bound_9 = 6.011778044486515e-2
+group_bound_10 = 8.015704059315353e-2
+group_bound_11 = 1.068760541242047e-1
+group_bound_12 = 1.335950676552559e-1
+group_bound_13 = 1.469545744207815e-1
+group_bound_14 = 1.603140811863071e-1
+group_bound_15 = 1.736735879518326e-1
+group_bound_16 = 1.870330947173582e-1
+group_bound_17 = 2.070723548656466e-1
+group_bound_18 = 2.337913683966978e-1
+group_bound_19 = 2.671901353105118e-1
+group_bound_20 = 6.679753382762794e-1
+
+# Initial snapshot after the drive has ended: no laser and no stationary Au cones.
+<problem>
+user_hist = true
+shell_density_gcc = 10.0
+ambient_density_gcc = 1.0e-5
+shell_temperature_ev = 20.0
+# Rear CH background from Yang et al. (2022), DOI 10.7498/aps.71.20220948, Sec. 3.
+# Stationary Ti=Te=1000 eV CH at 0.01 g/cc, behind r=135/95 um upper/lower,
+# within the same cap half-angle, extending to the box boundaries.
+corona_enabled = true
+corona_density_gcc = 0.01
+corona_temperature_ev = 1000.0
+# Same 11606 K ambient as DCI_3D, just above the He EOS lower temperature edge.
+ambient_temperature_ev = 1.0001276984045693
+upper_radius_um = 120.0
+lower_radius_um = 80.0
+shell_thickness_um = 30.0
+upper_speed_kms = 300.0
+lower_speed_kms = 200.0
+opening_half_angle_deg = 50.0
+# Compact smoothing around each interface, with exact pure-shell plateaus.
+# Nominal radial interfaces: upper [105,135] um, lower [65,95] um.
+interface_half_width_um = 0.5
+angular_half_width = 0.01
+
+<output1>
+file_type = hst
+user_hist_only = true
+data_format = %20.12e
+dt = 0.005
+
+<output2>
+file_type = bin
+atomic_write = true
+variable = fluid_w
+id = fluid_xy
+slice_x3 = 0.0
+dt = 0.01
+
+<output3>
+file_type = bin
+atomic_write = true
+variable = fluid_3t
+id = three_t_xy
+slice_x3 = 0.0
+dt = 0.01
+
+<output4>
+file_type = bin
+atomic_write = true
+variable = fluid_w
+id = fluid
+single_file_per_rank = false
+dt = 0.1
+
+<output5>
+file_type = bin
+atomic_write = true
+variable = fluid_3t
+id = three_t
+single_file_per_rank = false
+dt = 0.1
+
+<output6>
+file_type = rst
+atomic_write = true
+dt = 0.1

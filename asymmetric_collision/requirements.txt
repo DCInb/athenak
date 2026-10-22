@@ -1,0 +1,6 @@
+numpy
+matplotlib
+Pillow
+av
+pytest
+h5py

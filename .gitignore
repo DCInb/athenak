@@ -21,3 +21,22 @@ tst/test_log.txt
 *~
 *.swp
 Lorene
+
+# server-specific files
+A100/
+
+# Generated binaries, caches, and batch output
+*.o
+*.a
+*.so
+*.so.*
+*.pyc
+.pytest_cache/
+slurm-*.out*
+mesh_structure.dat
+
+# Local experiment histories and generated material tables
+/DCI_3D/performance/
+/docs/data/
+/DCI_integrate/material_tables/
+/asymmetric_collision/material_tables/

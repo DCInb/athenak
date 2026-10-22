@@ -107,7 +107,7 @@ void ParameterInput::CheckBlockNames() {
     "hydro", "mhd", "ion-neutral", "radiation", "thermal_radiation",
     "z4c", "z4c_amr", "cce",
     "rad_srcterms", "hydro_srcterms", "mhd_srcterms", "particles", "turb_driving",
-    "fastflow", "laser", "materials"
+    "fastflow", "laser", "materials", "fast_electrons", "dt_fusion"
     };
 
   for (auto it1 = block.begin(); it1 != block.end(); ++it1) {
@@ -213,6 +213,10 @@ void ParameterInput::LoadFromStream(std::istream &is) {
 void ParameterInput::LoadFromFile(IOWrapper &input, bool single_file_per_rank) {
   std::stringstream par;
   constexpr int kBufSize = 4096;
+  // AMR region lists plus parameters added at runtime can make a valid restart
+  // header much larger than its input deck. Keep a bounded scan for damaged files,
+  // while allowing these expanded headers (the DCI AMR case exceeds 50 KiB).
+  constexpr IOWrapperSizeT kMaxHeaderSize = 1024*1024;
   char buf[kBufSize];
   IOWrapperSizeT header = 0, ret, loc;
 
@@ -239,9 +243,9 @@ void ParameterInput::LoadFromFile(IOWrapper &input, bool single_file_per_rank) {
       header = loc + 10; // store the header length
       break;
     }
-    if (header > kBufSize*10) {
+    if (header > kMaxHeaderSize) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<par_end> is not found in the first 40KBytes."
+                << std::endl << "Parameter header exceeds 1 MiB before <par_end> or EOF."
                 << std::endl << "Probably the file is broken or the wrong file is "
                 << "specified" << std::endl;
       std::exit(EXIT_FAILURE);

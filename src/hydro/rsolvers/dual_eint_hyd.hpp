@@ -21,8 +21,8 @@ void UpwindDualEnergyVelocity(TeamMember_t const &member, const EOS_Data &eos,
                               const int il, const int iu,
                               const ScrArray2D<Real> &wl,
                               const ScrArray2D<Real> &wr,
-                              DvceArray5D<Real> flx,
-                              DvceArray5D<Real> vf) {
+                              BandView5D<Real> flx,
+                              BandView5D<Real> vf) {
   par_for_inner(member, il, iu, [&](const int i) {
     const Real mass_flux = flx(m, IDN, k, j, i);
     if (mass_flux > 0.0) {

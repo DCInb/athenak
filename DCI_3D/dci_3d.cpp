@@ -14,14 +14,17 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
+#include "globals.hpp"
 #include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
 #include "materials/material_mixture.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/mesh_refinement.hpp"
 #include "eos/eos.hpp"
 #include "mhd/biermann_battery.hpp"
 #include "mhd/mhd.hpp"
@@ -31,6 +34,7 @@
 #include "two_temperature/thermal_radiation.hpp"
 #include "two_temperature/two_temperature.hpp"
 #include "units/units.hpp"
+#include "dci_amr.hpp"
 
 namespace {
 
@@ -38,6 +42,9 @@ constexpr int kHistoryFields = 22;
 
 void DCIHistory(HistoryData *pdata, Mesh *pm);
 void VacuumRadiationBoundary(Mesh *pm);
+void DCIRefinement(MeshBlockPack *pmbp);
+
+DCIAMRPolicy dci_amr{};
 
 [[noreturn]] void ProblemError(const char *message) {
   std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
@@ -64,7 +71,7 @@ struct DCIFluid {
   bool use_dual_energy = false;
   int nuser_scalars = 0;
   DvceArray5D<Real> u0, w0;
-  DvceArray5D<Real> flx1, flx2, flx3;
+  BandView5D<Real> flx1, flx2, flx3;
   DvceArray5D<Real> bcc0;
   DvceArray4D<Real> b0x1f, b0x2f, b0x3f;
 };
@@ -85,9 +92,9 @@ DCIFluid SelectFluid(MeshBlockPack *pmbp) {
     fluid.nuser_scalars = pmhd->nuser_scalars;
     fluid.u0 = pmhd->u0;
     fluid.w0 = pmhd->w0;
-    fluid.flx1 = pmhd->uflx.x1f;
-    fluid.flx2 = pmhd->uflx.x2f;
-    fluid.flx3 = pmhd->uflx.x3f;
+    fluid.flx1 = MakeBandView(pmhd->uflx.x1f);
+    fluid.flx2 = MakeBandView(pmhd->uflx.x2f);
+    fluid.flx3 = MakeBandView(pmhd->uflx.x3f);
     fluid.bcc0 = pmhd->bcc0;
     fluid.b0x1f = pmhd->b0.x1f;
     fluid.b0x2f = pmhd->b0.x2f;
@@ -101,13 +108,88 @@ DCIFluid SelectFluid(MeshBlockPack *pmbp) {
     fluid.nuser_scalars = phydro->nuser_scalars;
     fluid.u0 = phydro->u0;
     fluid.w0 = phydro->w0;
-    fluid.flx1 = phydro->uflx.x1f;
-    fluid.flx2 = phydro->uflx.x2f;
-    fluid.flx3 = phydro->uflx.x3f;
+    fluid.flx1 = phydro->FluxBand(phydro->uflx.x1f);
+    fluid.flx2 = phydro->FluxBand(phydro->uflx.x2f);
+    fluid.flx3 = phydro->FluxBand(phydro->uflx.x3f);
   } else {
     ProblemError("dci_3d requires an <mhd> or <hydro> block");
   }
   return fluid;
+}
+
+// Read on both fresh starts and restarts: the callback and thresholds are runtime data.
+bool ConfigureDCIRefinement(ParameterInput *pin, Mesh *pm) {
+  if (!pm->adaptive) return false;
+  bool configured = false;
+  int ncriteria = 0;
+  const int max_level = pm->max_level-pm->root_level;
+  for (const auto &block : pin->block) {
+    if (block.block_name.compare(0, 13, "amr_criterion") != 0) continue;
+    ++ncriteria;
+    if (pin->GetString(block.block_name, "method") != "user") continue;
+    if (configured) ProblemError("dci_3d accepts only one material-aware user criterion");
+    const auto &name = block.block_name;
+    dci_amr.density_threshold = pin->GetOrAddReal(
+        name, "value_max", 1.0/pm->pmb_pack->punit->density_cgs());
+    dci_amr.dense_level = pin->GetOrAddInteger(name, "dense_level", 2);
+    dci_amr.ch_level = pin->GetOrAddInteger(name, "ch_level", max_level);
+    dci_amr.gold_level = pin->GetOrAddInteger(name, "gold_level", 2);
+    if (!std::isfinite(dci_amr.density_threshold) || !(dci_amr.density_threshold > 0.0) ||
+        dci_amr.density_threshold >= std::numeric_limits<float>::max()) {
+      ProblemError("DCI AMR value_max must be a finite positive density in code units");
+    }
+    for (const int level : {dci_amr.dense_level, dci_amr.ch_level, dci_amr.gold_level}) {
+      if (level < 0 || level > max_level) {
+        ProblemError("DCI AMR dense_level/ch_level/gold_level must lie between 0 and "
+                     "mesh_refinement/num_levels-1");
+      }
+    }
+    configured = true;
+  }
+  if (configured && ncriteria != 1) {
+    ProblemError("Use the DCI material criterion by itself; it sets all target levels");
+  }
+  return configured;
+}
+
+// A block follows its most demanding cell. The mesh's ordinary 2:1 balancing and
+// refinement_interval still apply; neither the shell nor the cone is tied to a fixed box.
+void DCIRefinement(MeshBlockPack *pmbp) {
+  const auto fluid = SelectFluid(pmbp);
+  if (fluid.pmaterials == nullptr || fluid.pmaterials->NumberOfMaterials() != 3) {
+    ProblemError("DCI material refinement requires the CH/Au/He scalar fields");
+  }
+  const int scalar = fluid.pmaterials->ScalarIndex();
+  const auto u = fluid.u0;
+  const auto policy = dci_amr;
+  const auto indcs = pmbp->pmesh->mb_indcs;
+  const int nji = indcs.nx1*indcs.nx2;
+  const int ncell = nji*indcs.nx3;
+  const int root_level = pmbp->pmesh->root_level;
+  const int first_gid = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
+  auto levels = pmbp->pmb->mb_lev.d_view;
+  auto &flags = pmbp->pmesh->pmr->refine_flag;
+  auto flag = flags.d_view;
+  par_for_outer("dci_material_refinement", DevExeSpace(), 0, 0, 0,
+                pmbp->nmb_thispack-1,
+  KOKKOS_LAMBDA(TeamMember_t team, const int m) {
+    int target = 0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(team, ncell),
+    [=](const int index, int &wanted) {
+      const int k = index/nji+indcs.ks;
+      const int j = (index%nji)/indcs.nx1+indcs.js;
+      const int i = index%indcs.nx1+indcs.is;
+      const int cell_target = policy.TargetLevel(
+          u(m, IDN, k, j, i), u(m, scalar, k, j, i), u(m, scalar+1, k, j, i));
+      wanted = cell_target > wanted ? cell_target : wanted;
+    }, Kokkos::Max<int>(target));
+    Kokkos::single(Kokkos::PerTeam(team), [&]() {
+      const int current = levels(m)-root_level;
+      flag(m+first_gid) = target > current ? 1 : (target < current ? -1 : 0);
+    });
+  });
+  flags.template modify<DevExeSpace>();
+  flags.template sync<HostMemSpace>();
 }
 
 } // namespace
@@ -130,6 +212,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // Fluid faces use ordinary outflow flags.  Force the post-physical-BC callback so it
   // can replace only the embedded FLD group ghost cells with a vacuum state.
   user_bcs = true;
+  if (ConfigureDCIRefinement(pin, pmy_mesh_)) user_ref_func = DCIRefinement;
   if (restart) return;
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;

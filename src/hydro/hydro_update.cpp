@@ -36,9 +36,9 @@ TaskStatus Hydro::RKUpdate(Driver *pdriver, int stage) {
   int nvar = nhydro + nscalars;
   auto u0_ = u0;
   auto u1_ = u1;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto &mbsize = pmy_pack->pmb->mb_size;
 
   // hierarchical parallel loop that updates conserved variables to intermediate step

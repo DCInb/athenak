@@ -15,6 +15,24 @@
 #include "mesh/mesh.hpp"
 #include "coordinates/cell_locations.hpp"
 
+// A scalar Krylov field may have a large common offset and tiny differences.
+// Restrict the differences, then restore the offset, so constant modes survive
+// exactly even when a stiff diffusion coefficient amplifies a one-ulp error.
+KOKKOS_INLINE_FUNCTION
+Real RestrictLinearAverage(const DvceArray5D<Real> &a, int m, int v,
+                          int k, int j, int i, bool multi_d, bool three_d) {
+  const Real center = a(m, v, k, j, i);
+  Real correction = 0.0;
+  for (int dk = 0; dk < (three_d ? 2 : 1); ++dk) {
+    for (int dj = 0; dj < (multi_d ? 2 : 1); ++dj) {
+      for (int di = 0; di < 2; ++di) {
+        correction += a(m, v, k+dk, j+dj, i+di)-center;
+      }
+    }
+  }
+  return center+(three_d ? 0.125 : (multi_d ? 0.25 : 0.5))*correction;
+}
+
 template <int NGHOST>
 KOKKOS_INLINE_FUNCTION
 Real RestrictInterpolation(const int m, const int v, const int fk, const int fj,

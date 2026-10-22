@@ -9,10 +9,13 @@
 //! \brief Contains data and functions that implement various formulations for conduction.
 //  Currently only isotropic conduction implemented
 
+#include <cstddef>
 #include <string>
 
 #include "athena.hpp"
 #include "parameter_input.hpp"
+
+namespace diffusion { class NativeDiffusionSolver; }
 
 class MeshBlockPack;
 class MeshBoundaryValuesCC;
@@ -22,6 +25,7 @@ class MaterialMixture;
 }
 namespace two_temperature {
 class TwoTemperature;
+class ImplicitRadiationHalo;
 }
 
 //----------------------------------------------------------------------------------------
@@ -51,13 +55,13 @@ class Conduction {
 
   // functions
   void AddHeatFluxes(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                     DvceFaceFld5D<Real> &f);
+                     DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void AddHeatFluxIso(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                      DvceFaceFld5D<Real> &f);
+                      DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void AddHeatFluxAniso(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                        DvceFaceFld5D<Real> &f);
+                        DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void AddHeatFluxSpitzer(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                          DvceFaceFld5D<Real> &f);
+                          DvceFaceFld5D<Real> &f, FaceFldOrigin origin = {});
   void NewTimeStep(const DvceArray5D<Real> &w, const EOS_Data &eos_data);
   void SolveImplicit(Real dt, DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
                      MeshBoundaryValuesCC *pbval,
@@ -71,6 +75,13 @@ class Conduction {
   materials::MaterialMixture *pmaterials_ = nullptr;
   bool implicit_ = false;
   bool report_ = false;
+  bool native_mg_ = false, native_device_mpi_ = false;
+  std::size_t native_max_bytes_ = 1024ULL*1024*1024;
+  diffusion::NativeDiffusionSolver *native_solver_ = nullptr;
+  // Shared scalar halo: 0=legacy, 1=packed device, 2=packed host staging.
+  int halo_exchange_ = 1;
+  bool compact_halo_ = true;
+  two_temperature::ImplicitRadiationHalo *implicit_halo_ = nullptr;
   Real theta_ = 1.0;
   Real linear_tolerance_ = 1.0e-10;
   Real nonlinear_tolerance_ = 1.0e-8;
@@ -103,15 +114,30 @@ class Conduction {
   DvceArray5D<Real> operator_direction_;
   DvceArray5D<Real> correction_;
   DvceArray5D<Real> coarse_scratch_;
+  // Frozen positive face graph and its refluxed diagonal on a composite leaf mesh.
+  MeshBoundaryValuesCC *implicit_bvals_ = nullptr;
+  DvceFaceFld5D<Real> amr_conductance_{"cond_amr_conductance", 0, 0, 0, 0, 0};
+  DvceFaceFld5D<Real> amr_flux_{"cond_amr_flux", 0, 0, 0, 0, 0};
+  // Only faces surrounding active cells are used by the operator and reflux.
+  FaceFldOrigin amr_face_origin_;
+  BandView5D<Real> AMRFaceBand(const DvceArray5D<Real> &face) const {
+    return MakeBandView(face, amr_face_origin_);
+  }
+  DvceArray5D<Real> amr_diagonal_;
 
  public:
   // Public because nvcc requires any member enclosing an extended device lambda to have
   // public access.  These remain implementation details of SolveImplicit().
   void ExchangeSolverField(DvceArray5D<Real> &field,
                            MeshBoundaryValuesCC *pbval,
-                           bool homogeneous_boundary);
+                           bool homogeneous_boundary, bool coefficient_field = false,
+                           bool full_halo = false);
   void ApplyPhysicalBoundaries(DvceArray5D<Real> &field,
-                               bool homogeneous_boundary);
+                               bool homogeneous_boundary, bool coefficient_field = false);
+  void BuildAMROperator();
+  void ApplyAMRDiffusionOperator(const DvceArray5D<Real> &field,
+                                DvceArray5D<Real> &result);
+  void RefluxAMRFluxes();
   void ApplyDiffusionOperator(const DvceArray5D<Real> &field,
                               DvceArray5D<Real> &result);
   void ApplyJacobian(const DvceArray5D<Real> &field,

@@ -467,7 +467,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     deck.write_text(
         "<mesh>\nx1min = -0.45\nx1max = 0.75\nx2min = -0.6\nx2max = 0.6\n"
         "x3min = -0.6\nx3max = 0.6\n"
-        "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
+        f"<thermal_radiation>\nc_light = {gate.PRODUCTION_C_LIGHT}\nn_groups = 20\n"
         "<laser>\nnbeams = 4\npulse0_nsections = 2\n"
         "pulse0_time_0 = 0\npulse0_time_1 = 1\n"
         "pulse0_power_0 = 1.77455e19\npulse0_power_1 = 1.77455e19\n"
@@ -719,7 +719,7 @@ def test_all_checks_are_derived_from_artifacts(tmp_path, monkeypatch):
     deck.write_text(
         "<mesh>\nx1min = -0.45\nx1max = 0.75\nx2min = -0.6\nx2max = 0.6\n"
         "x3min = -0.6\nx3max = 0.6\n"
-        "<thermal_radiation>\nc_light = 30\nn_groups = 20\n"
+        f"<thermal_radiation>\nc_light = {gate.PRODUCTION_C_LIGHT}\nn_groups = 20\n"
         "<laser>\nnbeams = 4\npulse0_nsections = 2\n"
         "pulse0_time_0 = 0\npulse0_time_1 = 1\n"
         "pulse0_power_0 = 1.77455e19\npulse0_power_1 = 1.77455e19\n"

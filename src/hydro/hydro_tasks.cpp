@@ -20,12 +20,14 @@
 #include "eos/eos.hpp"
 #include "diffusion/viscosity.hpp"
 #include "diffusion/conduction.hpp"
+#include "driver/driver.hpp"
 #include "srcterms/srcterms.hpp"
 #include "bvals/bvals.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "hydro/hydro.hpp"
 #include "two_temperature/two_temperature.hpp"
+#include "two_temperature/thermal_radiation.hpp"
 
 namespace hydro {
 //----------------------------------------------------------------------------------------
@@ -196,13 +198,13 @@ TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
 
   // Add diffusion fluxes
   if (pcond != nullptr && !pcond->IsImplicit()) {
-    pcond->AddHeatFluxes(w0, peos->eos_data, uflx);
+    pcond->AddHeatFluxes(w0, peos->eos_data, uflx, FluxOrigin());
   }
   if (pvisc != nullptr) {
-    pvisc->AddViscousFluxes(w0, peos->eos_data, uflx);
+    pvisc->AddViscousFluxes(w0, peos->eos_data, uflx, FluxOrigin());
   }
   if (ptwo_temp != nullptr) {
-    ptwo_temp->AddRadiationFluxes(w0, uflx);
+    ptwo_temp->AddRadiationFluxes(w0, uflx, FluxOrigin());
   }
 
   // call FOFC if necessary
@@ -227,7 +229,7 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
   // Only execute BoundaryVaLUES function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
     tstat = pbval_u->PackAndSendFluxCC(uflx,
-        use_dual_energy ? &dual_vf : nullptr);
+        use_dual_energy ? &dual_vf : nullptr, FluxOrigin());
   }
   return tstat;
 }
@@ -242,7 +244,7 @@ TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
   // Only execute BoundaryValues function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
     tstat = pbval_u->RecvAndUnpackFluxCC(uflx,
-        use_dual_energy ? &dual_vf : nullptr);
+        use_dual_energy ? &dual_vf : nullptr, FluxOrigin());
   }
   return tstat;
 }
@@ -451,6 +453,13 @@ TaskStatus Hydro::TwoTempExchange(Driver *pdrive, int stage) {
       pmy_pack->pmesh->dt, u0, w0, pbval_u);
   ptwo_temp->Exchange(pmy_pack->pmesh->dt, u0, w0,
                       0, n1m1, 0, n2m1, 0, n3m1);
+  if (pmy_pack->pmesh->multilevel &&
+      ((pcond != nullptr && pcond->IsImplicit()) ||
+       (ptwo_temp->pradiation != nullptr && ptwo_temp->pradiation->IsImplicit()))) {
+    // Split transport and sources change interiors after the last stage halo. Refresh
+    // the coarse state before AMR derefinement and ghosts before the next flux sweep.
+    pdrive->InitBoundaryValuesAndPrimitives(pmy_pack->pmesh);
+  }
   return NewTimeStep(pdrive, pdrive->nexp_stages);
 }
 

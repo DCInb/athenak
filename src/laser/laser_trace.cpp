@@ -36,46 +36,33 @@ constexpr Real kRealMaximum = FLT_MAX;
 constexpr Real kRealMaximum = DBL_MAX;
 #endif
 
+// Each atomic returns the exact predecessor in the serialized addition order.
+// Recover that addition's rounding error with TwoSum and accumulate it separately.
+// Only the much smaller error sum retains an order-dependent O(epsilon^2) error.
 KOKKOS_INLINE_FUNCTION
-bool ContainsPoint(const RegionSize &size, Real x, Real y, Real z,
-                   bool multi_d, bool three_d) {
-  bool inside = (x >= size.x1min && x < size.x1max);
-  if (multi_d) inside = inside && (y >= size.x2min && y < size.x2max);
-  if (three_d) inside = inside && (z >= size.x3min && z < size.x3max);
-  return inside;
-}
-
-KOKKOS_INLINE_FUNCTION
-int FindLocalBlock(const DvceArray1D<RegionSize> &sizes, int nmb,
-                   Real x, Real y, Real z, bool multi_d, bool three_d) {
-  for (int m = 0; m < nmb; ++m) {
-    if (ContainsPoint(sizes(m), x, y, z, multi_d, three_d)) return m;
-  }
-  return -1;
-}
-
-KOKKOS_INLINE_FUNCTION
-bool ContainsPoint(const laser::LaserBlockInfo &block, Real x, Real y, Real z,
-                   bool multi_d, bool three_d) {
-  bool inside = (x >= block.x1min && x < block.x1max);
-  if (multi_d) inside = inside && (y >= block.x2min && y < block.x2max);
-  if (three_d) inside = inside && (z >= block.x3min && z < block.x3max);
-  return inside;
-}
-
-KOKKOS_INLINE_FUNCTION
-int FindGlobalBlock(const DvceArray1D<laser::LaserBlockInfo> &blocks, int nmb,
-                    Real x, Real y, Real z, bool multi_d, bool three_d) {
-  for (int gid = 0; gid < nmb; ++gid) {
-    if (ContainsPoint(blocks(gid), x, y, z, multi_d, three_d)) return gid;
-  }
-  return -1;
+void AccumulateDeposition(Real *sum, Real *roundoff, const Real value) {
+  const Real previous = Kokkos::atomic_fetch_add(sum, value);
+  const Real rounded = previous+value;
+  const Real error = fabs(previous) >= fabs(value)
+      ? (previous-rounded)+value : (value-rounded)+previous;
+  Kokkos::atomic_add(roundoff, error);
 }
 
 KOKKOS_INLINE_FUNCTION
 int ActiveCellIndex(Real x, Real xmin, Real dx, int is, int ie) {
   int index = is + static_cast<int>(floor((x-xmin)/dx));
   return (index < is) ? is : ((index > ie) ? ie : index);
+}
+
+// Block ownership uses the stored endpoints. Reconstructing an outer face as
+// xmin + ncells*dx can differ from xmax under fused arithmetic, especially at
+// zero. A nearly tangent ray can then repeatedly hit a face still inside the
+// departing block, even though its forward probe moves by a representable value.
+KOKKOS_INLINE_FUNCTION
+Real CellFace(int face, int ncells, Real xmin, Real xmax, Real dx) {
+  if (face == 0) return xmin;
+  if (face == ncells) return xmax;
+  return xmin + face*dx;
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -288,10 +275,10 @@ void Laser::BuildInitialRays() {
 void Laser::InitializeRays() {
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
-  auto global_blocks = global_block_info_;
+  auto block_tree = global_block_tree_;
   auto &indcs = pmy_pack_->pmesh->mb_indcs;
   int nmb = pmy_pack_->nmb_thispack;
-  int nmb_total = pmy_pack_->pmesh->nmb_total;
+  int first_gid = pmy_pack_->gids;
   int my_rank = global_variable::my_rank;
   bool multi_d = pmy_pack_->pmesh->multi_d;
   bool three_d = pmy_pack_->pmesh->three_d;
@@ -329,6 +316,8 @@ void Laser::InitializeRays() {
   auto thermodynamics = FluidThermodynamics();
   auto wavelength = ray_wavelength_;
   bool refractive = propagation_model_ == PropagationModel::refractive;
+  const bool check_cutoff = refractive || critical_reflection_ ||
+                            absorption_model_ == AbsorptionModel::inverse_bremsstrahlung;
   Real number_scale = density_scale_cgs_*electron_number_per_gram_;
   Real length_scale = length_scale_cgs_;
   bool use_materials = use_material_mixture_;
@@ -360,10 +349,10 @@ void Laser::InitializeRays() {
         Real px = ProbeForward(x(r), nx(r), probe_eps);
         Real py = ProbeForward(y(r), ny(r), probe_eps);
         Real pz = ProbeForward(z(r), nz(r), probe_eps);
-        int m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+        int m = FindLocalBlock(block_tree, first_gid, nmb, px, py, pz, multi_d, three_d);
         if (m < 0) {
           int global_m = FindGlobalBlock(
-              global_blocks, nmb_total, px, py, pz, multi_d, three_d);
+              block_tree, px, py, pz, multi_d, three_d);
           if (global_m < 0 && my_rank == 0) {
             status(r) = static_cast<int>(RayStatus::escaped);
             Kokkos::atomic_add(&diag(0), power(r));
@@ -381,7 +370,7 @@ void Laser::InitializeRays() {
           ck(r) = ActiveCellIndex(pz, sizes(m).x3min, sizes(m).dx3, ks, ke);
         }
         Real wave_magnitude = 1.0;
-        if (refractive) {
+        if (check_cutoff) {
           int ii = ci(r), jj = cj(r), kk = ck(r);
           Real center_x = sizes(m).x1min + (ii-is+0.5)*sizes(m).dx1;
           Real center_y = sizes(m).x2min + (jj-js+0.5)*sizes(m).dx2;
@@ -404,6 +393,7 @@ void Laser::InitializeRays() {
                           (2.0*sizes(m).dx1);
             Real hess_x = (electron_density_p-2.0*electron_density_center+
                            electron_density_m)/SQR(sizes(m).dx1);
+            if (!refractive) hess_x = 0.0;
             Real reconstructed_density = electron_density_center+
                 grad_x*offset_x+0.5*hess_x*SQR(offset_x);
             if (multi_d) {
@@ -417,6 +407,7 @@ void Laser::InitializeRays() {
                             (2.0*sizes(m).dx2);
               Real hess_y = (electron_density_p-2.0*electron_density_center+
                              electron_density_m)/SQR(sizes(m).dx2);
+              if (!refractive) hess_y = 0.0;
               reconstructed_density +=
                   grad_y*offset_y+0.5*hess_y*SQR(offset_y);
             }
@@ -431,6 +422,7 @@ void Laser::InitializeRays() {
                             (2.0*sizes(m).dx3);
               Real hess_z = (electron_density_p-2.0*electron_density_center+
                              electron_density_m)/SQR(sizes(m).dx3);
+              if (!refractive) hess_z = 0.0;
               reconstructed_density +=
                   grad_z*offset_z+0.5*hess_z*SQR(offset_z);
             }
@@ -442,6 +434,7 @@ void Laser::InitializeRays() {
                            primitive(m, IDN, kk, jj, ii-1))/(2.0*sizes(m).dx1);
             Real hess_x = (primitive(m, IDN, kk, jj, ii+1)-2.0*density+
                            primitive(m, IDN, kk, jj, ii-1))/SQR(sizes(m).dx1);
+            if (!refractive) hess_x = 0.0;
             Real reconstructed_density =
                 density+grad_x*offset_x+0.5*hess_x*SQR(offset_x);
             if (multi_d) {
@@ -449,6 +442,7 @@ void Laser::InitializeRays() {
                              primitive(m, IDN, kk, jj-1, ii))/(2.0*sizes(m).dx2);
               Real hess_y = (primitive(m, IDN, kk, jj+1, ii)-2.0*density+
                              primitive(m, IDN, kk, jj-1, ii))/SQR(sizes(m).dx2);
+              if (!refractive) hess_y = 0.0;
               reconstructed_density +=
                   grad_y*offset_y+0.5*hess_y*SQR(offset_y);
             }
@@ -457,6 +451,7 @@ void Laser::InitializeRays() {
                              primitive(m, IDN, kk-1, jj, ii))/(2.0*sizes(m).dx3);
               Real hess_z = (primitive(m, IDN, kk+1, jj, ii)-2.0*density+
                              primitive(m, IDN, kk-1, jj, ii))/SQR(sizes(m).dx3);
+              if (!refractive) hess_z = 0.0;
               reconstructed_density +=
                   grad_z*offset_z+0.5*hess_z*SQR(offset_z);
             }
@@ -465,11 +460,15 @@ void Laser::InitializeRays() {
           Real critical_density = CriticalDensity(wavelength(r)*length_scale);
           Real normalized_density = electron_density/critical_density;
           if (!(normalized_density >= 0.0 && normalized_density < 1.0)) {
+            // A launch inside the evanescent region has no propagating ray or
+            // resolved incident surface normal. Reject it before depositing power.
+            // The IB roundoff cap must not turn this invalid launch into absorption.
             status(r) = static_cast<int>(RayStatus::failed);
             Kokkos::atomic_inc(&counters(3));
+            Kokkos::atomic_inc(&counters(8));
             return;
           }
-          wave_magnitude = sqrt(1.0-normalized_density);
+          if (refractive) wave_magnitude = sqrt(1.0-normalized_density);
         }
         wave_x(r) = wave_magnitude*nx(r);
         wave_y(r) = wave_magnitude*ny(r);
@@ -568,7 +567,6 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
   int nmb = pmy_pack_->nmb_thispack;
-  int nmb_total = pmy_pack_->pmesh->nmb_total;
   int first_gid = pmy_pack_->gids;
   int my_rank = global_variable::my_rank;
   bool multi_d = pmy_pack_->pmesh->multi_d;
@@ -576,6 +574,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
   auto global_blocks = global_block_info_;
+  auto block_tree = global_block_tree_;
   RegionSize domain = pmy_pack_->pmesh->mesh_size;
   Real machine_eps = std::numeric_limits<Real>::epsilon();
   Real infinite = std::numeric_limits<Real>::max();
@@ -590,6 +589,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
   auto reflection_armed = ray_reflection_armed_;
   auto last_turning_density = ray_last_turning_density_;
   auto path = ray_path_length_; auto data = cell_data;
+  auto deposition_roundoff = cumulative_energy_start_;
   auto diag = device_diagnostics_; auto counters = device_counters_;
   auto primitive = FluidPrim();
   auto temperature = FluidTemperature();
@@ -650,27 +650,33 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
 
             Real sx = infinite, sy = infinite, sz = infinite;
             if (nx(r) > 0.0) {
-              Real face = size.x1min + (i-is+1)*size.dx1;
+              Real face = CellFace(i-is+1, ie-is+1,
+                  size.x1min, size.x1max, size.dx1);
               sx = (face-x(r))/nx(r);
             } else if (nx(r) < 0.0) {
-              Real face = size.x1min + (i-is)*size.dx1;
+              Real face = CellFace(i-is, ie-is+1,
+                  size.x1min, size.x1max, size.dx1);
               sx = (face-x(r))/nx(r);
             }
             if (multi_d) {
               if (ny(r) > 0.0) {
-                Real face = size.x2min + (j-js+1)*size.dx2;
+                Real face = CellFace(j-js+1, je-js+1,
+                  size.x2min, size.x2max, size.dx2);
                 sy = (face-y(r))/ny(r);
               } else if (ny(r) < 0.0) {
-                Real face = size.x2min + (j-js)*size.dx2;
+                Real face = CellFace(j-js, je-js+1,
+                  size.x2min, size.x2max, size.dx2);
                 sy = (face-y(r))/ny(r);
               }
             }
             if (three_d) {
               if (nz(r) > 0.0) {
-                Real face = size.x3min + (k-ks+1)*size.dx3;
+                Real face = CellFace(k-ks+1, ke-ks+1,
+                  size.x3min, size.x3max, size.dx3);
                 sz = (face-z(r))/nz(r);
               } else if (nz(r) < 0.0) {
-                Real face = size.x3min + (k-ks)*size.dx3;
+                Real face = CellFace(k-ks, ke-ks+1,
+                  size.x3min, size.x3max, size.dx3);
                 sz = (face-z(r))/nz(r);
               }
             }
@@ -694,6 +700,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               Real ne_p;
               Real ne_m;
               Real grad_x;
+              Real density_roundoff_scale;
               if (use_materials) {
                 ne_center = MaterialElectronDensityCgs(
                     primitive, thermodynamics, material_mixture,
@@ -707,10 +714,14 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 grad_x = (ne_p-ne_m)/(2.0*size.dx1);
               } else {
                 ne_center = number_scale*primitive(m, IDN, k, j, i);
+                ne_p = number_scale*primitive(m, IDN, k, j, i+1);
+                ne_m = number_scale*primitive(m, IDN, k, j, i-1);
                 grad_x = number_scale*
                     (primitive(m, IDN, k, j, i+1)-
                      primitive(m, IDN, k, j, i-1))/(2.0*size.dx1);
               }
+              density_roundoff_scale = fmax(fabs(ne_center),
+                  fmax(fabs(ne_p), fabs(ne_m)));
               Real grad_y = 0.0;
               Real grad_z = 0.0;
               if (multi_d) {
@@ -723,11 +734,15 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                       use_tabular_materials, density_scale_cgs, m, k, j-1, i);
                   grad_y = (ne_p-ne_m)/(2.0*size.dx2);
                 } else {
+                  ne_p = number_scale*primitive(m, IDN, k, j+1, i);
+                  ne_m = number_scale*primitive(m, IDN, k, j-1, i);
                   grad_y = number_scale*
                       (primitive(m, IDN, k, j+1, i)-
                        primitive(m, IDN, k, j-1, i))/(2.0*size.dx2);
                 }
               }
+              if (multi_d) density_roundoff_scale = fmax(density_roundoff_scale,
+                  fmax(fabs(ne_p), fabs(ne_m)));
               if (three_d) {
                 if (use_materials) {
                   ne_p = MaterialElectronDensityCgs(
@@ -738,11 +753,15 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                       use_tabular_materials, density_scale_cgs, m, k-1, j, i);
                   grad_z = (ne_p-ne_m)/(2.0*size.dx3);
                 } else {
+                  ne_p = number_scale*primitive(m, IDN, k+1, j, i);
+                  ne_m = number_scale*primitive(m, IDN, k-1, j, i);
                   grad_z = number_scale*
                       (primitive(m, IDN, k+1, j, i)-
                        primitive(m, IDN, k-1, j, i))/(2.0*size.dx3);
                 }
               }
+              if (three_d) density_roundoff_scale = fmax(density_roundoff_scale,
+                  fmax(fabs(ne_p), fabs(ne_m)));
               Real center_x = size.x1min + (i-is+0.5)*size.dx1;
               Real center_y = size.x2min + (j-js+0.5)*size.dx2;
               Real center_z = size.x3min + (k-ks+0.5)*size.dx3;
@@ -763,8 +782,16 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                     density_at_face < rearm_density;
               }
 
+              // A normal inferred from nearly equal rounded densities is
+              // arbitrary. Normalizing it can create an oblique turning point
+              // in uniform underdense plasma, amplifying solver-level roundoff
+              // into a different ray and deposition path. Require a density
+              // change across a cell that exceeds the existing roundoff band.
+              const Real gradient_step = fmax(fabs(grad_x*size.dx1),
+                  fmax(fabs(grad_y*size.dx2), fabs(grad_z*size.dx3)));
               Real grad_norm = sqrt(SQR(grad_x)+SQR(grad_y)+SQR(grad_z));
-              if (grad_norm > 0.0) {
+              if (grad_norm > 0.0 &&
+                  gradient_step > 128.0*machine_eps*density_roundoff_scale) {
                 normal_x = grad_x/grad_norm;
                 normal_y = grad_y/grad_norm;
                 normal_z = grad_z/grad_norm;
@@ -864,7 +891,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               if (multi_d) volume *= size.dx2;
               if (three_d) volume *= size.dx3;
               if (deposited > 0.0) {
-                Kokkos::atomic_add(&data(m, 0, k, j, i), deposited/volume);
+                AccumulateDeposition(&data(m, 0, k, j, i),
+                    &deposition_roundoff(m, 1, k, j, i), deposited/volume);
                 Kokkos::atomic_add(&diag(1), deposited);
               }
               if (optical_depth > 0.0) {
@@ -922,36 +950,35 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                 last_turning_density(r) = current_turning_density;
               }
 
-              Real offset = fmax(reflection_offset_fraction*scale,
-                                  128.0*machine_eps*fmax(scale, 1.0));
-              if (reflection_hysteresis_fraction > 0.0) {
-                // Move into the underdense side by a fixed normal distance.  An
-                // offset along a nearly tangent reflected direction has vanishing
-                // normal separation and can immediately retrigger against a
-                // cell-to-cell change in the reconstructed critical surface.
-                x(r) -= offset*normal_x;
-                y(r) -= offset*normal_y;
-                z(r) -= offset*normal_z;
-              } else {
+              Real reflected_probe = 128.0*machine_eps*fmax(scale, 1.0);
+              if (reflection_hysteresis_fraction == 0.0) {
                 // Preserve the legacy position update when rearm hysteresis is off.
+                Real offset = fmax(reflection_offset_fraction*scale, reflected_probe);
                 x(r) += offset*nx(r);
                 y(r) += offset*ny(r);
                 z(r) += offset*nz(r);
+                reflected_probe = offset;
               }
+              // With hysteresis, keep the physical turning point. The disarmed
+              // reflection state already prevents another turn until a finite
+              // segment lies below the rearm density. A normal displacement can
+              // move a grazing ray across a cell face, creating an artificial
+              // return path proportional to offset/abs(direction_component).
+              // Only probe ownership along the outgoing direction; do not move
+              // the ray off its reflected trajectory or skip absorbing path.
               // Resolve an exact cell/MeshBlock face on the forward side of the
-              // reflected direction.  Assigning the unprobed offset point can make
+              // reflected direction. Assigning the unprobed turning point can make
               // neighboring ranks exchange a face-resident ray forever without
               // tracing a finite segment.
-              Real reflected_probe = offset;
               Real reflected_x = ProbeForward(x(r), nx(r), reflected_probe);
               Real reflected_y = ProbeForward(y(r), ny(r), reflected_probe);
               Real reflected_z = ProbeForward(z(r), nz(r), reflected_probe);
               int reflected_m = FindLocalBlock(
-                  sizes, nmb, reflected_x, reflected_y, reflected_z,
+                  block_tree, first_gid, nmb, reflected_x, reflected_y, reflected_z,
                   multi_d, three_d);
               if (reflected_m < 0) {
                 int reflected_gid = FindGlobalBlock(
-                    global_blocks, nmb_total, reflected_x, reflected_y, reflected_z,
+                    block_tree, reflected_x, reflected_y, reflected_z,
                     multi_d, three_d);
                 if (reflected_gid >= 0 &&
                     global_blocks(reflected_gid).rank != my_rank) {
@@ -996,6 +1023,21 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               continue;
             }
 
+            // Snap every crossed axis to the stored boundary, including tied
+            // edge/corner crossings. The drift endpoint can round to the interior
+            // side of the face; a nearly tangent forward probe need not bridge
+            // that gap and would otherwise reselect this block indefinitely.
+            if (ci(r) < is) x(r) = size.x1min;
+            if (ci(r) > ie) x(r) = size.x1max;
+            if (multi_d) {
+              if (cj(r) < js) y(r) = size.x2min;
+              if (cj(r) > je) y(r) = size.x2max;
+            }
+            if (three_d) {
+              if (ck(r) < ks) z(r) = size.x3min;
+              if (ck(r) > ke) z(r) = size.x3max;
+            }
+
             // Probe infinitesimally into the destination so an exact block face is
             // assigned to the block on the forward side of the ray.  A tangential
             // component can make probe*direction smaller than half an ulp, so use
@@ -1005,7 +1047,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
             Real px = ProbeForward(x(r), nx(r), probe);
             Real py = ProbeForward(y(r), ny(r), probe);
             Real pz = ProbeForward(z(r), nz(r), probe);
-            int new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+            int new_m = FindLocalBlock(
+                block_tree, first_gid, nmb, px, py, pz, multi_d, three_d);
 
             if (new_m < 0 && periodic) {
               if (x(r) <= domain.x1min+tolerance && nx(r) < 0.0) x(r) = domain.x1max;
@@ -1021,7 +1064,8 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
               px = ProbeForward(x(r), nx(r), probe);
               py = ProbeForward(y(r), ny(r), probe);
               pz = ProbeForward(z(r), nz(r), probe);
-              new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+              new_m = FindLocalBlock(
+                  block_tree, first_gid, nmb, px, py, pz, multi_d, three_d);
             }
 
             if (new_m < 0) {
@@ -1032,7 +1076,7 @@ void Laser::TraceStraightRays(bool preserve_off_rank) {
                   pz >= domain.x3min && pz < domain.x3max;
               if (inside_global) {
                 int destination_gid = FindGlobalBlock(
-                    global_blocks, nmb_total, px, py, pz, multi_d, three_d);
+                    block_tree, px, py, pz, multi_d, three_d);
                 if (destination_gid >= 0 &&
                     global_blocks(destination_gid).rank != my_rank) {
                   LaserBlockInfo block = global_blocks(destination_gid);
@@ -1086,7 +1130,6 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
   int nmb = pmy_pack_->nmb_thispack;
-  int nmb_total = pmy_pack_->pmesh->nmb_total;
   int first_gid = pmy_pack_->gids;
   int my_rank = global_variable::my_rank;
   bool multi_d = pmy_pack_->pmesh->multi_d;
@@ -1094,6 +1137,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   auto sizes = pmy_pack_->pmb->mb_size.d_view;
   auto gids = pmy_pack_->pmb->mb_gid.d_view;
   auto global_blocks = global_block_info_;
+  auto block_tree = global_block_tree_;
   RegionSize domain = pmy_pack_->pmesh->mesh_size;
   Real machine_eps = std::numeric_limits<Real>::epsilon();
   Real infinite = std::numeric_limits<Real>::max();
@@ -1107,6 +1151,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
   auto status = ray_status; auto destination_rank = ray_destination_rank_;
   auto segments = ray_segments_; auto path = ray_path_length_;
   auto data = cell_data;
+  auto deposition_roundoff = cumulative_energy_start_;
   auto diag = device_diagnostics_; auto counters = device_counters_;
   auto primitive = FluidPrim();
   auto temperature = FluidTemperature();
@@ -1336,27 +1381,33 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               qhz = qz-0.25*step*normalized_grad_z;
               Real face_step = infinite;
               if (qhx > 0.0) {
-                Real face = size.x1min + (i-is+1)*size.dx1;
+                Real face = CellFace(i-is+1, ie-is+1,
+                  size.x1min, size.x1max, size.dx1);
                 face_step = fmin(face_step, (face-x(r))/qhx);
               } else if (qhx < 0.0) {
-                Real face = size.x1min + (i-is)*size.dx1;
+                Real face = CellFace(i-is, ie-is+1,
+                  size.x1min, size.x1max, size.dx1);
                 face_step = fmin(face_step, (face-x(r))/qhx);
               }
               if (multi_d) {
                 if (qhy > 0.0) {
-                  Real face = size.x2min + (j-js+1)*size.dx2;
+                  Real face = CellFace(j-js+1, je-js+1,
+                  size.x2min, size.x2max, size.dx2);
                   face_step = fmin(face_step, (face-y(r))/qhy);
                 } else if (qhy < 0.0) {
-                  Real face = size.x2min + (j-js)*size.dx2;
+                  Real face = CellFace(j-js, je-js+1,
+                  size.x2min, size.x2max, size.dx2);
                   face_step = fmin(face_step, (face-y(r))/qhy);
                 }
               }
               if (three_d) {
                 if (qhz > 0.0) {
-                  Real face = size.x3min + (k-ks+1)*size.dx3;
+                  Real face = CellFace(k-ks+1, ke-ks+1,
+                  size.x3min, size.x3max, size.dx3);
                   face_step = fmin(face_step, (face-z(r))/qhz);
                 } else if (qhz < 0.0) {
-                  Real face = size.x3min + (k-ks)*size.dx3;
+                  Real face = CellFace(k-ks, ke-ks+1,
+                  size.x3min, size.x3max, size.dx3);
                   face_step = fmin(face_step, (face-z(r))/qhz);
                 }
               }
@@ -1412,7 +1463,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             if (multi_d) volume *= size.dx2;
             if (three_d) volume *= size.dx3;
             if (deposited > 0.0) {
-              Kokkos::atomic_add(&data(m, 0, k, j, i), deposited/volume);
+              AccumulateDeposition(&data(m, 0, k, j, i),
+                  &deposition_roundoff(m, 1, k, j, i), deposited/volume);
               Kokkos::atomic_add(&diag(1), deposited);
             }
             Real optical_depth = coefficient*ds;
@@ -1446,7 +1498,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             Real px = ProbeForward(x(r), nx(r), probe);
             Real py = ProbeForward(y(r), ny(r), probe);
             Real pz = ProbeForward(z(r), nz(r), probe);
-            int new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+            int new_m = FindLocalBlock(
+                block_tree, first_gid, nmb, px, py, pz, multi_d, three_d);
             if (new_m < 0 && periodic) {
               if (x(r) <= domain.x1min+tolerance && nx(r) < 0.0) x(r) = domain.x1max;
               if (x(r) >= domain.x1max-tolerance && nx(r) > 0.0) x(r) = domain.x1min;
@@ -1461,7 +1514,8 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
               px = ProbeForward(x(r), nx(r), probe);
               py = ProbeForward(y(r), ny(r), probe);
               pz = ProbeForward(z(r), nz(r), probe);
-              new_m = FindLocalBlock(sizes, nmb, px, py, pz, multi_d, three_d);
+              new_m = FindLocalBlock(
+                  block_tree, first_gid, nmb, px, py, pz, multi_d, three_d);
             }
 
             if (new_m >= 0) {
@@ -1476,7 +1530,7 @@ void Laser::TraceRefractiveRays(bool preserve_off_rank) {
             }
 
             int destination_gid = FindGlobalBlock(
-                global_blocks, nmb_total, px, py, pz, multi_d, three_d);
+                block_tree, px, py, pz, multi_d, three_d);
             if (destination_gid >= 0 &&
                 global_blocks(destination_gid).rank != my_rank) {
               LaserBlockInfo block = global_blocks(destination_gid);
@@ -1595,10 +1649,10 @@ void Laser::FinalizeDiagnostics() {
   Real global_diag[6] = {
       host_diag(0), host_diag(1), host_diag(2),
       host_diag(3), host_diag(4), host_diag(5)};
-  int global_count[8] = {
+  int global_count[9] = {
       host_count(0), host_count(1), host_count(2),
       host_count(3), host_count(4), host_count(5),
-      host_count(6), host_count(7)};
+      host_count(6), host_count(7), host_count(8)};
   int segment_count = 0;
   // Report the maximum rank-local iteration count. This preserves the old per-stage
   // interpretation without pretending every wave exhausted its configured hard cap.
@@ -1615,7 +1669,7 @@ void Laser::FinalizeDiagnostics() {
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {
     Real reduced_diag[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    int reduced_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int reduced_count[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     int reduced_segments = 0;
     int reduced_maximum_count[2] = {0, 0};
     Real reduced_path = 0.0;
@@ -1623,7 +1677,7 @@ void Laser::FinalizeDiagnostics() {
     int ierr = MPI_Allreduce(global_diag, reduced_diag, 6, MPI_ATHENA_REAL,
                              MPI_SUM, mpi_comm_);
     if (ierr == MPI_SUCCESS) {
-      ierr = MPI_Allreduce(global_count, reduced_count, 8, MPI_INT,
+      ierr = MPI_Allreduce(global_count, reduced_count, 9, MPI_INT,
                            MPI_SUM, mpi_comm_);
     }
     if (ierr == MPI_SUCCESS) {
@@ -1650,7 +1704,7 @@ void Laser::FinalizeDiagnostics() {
       std::exit(EXIT_FAILURE);
     }
     for (int n = 0; n < 6; ++n) global_diag[n] = reduced_diag[n];
-    for (int n = 0; n < 8; ++n) global_count[n] = reduced_count[n];
+    for (int n = 0; n < 9; ++n) global_count[n] = reduced_count[n];
     segment_count = reduced_segments;
     maximum_count[0] = reduced_maximum_count[0];
     maximum_count[1] = reduced_maximum_count[1];
@@ -1746,6 +1800,12 @@ void Laser::FinalizeDiagnostics() {
                 << " with tolerance=" << conservation_tolerance_
                 << "; dispersion error=" << diagnostics_.max_dispersion_error
                 << " with tolerance=" << dispersion_tolerance_ << std::endl;
+      if (global_count[8] > 0) {
+        std::cout << "Invalid laser launches=" << global_count[8]
+                  << ": reconstructed electron density at launch must satisfy "
+                  << "0 <= ne < nc. Launch in an underdense region and resolve "
+                  << "the turning layer." << std::endl;
+      }
     }
     std::exit(EXIT_FAILURE);
   }

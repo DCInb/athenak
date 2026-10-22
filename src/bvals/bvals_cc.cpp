@@ -148,65 +148,76 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
     tmember.team_barrier();
   }); // end par_for_outer
 
-  Kokkos::parallel_for("SendBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+  // Extra coarse data are used only for higher-order Z4c prolongation.
+  if (is_z4c && multilevel) {
+    Kokkos::parallel_for("SendBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int m = (tmember.league_rank())/(nnghbr*nvar);
+      const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
+      const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
 
-    // only load buffers when neighbor exists
-    if (nghbr.d_view(m,n).gid >= 0) {
-      int il, iu, jl, ju, kl, ku;
-      // If neighbor is at same level and data is for Z4c module, append data from coarse
-      // array for higher-order prolongation
-      if ((nghbr.d_view(m,n).lev == mblev.d_view(m)) && (is_z4c) && (multilevel)) {
-        il = sbuf[n].isame_z4c.bis;
-        iu = sbuf[n].isame_z4c.bie;
-        jl = sbuf[n].isame_z4c.bjs;
-        ju = sbuf[n].isame_z4c.bje;
-        kl = sbuf[n].isame_z4c.bks;
-        ku = sbuf[n].isame_z4c.bke;
-        int ni = iu - il + 1;
-        int nj = ju - jl + 1;
-        int nk = ku - kl + 1;
-        int nkj  = nk*nj;
-        int ndat = nvar*sbuf[n].isame_ndat; // size of same level data already in buff
+      // only load buffers when neighbor exists
+      if (nghbr.d_view(m,n).gid >= 0) {
+        int il, iu, jl, ju, kl, ku;
+        // Append coarse data for same-level neighbors.
+        if (nghbr.d_view(m,n).lev == mblev.d_view(m)) {
+          il = sbuf[n].isame_z4c.bis;
+          iu = sbuf[n].isame_z4c.bie;
+          jl = sbuf[n].isame_z4c.bjs;
+          ju = sbuf[n].isame_z4c.bje;
+          kl = sbuf[n].isame_z4c.bks;
+          ku = sbuf[n].isame_z4c.bke;
+          int ni = iu - il + 1;
+          int nj = ju - jl + 1;
+          int nk = ku - kl + 1;
+          int nkj  = nk*nj;
+          int ndat = nvar*sbuf[n].isame_ndat; // size of same level data already in buff
 
-        // indices of recv'ing (destination) MB and buffer: MB IDs are stored sequentially
-        // in MeshBlockPacks, so array index equals (target_id - first_id)
-        int dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
-        int dn = nghbr.d_view(m,n).dest;
+          // Destination MB IDs are sequential within a pack, so the array index
+          // equals (target_id - first_id).
+          int dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
+          int dn = nghbr.d_view(m,n).dest;
 
-        // Middle loop over k,j
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj), [&](const int idx) {
-          int k = idx / nj;
-          int j = (idx - k * nj) + jl;
-          k += kl;
+          // Middle loop over k,j
+          Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj),
+          [&](const int idx) {
+            int k = idx / nj;
+            int j = (idx - k * nj) + jl;
+            k += kl;
 
-          // Inner (vector) loop over i
-          // copy directly into recv buffer if MeshBlocks on same rank
-          if (nghbr.d_view(m,n).rank == my_rank) {
-            // load data from coarse_u0
-            Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
-            [&](const int i) {
-              rbuf[dn].vars(dm,ndat+ (i-il + ni*(j-jl + nj*(k-kl + nk*v))))=ca(m,v,k,j,i);
-            });
+            // Inner (vector) loop over i
+            // copy directly into recv buffer if MeshBlocks on same rank
+            if (nghbr.d_view(m,n).rank == my_rank) {
+              // load data from coarse_u0
+              Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
+              [&](const int i) {
+                rbuf[dn].vars(dm,ndat+ (i-il + ni*(j-jl + nj*(k-kl + nk*v))))
+                    = ca(m,v,k,j,i);
+              });
 
-          // else copy into send buffer for MPI communication below
-          } else {
-            // load data from coarse_u0
-            Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
-            [&](const int i) {
-              sbuf[n].vars(m,ndat+ (i-il + ni*(j-jl + nj*(k-kl + nk*v))) )=ca(m,v,k,j,i);
-            });
-          }
-        });
-      }
-    } // end if-neighbor-exists block
-    tmember.team_barrier();
-  }); // end par_for_outer
+            // else copy into send buffer for MPI communication below
+            } else {
+              // load data from coarse_u0
+              Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
+              [&](const int i) {
+                sbuf[n].vars(m,ndat+ (i-il + ni*(j-jl + nj*(k-kl + nk*v))) )
+                    = ca(m,v,k,j,i);
+              });
+            }
+          });
+        }
+      } // end if-neighbor-exists block
+      tmember.team_barrier();
+    }); // end par_for_outer
+  }
   }
 
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_vars_.PackAndSend(BatchSegments(true, false, nvar), comm_vars);
+    return TaskStatus::complete;
+  }
+  // Local copies stay ordered on the default execution space without an MPI fence.
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   // Send boundary buffer to neighboring MeshBlocks using MPI
   Kokkos::fence();
   auto &is_z4c = is_z4c_;
@@ -271,33 +282,36 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   auto &is_z4c = is_z4c_;
   auto &multilevel = pmy_pack->pmesh->multilevel;
 #if MPI_PARALLEL_ENABLED
-  //----- STEP 1: check that recv boundary buffer communications have all completed
+  if (batch_enabled_ && !batch_vars_.Receive(false)) return TaskStatus::incomplete;
+  if (global_variable::nranks > 1 && !batch_enabled_) {
+    //----- STEP 1: check that recv boundary buffer communications have all completed
 
-  bool bflag = false;
-  bool no_errors=true;
-  for (int m=0; m<nmb; ++m) {
-    for (int n=0; n<nnghbr; ++n) {
-      if (nghbr.h_view(m,n).gid >= 0) { // neighbor exists and not a physical boundary
-        if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
-          int test;
-          int ierr = MPI_Test(&(rbuf[n].vars_req[m]), &test, MPI_STATUS_IGNORE);
-          if (ierr != MPI_SUCCESS) {no_errors=false;}
-          if (!(static_cast<bool>(test))) {
-            bflag = true;
+    bool bflag = false;
+    bool no_errors=true;
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nnghbr; ++n) {
+        if (nghbr.h_view(m,n).gid >= 0) { // neighbor exists and not a physical boundary
+          if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
+            int test;
+            int ierr = MPI_Test(&(rbuf[n].vars_req[m]), &test, MPI_STATUS_IGNORE);
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+            if (!(static_cast<bool>(test))) {
+              bflag = true;
+            }
           }
         }
       }
     }
+    // Quit if MPI error detected
+    if (!(no_errors)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "MPI error in testing non-blocking receives"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    // exit if recv boundary buffer communications have not completed
+    if (bflag) {return TaskStatus::incomplete;}
   }
-  // Quit if MPI error detected
-  if (!(no_errors)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "MPI error in testing non-blocking receives"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  // exit if recv boundary buffer communications have not completed
-  if (bflag) {return TaskStatus::incomplete;}
 #endif
 
   //----- STEP 2: buffers have all completed, so unpack
@@ -373,44 +387,48 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   });  // end par_for_outer
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
-  Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
-    // only unpack buffers when neighbor exists
-    if (nghbr.d_view(m,n).gid >= 0) {
-      int il, iu, jl, ju, kl, ku;
-      // If neighbor is at same level and data is for Z4c module, unpack data from coarse
-      // array for higher-order prolongation
-      if ((nghbr.d_view(m,n).lev == mblev.d_view(m)) && (is_z4c) && (multilevel)) {
-        il = rbuf[n].isame_z4c.bis;
-        iu = rbuf[n].isame_z4c.bie;
-        jl = rbuf[n].isame_z4c.bjs;
-        ju = rbuf[n].isame_z4c.bje;
-        kl = rbuf[n].isame_z4c.bks;
-        ku = rbuf[n].isame_z4c.bke;
-        int ni = iu - il + 1;
-        int nj = ju - jl + 1;
-        int nk = ku - kl + 1;
-        int nkj  = nk*nj;
-        int ndat = nvar*rbuf[n].isame_ndat; // size of same level data packed in buff
+  // Extra coarse data are used only for higher-order Z4c prolongation.
+  if (is_z4c && multilevel) {
+    Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int m = (tmember.league_rank())/(nnghbr*nvar);
+      const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
+      const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+      // only unpack buffers when neighbor exists
+      if (nghbr.d_view(m,n).gid >= 0) {
+        int il, iu, jl, ju, kl, ku;
+        // Unpack coarse data for same-level neighbors.
+        if (nghbr.d_view(m,n).lev == mblev.d_view(m)) {
+          il = rbuf[n].isame_z4c.bis;
+          iu = rbuf[n].isame_z4c.bie;
+          jl = rbuf[n].isame_z4c.bjs;
+          ju = rbuf[n].isame_z4c.bje;
+          kl = rbuf[n].isame_z4c.bks;
+          ku = rbuf[n].isame_z4c.bke;
+          int ni = iu - il + 1;
+          int nj = ju - jl + 1;
+          int nk = ku - kl + 1;
+          int nkj  = nk*nj;
+          int ndat = nvar*rbuf[n].isame_ndat; // size of same level data packed in buff
 
-        // Middle loop over k,j
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj), [&](const int idx) {
-          int k = idx / nj;
-          int j = (idx - k * nj) + jl;
-          k += kl;
+          // Middle loop over k,j
+          Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj),
+          [&](const int idx) {
+            int k = idx / nj;
+            int j = (idx - k * nj) + jl;
+            k += kl;
 
-          // load data into coarse_u0
-          Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
-          [&](const int i) {
-            ca(m,v,k,j,i) = rbuf[n].vars(m,ndat + (i-il + ni*(j-jl + nj*(k-kl + nk*v))) );
+            // load data into coarse_u0
+            Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
+            [&](const int i) {
+              ca(m,v,k,j,i) =
+                  rbuf[n].vars(m,ndat + (i-il + ni*(j-jl + nj*(k-kl + nk*v))) );
+            });
           });
-        });
-      }
-    }  // end if-neighbor-exists block
-    tmember.team_barrier();
-  });  // end par_for_outer
+        }
+      }  // end if-neighbor-exists block
+      tmember.team_barrier();
+    });  // end par_for_outer
+  }
 
   return TaskStatus::complete;
 }

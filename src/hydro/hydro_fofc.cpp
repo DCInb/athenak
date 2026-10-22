@@ -37,9 +37,9 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
   bool &three_d = pmy_pack->pmesh->three_d;
 
   int nmb = pmy_pack->nmb_thispack;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto &size = pmy_pack->pmb->mb_size;
 
   if (use_fofc) {
@@ -151,12 +151,14 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
         SingleStateLLF_Hyd(wim1, wi, eos, flux);
       }
 
-      // store 1st-order fluxes
-      flx1(m,IDN,k,j,i) = flux.d;
-      flx1(m,IM1,k,j,i) = flux.mx;
-      flx1(m,IM2,k,j,i) = flux.my;
-      flx1(m,IM3,k,j,i) = flux.mz;
-      if (eos.is_ideal) {flx1(m,IEN,k,j,i) = flux.e;}
+      // Excision without FOFC can reach unused faces outside the band.
+      if (flx1.contains(k,j,i)) {
+        flx1(m,IDN,k,j,i) = flux.d;
+        flx1(m,IM1,k,j,i) = flux.mx;
+        flx1(m,IM2,k,j,i) = flux.my;
+        flx1(m,IM3,k,j,i) = flux.mz;
+        if (eos.is_ideal) {flx1(m,IEN,k,j,i) = flux.e;}
+      }
 
       // replace x1-flux at i+1
       // load right state (left state just wi from above)
@@ -187,12 +189,14 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
         SingleStateLLF_Hyd(wi, wip1, eos, flux);
       }
 
-      // store 1st-order fluxes
-      flx1(m,IDN,k,j,i+1) = flux.d;
-      flx1(m,IM1,k,j,i+1) = flux.mx;
-      flx1(m,IM2,k,j,i+1) = flux.my;
-      flx1(m,IM3,k,j,i+1) = flux.mz;
-      if (eos.is_ideal) {flx1(m,IEN,k,j,i+1) = flux.e;}
+      // Excision without FOFC can reach unused faces outside the band.
+      if (flx1.contains(k,j,i+1)) {
+        flx1(m,IDN,k,j,i+1) = flux.d;
+        flx1(m,IM1,k,j,i+1) = flux.mx;
+        flx1(m,IM2,k,j,i+1) = flux.my;
+        flx1(m,IM3,k,j,i+1) = flux.mz;
+        if (eos.is_ideal) {flx1(m,IEN,k,j,i+1) = flux.e;}
+      }
 
       if (multi_d) {
         // replace x2-flux at j
@@ -232,12 +236,14 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
           SingleStateLLF_Hyd(wjm1, wj, eos, flux);
         }
 
-        // store 1st-order fluxes, permutting indices
-        flx2(m,IDN,k,j,i) = flux.d;
-        flx2(m,IM2,k,j,i) = flux.mx;
-        flx2(m,IM3,k,j,i) = flux.my;
-        flx2(m,IM1,k,j,i) = flux.mz;
-        if (eos.is_ideal) {flx2(m,IEN,k,j,i) = flux.e;}
+        // Excision without FOFC can reach unused faces outside the band.
+        if (flx2.contains(k,j,i)) {
+          flx2(m,IDN,k,j,i) = flux.d;
+          flx2(m,IM2,k,j,i) = flux.mx;
+          flx2(m,IM3,k,j,i) = flux.my;
+          flx2(m,IM1,k,j,i) = flux.mz;
+          if (eos.is_ideal) {flx2(m,IEN,k,j,i) = flux.e;}
+        }
 
         // replace x2-flux at j+1
         // load left state, permutting components of vectors (just wj from above)
@@ -269,12 +275,14 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
           SingleStateLLF_Hyd(wj, wjp1, eos, flux);
         }
 
-        // store 1st-order fluxes, permutting indices
-        flx2(m,IDN,k,j+1,i) = flux.d;
-        flx2(m,IM2,k,j+1,i) = flux.mx;
-        flx2(m,IM3,k,j+1,i) = flux.my;
-        flx2(m,IM1,k,j+1,i) = flux.mz;
-        if (eos.is_ideal) {flx2(m,IEN,k,j+1,i) = flux.e;}
+        // Excision without FOFC can reach unused faces outside the band.
+        if (flx2.contains(k,j+1,i)) {
+          flx2(m,IDN,k,j+1,i) = flux.d;
+          flx2(m,IM2,k,j+1,i) = flux.mx;
+          flx2(m,IM3,k,j+1,i) = flux.my;
+          flx2(m,IM1,k,j+1,i) = flux.mz;
+          if (eos.is_ideal) {flx2(m,IEN,k,j+1,i) = flux.e;}
+        }
       }
 
       if (three_d) {
@@ -315,12 +323,14 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
           SingleStateLLF_Hyd(wkm1, wk, eos, flux);
         }
 
-        // store 1st-order fluxes, permutting indices
-        flx3(m,IDN,k,j,i) = flux.d;
-        flx3(m,IM3,k,j,i) = flux.mx;
-        flx3(m,IM1,k,j,i) = flux.my;
-        flx3(m,IM2,k,j,i) = flux.mz;
-        if (eos.is_ideal) {flx3(m,IEN,k,j,i) = flux.e;}
+        // Excision without FOFC can reach unused faces outside the band.
+        if (flx3.contains(k,j,i)) {
+          flx3(m,IDN,k,j,i) = flux.d;
+          flx3(m,IM3,k,j,i) = flux.mx;
+          flx3(m,IM1,k,j,i) = flux.my;
+          flx3(m,IM2,k,j,i) = flux.mz;
+          if (eos.is_ideal) {flx3(m,IEN,k,j,i) = flux.e;}
+        }
 
         // replace x3-flux at k+1
         // load left state, permutting components of vectors (just wk from above)
@@ -352,12 +362,14 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
           SingleStateLLF_Hyd(wk, wkp1, eos, flux);
         }
 
-        // store 1st-order fluxes, permutting indices
-        flx3(m,IDN,k+1,j,i) = flux.d;
-        flx3(m,IM3,k+1,j,i) = flux.mx;
-        flx3(m,IM1,k+1,j,i) = flux.my;
-        flx3(m,IM2,k+1,j,i) = flux.mz;
-        if (eos.is_ideal) {flx3(m,IEN,k+1,j,i) = flux.e;}
+        // Excision without FOFC can reach unused faces outside the band.
+        if (flx3.contains(k+1,j,i)) {
+          flx3(m,IDN,k+1,j,i) = flux.d;
+          flx3(m,IM3,k+1,j,i) = flux.mx;
+          flx3(m,IM1,k+1,j,i) = flux.my;
+          flx3(m,IM2,k+1,j,i) = flux.mz;
+          if (eos.is_ideal) {flx3(m,IEN,k+1,j,i) = flux.e;}
+        }
       }
 
       // reset FOFC flag (do not reset excision flag)

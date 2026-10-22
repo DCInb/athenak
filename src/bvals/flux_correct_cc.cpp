@@ -27,7 +27,8 @@
 //! block boundaries.
 
 TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
-                                                   DvceFaceFld5D<Real> *extra_flx) {
+                                                   DvceFaceFld5D<Real> *extra_flx,
+                                                   const FaceFldOrigin origin) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -35,9 +36,12 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
   const bool use_extra = (extra_flx != nullptr);
   const int nvar_extra = use_extra ? extra_flx->x1f.extent_int(1) : 0;
   int nvar = nvar_base + nvar_extra;
-  auto extra_x1f = use_extra ? extra_flx->x1f : flx.x1f;
-  auto extra_x2f = use_extra ? extra_flx->x2f : flx.x2f;
-  auto extra_x3f = use_extra ? extra_flx->x3f : flx.x3f;
+  auto flx1 = MakeBandView(flx.x1f, origin);
+  auto extra_x1f = MakeBandView(use_extra ? extra_flx->x1f : flx.x1f, origin);
+  auto flx2 = MakeBandView(flx.x2f, origin);
+  auto extra_x2f = MakeBandView(use_extra ? extra_flx->x2f : flx.x2f, origin);
+  auto flx3 = MakeBandView(flx.x3f, origin);
+  auto extra_x3f = MakeBandView(use_extra ? extra_flx->x3f : flx.x3f, origin);
 
   auto &cis = pmy_pack->pmesh->mb_indcs.cis;
   auto &cjs = pmy_pack->pmesh->mb_indcs.cjs;
@@ -92,19 +96,19 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
           int fk = 2*k - cks;
           Real rflx;
           if (one_d) {
-            rflx = (v < nvar_base) ? flx.x1f(m,v,0,0,fi) :
+            rflx = (v < nvar_base) ? flx1(m,v,0,0,fi) :
                 extra_x1f(m,v - nvar_base,0,0,fi);
           } else if (two_d) {
             if (v < nvar_base) {
-              rflx = 0.5*(flx.x1f(m,v,0,fj,fi) + flx.x1f(m,v,0,fj+1,fi));
+              rflx = 0.5*(flx1(m,v,0,fj,fi) + flx1(m,v,0,fj+1,fi));
             } else {
               const int ve = v - nvar_base;
               rflx = 0.5*(extra_x1f(m,ve,0,fj,fi) + extra_x1f(m,ve,0,fj+1,fi));
             }
           } else {
             if (v < nvar_base) {
-              rflx = 0.25*(flx.x1f(m,v,fk  ,fj,fi) + flx.x1f(m,v,fk  ,fj+1,fi) +
-                           flx.x1f(m,v,fk+1,fj,fi) + flx.x1f(m,v,fk+1,fj+1,fi));
+              rflx = 0.25*(flx1(m,v,fk  ,fj,fi) + flx1(m,v,fk  ,fj+1,fi) +
+                           flx1(m,v,fk+1,fj,fi) + flx1(m,v,fk+1,fj+1,fi));
             } else {
               const int ve = v - nvar_base;
               rflx = 0.25*(extra_x1f(m,ve,fk  ,fj,fi) +
@@ -135,15 +139,15 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
           Real rflx;
           if (two_d) {
             if (v < nvar_base) {
-              rflx = 0.5*(flx.x2f(m,v,0,fj,fi) + flx.x2f(m,v,0,fj,fi+1));
+              rflx = 0.5*(flx2(m,v,0,fj,fi) + flx2(m,v,0,fj,fi+1));
             } else {
               const int ve = v - nvar_base;
               rflx = 0.5*(extra_x2f(m,ve,0,fj,fi) + extra_x2f(m,ve,0,fj,fi+1));
             }
           } else {
             if (v < nvar_base) {
-              rflx = 0.25*(flx.x2f(m,v,fk  ,fj,fi) + flx.x2f(m,v,fk  ,fj,fi+1) +
-                           flx.x2f(m,v,fk+1,fj,fi) + flx.x2f(m,v,fk+1,fj,fi+1));
+              rflx = 0.25*(flx2(m,v,fk  ,fj,fi) + flx2(m,v,fk  ,fj,fi+1) +
+                           flx2(m,v,fk+1,fj,fi) + flx2(m,v,fk+1,fj,fi+1));
             } else {
               const int ve = v - nvar_base;
               rflx = 0.25*(extra_x2f(m,ve,fk  ,fj,fi) +
@@ -173,8 +177,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
           int fj = 2*j - cjs;
           Real rflx;
           if (v < nvar_base) {
-            rflx = 0.25*(flx.x3f(m,v,fk,fj  ,fi) + flx.x3f(m,v,fk,fj  ,fi+1) +
-                         flx.x3f(m,v,fk,fj+1,fi) + flx.x3f(m,v,fk,fj+1,fi+1));
+            rflx = 0.25*(flx3(m,v,fk,fj  ,fi) + flx3(m,v,fk,fj  ,fi+1) +
+                         flx3(m,v,fk,fj+1,fi) + flx3(m,v,fk,fj+1,fi+1));
           } else {
             const int ve = v - nvar_base;
             rflx = 0.25*(extra_x3f(m,ve,fk,fj  ,fi) +
@@ -196,6 +200,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
   });  // end par_for_outer
 
 #if MPI_PARALLEL_ENABLED
+  // Local copies stay ordered on the default execution space without an MPI fence.
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   // Send boundary buffer to neighboring MeshBlocks using MPI
   // Sends only occur to neighbors on FACES at a COARSER level
   Kokkos::fence();
@@ -240,7 +246,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
 //! \brief Unpack boundary buffers for flux correction of CC variables.
 
 TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
-                                                     DvceFaceFld5D<Real> *extra_flx) {
+                                                     DvceFaceFld5D<Real> *extra_flx,
+                                                     const FaceFldOrigin origin) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -248,36 +255,38 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
   auto &mblev = pmy_pack->pmb->mb_lev;
   auto &rbuf = recvbuf;
 #if MPI_PARALLEL_ENABLED
-  //----- STEP 1: check that recv boundary buffer communications have all completed
-  // receives only occur for neighbors on faces at a FINER level
+  if (global_variable::nranks > 1) {
+    //----- STEP 1: check that recv boundary buffer communications have all completed
+    // receives only occur for neighbors on faces at a FINER level
 
-  bool bflag = false;
-  bool no_errors=true;
-  for (int m=0; m<nmb; ++m) {
-    for (int n=0; n<nnghbr; ++n) {
-      if ( (nghbr.h_view(m,n).gid >=0) &&
-           (nghbr.h_view(m,n).lev > mblev.h_view(m)) &&
-           ((n<16) || ((n>=24) && (n<32))) ) {
-        if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
-          int test;
-          int ierr = MPI_Test(&(rbuf[n].flux_req[m]), &test, MPI_STATUS_IGNORE);
-          if (ierr != MPI_SUCCESS) {no_errors=false;}
-          if (!(static_cast<bool>(test))) {
-            bflag = true;
+    bool bflag = false;
+    bool no_errors=true;
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nnghbr; ++n) {
+        if ( (nghbr.h_view(m,n).gid >=0) &&
+             (nghbr.h_view(m,n).lev > mblev.h_view(m)) &&
+             ((n<16) || ((n>=24) && (n<32))) ) {
+          if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
+            int test;
+            int ierr = MPI_Test(&(rbuf[n].flux_req[m]), &test, MPI_STATUS_IGNORE);
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+            if (!(static_cast<bool>(test))) {
+              bflag = true;
+            }
           }
         }
       }
     }
+    // Quit if MPI error detected
+    if (!(no_errors)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "MPI error in testing non-blocking receives"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    // exit if recv boundary buffer communications have not completed
+    if (bflag) {return TaskStatus::incomplete;}
   }
-  // Quit if MPI error detected
-  if (!(no_errors)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "MPI error in testing non-blocking receives"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  // exit if recv boundary buffer communications have not completed
-  if (bflag) {return TaskStatus::incomplete;}
 #endif
 
   //----- STEP 2: buffers have all completed, so unpack
@@ -286,9 +295,12 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
   const bool use_extra = (extra_flx != nullptr);
   const int nvar_extra = use_extra ? extra_flx->x1f.extent_int(1) : 0;
   int nvar = nvar_base + nvar_extra;
-  auto extra_x1f = use_extra ? extra_flx->x1f : flx.x1f;
-  auto extra_x2f = use_extra ? extra_flx->x2f : flx.x2f;
-  auto extra_x3f = use_extra ? extra_flx->x3f : flx.x3f;
+  auto flx1 = MakeBandView(flx.x1f, origin);
+  auto extra_x1f = MakeBandView(use_extra ? extra_flx->x1f : flx.x1f, origin);
+  auto flx2 = MakeBandView(flx.x2f, origin);
+  auto extra_x2f = MakeBandView(use_extra ? extra_flx->x2f : flx.x2f, origin);
+  auto flx3 = MakeBandView(flx.x3f, origin);
+  auto extra_x3f = MakeBandView(use_extra ? extra_flx->x3f : flx.x3f, origin);
 
   // Outer loop over (# of MeshBlocks)*(# of neighbors)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr*nvar), Kokkos::AUTO);
@@ -321,7 +333,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
           k += kl;
           const Real rval = rbuf[n].flux(m,(j-jl + nj*(k-kl + nk*v)));
           if (v < nvar_base) {
-            flx.x1f(m,v,k,j,il) = rval;
+            flx1(m,v,k,j,il) = rval;
           } else {
             extra_x1f(m,v - nvar_base,k,j,il) = rval;
           }
@@ -334,7 +346,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
           k += kl;
           const Real rval = rbuf[n].flux(m,(i-il + ni*(k-kl + nk*v)));
           if (v < nvar_base) {
-            flx.x2f(m,v,k,jl,i) = rval;
+            flx2(m,v,k,jl,i) = rval;
           } else {
             extra_x2f(m,v - nvar_base,k,jl,i) = rval;
           }
@@ -347,7 +359,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
           j += jl;
           const Real rval = rbuf[n].flux(m,(i-il + ni*(j-jl + nj*v)));
           if (v < nvar_base) {
-            flx.x3f(m,v,kl,j,i) = rval;
+            flx3(m,v,kl,j,i) = rval;
           } else {
             extra_x3f(m,v - nvar_base,kl,j,i) = rval;
           }
@@ -368,6 +380,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
 
 TaskStatus MeshBoundaryValuesCC::InitFluxRecv(const int nvars) {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;

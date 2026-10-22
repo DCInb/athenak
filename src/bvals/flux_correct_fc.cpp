@@ -321,6 +321,10 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx) {
   });  // end par_for_outer
 
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_flux_.PackAndSend(BatchSegments(true, true, 3), comm_flux);
+    return TaskStatus::complete;
+  }
   // Send boundary buffer to neighboring MeshBlocks using MPI
   // Sends only occur to neighbors on FACES and EDGES at COARSER or SAME level
   Kokkos::fence();
@@ -375,6 +379,7 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_ && !batch_flux_.Receive(false)) return TaskStatus::incomplete;
   int nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &rbuf = recvbuf;
@@ -382,33 +387,35 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx) {
   //----- STEP 1: check that recv boundary buffer communications have all completed
   // receives only occur for neighbors on faces and edges at FINER or SAME level
 
-  bool bflag = false;
-  bool no_errors=true;
-  for (int m=0; m<nmb; ++m) {
-    for (int n=0; n<nnghbr; ++n) {
-      if ( (nghbr.h_view(m,n).gid >=0) &&
-           (nghbr.h_view(m,n).lev >= mblev.h_view(m)) &&
-           (n<48) ) {
-        if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
-          int test;
-          int ierr = MPI_Test(&(rbuf[n].flux_req[m]), &test, MPI_STATUS_IGNORE);
-          if (ierr != MPI_SUCCESS) {no_errors=false;}
-          if (!(static_cast<bool>(test))) {
-            bflag = true;
+  if (!batch_enabled_) {
+    bool bflag = false;
+    bool no_errors=true;
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nnghbr; ++n) {
+        if ( (nghbr.h_view(m,n).gid >=0) &&
+             (nghbr.h_view(m,n).lev >= mblev.h_view(m)) &&
+             (n<48) ) {
+          if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
+            int test;
+            int ierr = MPI_Test(&(rbuf[n].flux_req[m]), &test, MPI_STATUS_IGNORE);
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+            if (!(static_cast<bool>(test))) {
+              bflag = true;
+            }
           }
         }
       }
     }
+    // Quit if MPI error detected
+    if (!(no_errors)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "MPI error in testing non-blocking receives"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    // exit if recv boundary buffer communications have not completed
+    if (bflag) {return TaskStatus::incomplete;}
   }
-  // Quit if MPI error detected
-  if (!(no_errors)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "MPI error in testing non-blocking receives"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  // exit if recv boundary buffer communications have not completed
-  if (bflag) {return TaskStatus::incomplete;}
 #endif
 
   //----- STEP 2: buffers have all completed, so unpack and perform appropriate averaging
@@ -1044,6 +1051,10 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
 
 TaskStatus MeshBoundaryValuesFC::InitFluxRecv(const int nvars) {
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_flux_.PostRecv(BatchSegments(false, true, nvars), comm_flux);
+    return TaskStatus::complete;
+  }
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;

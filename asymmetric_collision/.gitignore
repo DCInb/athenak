@@ -1,0 +1,15 @@
+/build/
+/build-*/
+/runs/
+/diagnostics/
+/plots/
+/logs/*
+!/logs/.gitkeep
+/.venv/
+/.solver-test-venv/
+/.pytest_cache/
+**/__pycache__/
+*.pyc
+*.out
+*.out_perf
+*.log

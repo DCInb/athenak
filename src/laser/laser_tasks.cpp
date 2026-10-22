@@ -76,6 +76,7 @@ void Laser::ClearInstantaneousData(bool capture_cumulative_start) {
           indcs.ks, indcs.ke, indcs.js, indcs.je, indcs.is, indcs.ie,
   KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
     if (n != 1) data(m, n, k, j, i) = 0.0;
+    if (n == 0) energy_start(m, 1, k, j, i) = 0.0;
     if (capture_cumulative_start && n == 1) {
       energy_start(m, 0, k, j, i) = data(m, 1, k, j, i);
     }
@@ -102,6 +103,10 @@ TaskStatus Laser::ApplySource(Driver *pdrive, int stage) {
   par_for("laser_apply_source", DevExeSpace(), 0, nmb1,
           indcs.ks, indcs.ke, indcs.js, indcs.je, indcs.is, indcs.ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    // All ray waves have completed. Fold their atomic-add roundoff into the
+    // physical heating rate once, before applying the RK source update.
+    data(m, 0, k, j, i) += energy_start(m, 1, k, j, i);
+    energy_start(m, 1, k, j, i) = 0.0;
     Real deposited_energy = beta_dt*data(m, 0, k, j, i);
     u0(m, IEN, k, j, i) += deposited_energy;
     if (heat_electrons) u0(m, iele, k, j, i) += deposited_energy;

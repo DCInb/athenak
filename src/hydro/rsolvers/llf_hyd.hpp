@@ -25,7 +25,7 @@ void LLF(TeamMember_t const &member, const EOS_Data &eos,
      const ScrArray2D<Real> &wl, const ScrArray2D<Real> &wr,
      const ScrArray2D<Real> &material_left,
      const ScrArray2D<Real> &material_right,
-     DvceArray5D<Real> flx) {
+     BandView5D<Real> flx) {
   int ivy = IVX + ((ivx-IVX)+1)%3;
   int ivz = IVX + ((ivx-IVX)+2)%3;
 

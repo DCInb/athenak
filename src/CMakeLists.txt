@@ -12,6 +12,7 @@ add_executable(
         parameter_input.cpp
 
         bvals/bvals.cpp
+        bvals/bvals_batch.cpp
         bvals/buffs_cc.cpp
         bvals/buffs_fc.cpp
         bvals/bvals_cc.cpp
@@ -33,6 +34,9 @@ add_executable(
 
         diffusion/ambipolar.cpp
         diffusion/conduction.cpp
+        diffusion/conduction_amr.cpp
+        diffusion/native_multigrid.cpp
+        diffusion/native_diffusion_solver.cpp
         diffusion/conduction_implicit.cpp
         diffusion/resistivity.cpp
         diffusion/viscosity.cpp
@@ -73,6 +77,18 @@ add_executable(
 
         ion-neutral/ion-neutral.cpp
         ion-neutral/ion-neutral_tasks.cpp
+
+        fast_electrons/fast_electrons.cpp
+        fast_electrons/fast_electron_mesh.cpp
+        fast_electrons/fast_electron_fields.cpp
+        fast_electrons/fast_electron_restart.cpp
+        fast_electrons/fast_electron_transport.cpp
+        fast_electrons/fast_electron_memory.cpp
+        fast_electrons/fast_electron_sampling.cpp
+        nuclear/dt_fusion.cpp
+        nuclear/dt_mesh.cpp
+        nuclear/dt_transport.cpp
+        nuclear/dt_restart.cpp
 
         laser/laser.cpp
         laser/laser_mpi.cpp
@@ -177,6 +193,13 @@ add_executable(
         two_temperature/two_temperature.cpp
         two_temperature/opacity_table.cpp
         two_temperature/thermal_radiation.cpp
+        two_temperature/thermal_radiation_amr.cpp
+        two_temperature/thermal_radiation_aggregate.cpp
+        two_temperature/thermal_radiation_gmres.cpp
+        two_temperature/thermal_radiation_batch.cpp
+        two_temperature/thermal_radiation_groups.cpp
+        two_temperature/thermal_radiation_halo.cpp
+        two_temperature/thermal_radiation_hypre.cpp
 
         units/units.cpp
         utils/change_rundir.cpp
@@ -219,3 +242,26 @@ endif()
 
 # enable include of header files with /src/ as root of path
 target_include_directories(athena PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Keep this optional host library out of every other compilation unit, including
+# config.hpp, so enabling it does not rebuild unrelated CUDA kernels.
+if (Athena_ENABLE_CHOLMOD)
+  set_property(SOURCE two_temperature/thermal_radiation_aggregate.cpp APPEND
+      PROPERTY COMPILE_DEFINITIONS ATHENA_CHOLMOD_ENABLED=1)
+  set_property(SOURCE two_temperature/thermal_radiation_aggregate.cpp APPEND
+      PROPERTY INCLUDE_DIRECTORIES ${CHOLMOD_INCLUDE_DIR})
+endif()
+if (Athena_ENABLE_CUSPARSE)
+  set_property(SOURCE two_temperature/thermal_radiation_aggregate.cpp APPEND
+      PROPERTY COMPILE_DEFINITIONS ATHENA_CUSPARSE_ENABLED=1)
+endif()
+if (Athena_ENABLE_HYPRE)
+  set_property(SOURCE two_temperature/thermal_radiation_hypre.cpp
+      two_temperature/thermal_radiation_aggregate.cpp APPEND
+      PROPERTY COMPILE_DEFINITIONS ATHENA_HYPRE_ENABLED=1)
+endif()
+
+if (Athena_ENABLE_HYPRE_REUSE)
+  set_property(SOURCE two_temperature/thermal_radiation_hypre.cpp APPEND
+      PROPERTY COMPILE_DEFINITIONS ATHENA_HYPRE_REUSE_ENABLED=1)
+endif()

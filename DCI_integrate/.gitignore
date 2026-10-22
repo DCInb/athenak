@@ -1,0 +1,6 @@
+build/
+runs/
+plots/
+__pycache__/
+*.pyc
+slurm-*.out*

@@ -28,7 +28,7 @@
 
 void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
                                                DvceArray5D<Real> &ca,
-                                               bool is_z4c) {
+                                               bool is_z4c, int coarse_ghost_depth) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -75,6 +75,16 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
         int ju = (rbuf[n].isame[0].bje + cjs)/2;
         int kl = (rbuf[n].isame[0].bks + cks)/2;
         int ku = (rbuf[n].isame[0].bke + cks)/2;
+        // Compact scalar halos supply only the fine cells needed to form this
+        // many coarse donor layers. Fluid/Z4c callers retain the full bounds.
+        if (coarse_ghost_depth >= 0) {
+          il = (il < cis-coarse_ghost_depth) ? cis-coarse_ghost_depth : il;
+          iu = (iu > indcs.cie+coarse_ghost_depth) ? indcs.cie+coarse_ghost_depth : iu;
+          jl = (jl < cjs-coarse_ghost_depth) ? cjs-coarse_ghost_depth : jl;
+          ju = (ju > indcs.cje+coarse_ghost_depth) ? indcs.cje+coarse_ghost_depth : ju;
+          kl = (kl < cks-coarse_ghost_depth) ? cks-coarse_ghost_depth : kl;
+          ku = (ku > indcs.cke+coarse_ghost_depth) ? indcs.cke+coarse_ghost_depth : ku;
+        }
 
         const int ni = iu - il + 1;
         const int nj = ju - jl + 1;
@@ -94,6 +104,12 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
           int finei = (i - indcs.cis)*2 + indcs.is;
           int finej = (j - indcs.cjs)*2 + indcs.js;
           int finek = (k - indcs.cks)*2 + indcs.ks;
+
+          if (nvar == 1 && !is_z4c) {
+            ca(m,v,k,j,i) = RestrictLinearAverage(a, m, v, finek, finej, finei,
+                                                 multi_d, three_d);
+            return;
+          }
 
           // restrict in 2D
           if (!(three_d)) {

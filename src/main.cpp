@@ -40,6 +40,7 @@
 #include "outputs/outputs.hpp"
 #include "driver/driver.hpp"
 #include "utils/utils.hpp"
+#include "fast_electrons/fast_electron_memory.hpp"
 
 // MPI/OpenMP headers
 #if MPI_PARALLEL_ENABLED
@@ -305,6 +306,7 @@ int main(int argc, char *argv[]) {
   // on this rank.  Latter cannot be performed in Mesh constructor since it requires
   // pointer to Mesh.
 
+  fast_electrons::memory::Initialize(pinput);
   Mesh* pmesh = new Mesh(pinput);
   if (!res_flag) {
     pmesh->BuildTreeFromScratch(pinput);

@@ -183,6 +183,38 @@ struct DvceFaceFld5D {
   ~DvceFaceFld5D() = default;
 };
 
+// Face registers may store only the active faces (plus a one-cell FOFC margin).
+// Keep mesh indices in kernels and translate them to the compact allocation here.
+// A zero origin preserves the ghost-extended layout used by other physics modules.
+struct FaceFldOrigin {
+  int k = 0;
+  int j = 0;
+  int i = 0;
+};
+
+template <typename T>
+struct BandView5D {
+  DvceArray5D<T> data;
+  FaceFldOrigin origin;
+
+  KOKKOS_INLINE_FUNCTION
+  T &operator()(const int m, const int n, const int k, const int j, const int i) const {
+    return data(m, n, k-origin.k, j-origin.j, i-origin.i);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  bool contains(const int k, const int j, const int i) const {
+    return k >= origin.k && k-origin.k < data.extent_int(2) &&
+           j >= origin.j && j-origin.j < data.extent_int(3) &&
+           i >= origin.i && i-origin.i < data.extent_int(4);
+  }
+};
+
+template <typename T>
+BandView5D<T> MakeBandView(const DvceArray5D<T> &data, FaceFldOrigin origin = {}) {
+  return {data, origin};
+}
+
 template <typename T>
 struct HostFaceFld4D {
   HostArray4D<T> x1f, x2f, x3f;  // name indicates both direction and location

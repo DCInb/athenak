@@ -1203,6 +1203,11 @@ struct MaterialMixtureDevice {
     return MaximumTemperatureForComposition(y0);
   }
 
+  KOKKOS_INLINE_FUNCTION
+  bool ExtrapolatesHighTransportTemperature(const Real y0) const {
+    return AllPresentTablesExtrapolateHighTemperature(y0);
+  }
+
   // Each table loader reserves enough exponent headroom for all interpolated
   // non-negative pressure contributions (up to three materials times ion/electron). This
   // capability permits exact zero-residual shortcuts that would otherwise have to
@@ -2495,6 +2500,11 @@ struct MaterialMixtureDevice {
   KOKKOS_INLINE_FUNCTION
   Real MaximumTransportTemperature(const MaterialComposition &mix) const {
     return MaximumTemperatureForComposition(mix);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  bool ExtrapolatesHighTransportTemperature(const MaterialComposition &mix) const {
+    return AllPresentTablesExtrapolateHighTemperature(mix);
   }
 
   KOKKOS_INLINE_FUNCTION

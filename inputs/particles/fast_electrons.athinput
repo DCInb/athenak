@@ -1,0 +1,141 @@
+# PIC-informed fast electrons heating a cold, fully ionized hydrogen slab.
+# Code units: 1 cm, 1 g, 1 ns. Physical densities are g/cm^3.
+# The source power is erg/s; times and positions use code units.
+# Use a PIC joint distribution with four columns:
+#   kinetic_energy_keV  theta_degrees  phi_degrees  relative_number_weight
+# theta is measured from +x1; phi turns from +x2 toward +x3.
+# Collision-only baseline; see fast_electrons_hybrid.athinput for fields and refinement.
+
+<job>
+basename = fast_electrons
+
+<units>
+length_cgs = 1.0
+mass_cgs = 1.0
+time_cgs = 1.0e-9
+mu = 0.5
+
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = 0.0
+x1max = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 1
+x2min = -0.5
+x2max = 0.5
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 1
+nx3 = 1
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+tlim = 0.04
+nlim = -1
+ndiag = 1
+initial_dt = 0.01
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = hllc
+gamma = 1.6666666666666667
+two_temperature = true
+dual_energy = true
+electron_heat_capacity_fraction = 0.5
+initial_electron_temperature_ratio = 1.0
+t_ei = -1.0
+
+<fast_electrons>
+power_erg_s = 1.0e13
+start_time = 0.0
+end_time = 0.02
+origin_x1 = 0.05
+origin_x2 = 0.0
+origin_x3 = 0.0
+energy_kev = 100.0
+theta_deg = 0.0
+phi_deg = 0.0
+distribution_file =
+packets_per_bin = 1
+# Positive: fixed source-bin width in code time, independent of field substeps.
+# Zero: retain emission at every active transport interval.
+emission_interval = 0.0
+electron_number_per_gram = 6.02214076e23
+zeff = 1.0
+coulomb_log = 10.0
+collisions = true
+scattering = true
+thermalization_kev = 1.0
+thermalization_factor = 3.0
+max_fractional_loss = 0.05
+max_scatter = 0.05
+max_segments = 256
+max_transport_waves = 10000
+max_packets = 1000000
+# Release oversized GPU packet buffers after the live population falls.
+reclaim_packet_memory = false
+# Per-rank execution-space allocations, including mesh and temporary buffers.
+memory_diagnostics = false
+memory_budget_mib = 0.0
+memory_headroom_mib = 0.0
+# Local PPC and weighted effective counts every N accepted transport intervals.
+# Zero disables sampling diagnostics; cell CSVs can be large.
+particle_diagnostics_interval = 0
+particle_diagnostics_cells = false
+periodic_transport = false
+report_diagnostics = true
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.5
+dl = 0.01
+dr = 0.01
+pl = 1.0e-10
+pr = 1.0e-10
+ul = 0.0
+ur = 0.0
+vl = 0.0
+vr = 0.0
+wl = 0.0
+wr = 0.0
+
+<output1>
+file_type = tab
+variable = fast_electrons
+id = fast_electrons
+data_format = %24.16e
+dt = 0.01
+slice_x2 = 0.0
+slice_x3 = 0.0
+
+<output2>
+file_type = tab
+variable = hydro_2t
+id = temperatures
+data_format = %24.16e
+dt = 0.01
+slice_x2 = 0.0
+slice_x3 = 0.0
+
+<output3>
+file_type = tab
+variable = hydro_u
+id = fluid
+data_format = %24.16e
+dt = 0.01
+slice_x2 = 0.0
+slice_x3 = 0.0

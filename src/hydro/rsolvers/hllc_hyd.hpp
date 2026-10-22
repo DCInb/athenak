@@ -7,7 +7,7 @@
 //========================================================================================
 //! \file hllc_hyd.hpp
 //! \brief The HLLC Riemann solver for hydrodynamics, an extension of the HLLE fluxes to
-//! include the contact wave.  Only works for ideal gas EOS in hydrodynamics.
+//! include the contact wave. Supports ideal gas and tabulated EOS in hydrodynamics.
 //!
 //! REFERENCES:
 //! - E.F. Toro, "Riemann Solvers and numerical methods for fluid dynamics", 2nd ed.,
@@ -19,18 +19,53 @@
 #include <algorithm>  // max(), min()
 #include <cmath>      // sqrt()
 
+#include "hydro/rsolvers/material_hllc_hyd.hpp"
+
 namespace hydro {
 //----------------------------------------------------------------------------------------
 //! \fn void HLLC
-//! \brief The HLLC Riemann solver for ideal gas hydrodynamics (use HLLE for isothermal)
+//! \brief HLLC for ideal gas or tabulated hydrodynamics (use HLLE for isothermal).
 
 KOKKOS_INLINE_FUNCTION
 void HLLC(TeamMember_t const &member, const EOS_Data &eos,
+     const bool use_tabular_material_eos,
      const RegionIndcs &indcs,const DualArray1D<RegionSize> &size,const CoordData &coord,
      const int m, const int k, const int j, const int il, const int iu, const int ivx,
-     const ScrArray2D<Real> &wl, const ScrArray2D<Real> &wr, DvceArray5D<Real> flx) {
+     const ScrArray2D<Real> &wl, const ScrArray2D<Real> &wr,
+     const ScrArray2D<Real> &material_left,
+     const ScrArray2D<Real> &material_right, BandView5D<Real> flx) {
   int ivy = IVX + ((ivx-IVX)+1)%3;
   int ivz = IVX + ((ivx-IVX)+2)%3;
+
+  if (use_tabular_material_eos || eos.is_table) {
+    par_for_inner(member, il, iu, [&](const int i) {
+      const HydPrim1D wli{wl(IDN,i), wl(ivx,i), wl(ivy,i), wl(ivz,i), wl(IEN,i)};
+      const HydPrim1D wri{wr(IDN,i), wr(ivx,i), wr(ivy,i), wr(ivz,i), wr(IEN,i)};
+      Real pl, pr, cs2l, cs2r;
+      if (use_tabular_material_eos) {
+        pl = material_left(material_total_pressure, i);
+        pr = material_right(material_total_pressure, i);
+        cs2l = material_left(material_sound_speed_squared, i);
+        cs2r = material_right(material_sound_speed_squared, i);
+      } else {
+        const auto left = eos.EvalThermoStateFromRhoEint(wli.d, wli.e);
+        const auto right = eos.EvalThermoStateFromRhoEint(wri.d, wri.e);
+        pl = left.pressure;
+        pr = right.pressure;
+        cs2l = left.sound_speed_squared;
+        cs2r = right.sound_speed_squared;
+      }
+      HydCons1D flux;
+      SingleStateHLLC_HydMaterial(wli, wri, fmax(pl, 0.0), fmax(pr, 0.0),
+                                  fmax(cs2l, 0.0), fmax(cs2r, 0.0), flux);
+      flx(m,IDN,k,j,i) = flux.d;
+      flx(m,ivx,k,j,i) = flux.mx;
+      flx(m,ivy,k,j,i) = flux.my;
+      flx(m,ivz,k,j,i) = flux.mz;
+      flx(m,IEN,k,j,i) = flux.e;
+    });
+    return;
+  }
 
   Real gm1 = eos.gamma - 1.0;
   Real igm1 = 1.0/gm1;

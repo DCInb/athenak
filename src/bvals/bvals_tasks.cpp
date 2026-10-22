@@ -30,6 +30,11 @@
 
 TaskStatus MeshBoundaryValues::InitRecv(const int nvars) {
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_vars_.PostRecv(BatchSegments(false, false, nvars), comm_vars);
+    return TaskStatus::complete;
+  }
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -87,6 +92,11 @@ TaskStatus MeshBoundaryValues::InitRecv(const int nvars) {
 
 TaskStatus MeshBoundaryValues::ClearRecv() {
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_vars_.Receive(true);
+    return TaskStatus::complete;
+  }
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   bool no_errors=true;
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
@@ -119,6 +129,11 @@ TaskStatus MeshBoundaryValues::ClearRecv() {
 
 TaskStatus MeshBoundaryValues::ClearSend() {
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_vars_.WaitSend();
+    return TaskStatus::complete;
+  }
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   bool no_errors=true;
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
@@ -152,6 +167,11 @@ TaskStatus MeshBoundaryValues::ClearSend() {
 TaskStatus MeshBoundaryValues::ClearFluxRecv() {
   bool no_errors=true;
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_flux_.Receive(true);
+    return TaskStatus::complete;
+  }
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -181,6 +201,11 @@ TaskStatus MeshBoundaryValues::ClearFluxRecv() {
 TaskStatus MeshBoundaryValues::ClearFluxSend() {
   bool no_errors=true;
 #if MPI_PARALLEL_ENABLED
+  if (batch_enabled_) {
+    batch_flux_.WaitSend();
+    return TaskStatus::complete;
+  }
+  if (global_variable::nranks == 1) {return TaskStatus::complete;}
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;

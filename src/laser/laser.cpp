@@ -20,6 +20,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/mesh_refinement.hpp"
 #include "eos/eos.hpp"
 #include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
@@ -158,6 +159,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     active_queue_a_("laser-active-a", 1), active_queue_b_("laser-active-b", 1),
     ray_destination_rank_("laser-ray-destination-rank", 1),
     global_block_info_("laser-global-block-info", 1),
+    global_block_tree_("laser-global-block-tree", 0),
     mpi_send_counts_("laser-mpi-send-counts", 1),
     mpi_send_offsets_("laser-mpi-send-offsets", 1),
     mpi_pack_cursors_("laser-mpi-pack-cursors", 1),
@@ -166,7 +168,7 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
     mpi_host_send_packets_("laser-mpi-host-send-packets", 1),
     mpi_host_recv_packets_("laser-mpi-host-recv-packets", 1),
     device_diagnostics_("laser-diagnostics", 6),
-    device_counters_("laser-counters", 8),
+    device_counters_("laser-counters", 9),
     cumulative_energy_start_("laser-energy-start", 1, 1, 1, 1, 1),
     pmy_pack_(ppack) {
   // Couple to whichever Newtonian 2T fluid the deck configured.  <hydro> and <mhd> are
@@ -602,7 +604,9 @@ Laser::Laser(MeshBlockPack *ppack, ParameterInput *pin) :
   int ncells2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
   int ncells3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
   Kokkos::realloc(cell_data, nmb, ncell_data, ncells3, ncells2, ncells1);
-  Kokkos::realloc(cumulative_energy_start_, nmb, 1, ncells3, ncells2, ncells1);
+  // Lane zero preserves the RK cumulative-energy start. Lane one accumulates
+  // deposition roundoff during a stage; it is scratch and never migrates.
+  Kokkos::realloc(cumulative_energy_start_, nmb, 2, ncells3, ncells2, ncells1);
   if (ppack->pmesh->multilevel) {
     int n_ccells1 = indcs.cnx1 + 2*indcs.ng;
     int n_ccells2 = (indcs.cnx2 > 1) ? indcs.cnx2 + 2*indcs.ng : 1;
@@ -755,11 +759,12 @@ bool Laser::UpdateBeamPowers(Real time, Real dt) {
 void Laser::RefreshGlobalBlockInfo() {
   Mesh *mesh = pmy_pack_->pmesh;
   int nmb_total = mesh->nmb_total;
-  // The descriptors are a pure function of the block tree and the rank map, so on a
-  // static mesh they only need building once.  AMR is the only thing in this code that
-  // remaps gids or ranks after setup, so rebuild unconditionally there and cache
-  // otherwise; this was O(nmb_total) of host work plus one H2D on every RK stage.
-  if (global_block_info_built_ && !mesh->adaptive &&
+  // AMR redistributes gids/ranks only when blocks are created or deleted. Check both
+  // cumulative counts: simultaneous refinement and derefinement can preserve nmb_total.
+  const int created = mesh->pmr == nullptr ? 0 : mesh->pmr->nmb_created;
+  const int deleted = mesh->pmr == nullptr ? 0 : mesh->pmr->nmb_deleted;
+  if (global_block_info_built_ && created == global_blocks_created_ &&
+      deleted == global_blocks_deleted_ &&
       global_block_info_.extent_int(0) == nmb_total) {
     return;
   }
@@ -806,7 +811,16 @@ void Laser::RefreshGlobalBlockInfo() {
     host_blocks(gid) = info;
   }
   Kokkos::deep_copy(global_block_info_, host_blocks);
+  std::vector<LaserBlockInfo> blocks(nmb_total);
+  for (int gid = 0; gid < nmb_total; ++gid) blocks[gid] = host_blocks(gid);
+  const auto tree = BuildBlockTree(blocks, mesh->multi_d, mesh->three_d);
+  Kokkos::realloc(global_block_tree_, tree.size());
+  auto host_tree = Kokkos::create_mirror_view(global_block_tree_);
+  for (std::size_t n = 0; n < tree.size(); ++n) host_tree(n) = tree[n];
+  Kokkos::deep_copy(global_block_tree_, host_tree);
   global_block_info_built_ = true;
+  global_blocks_created_ = created;
+  global_blocks_deleted_ = deleted;
 }
 
 Laser::~Laser() {

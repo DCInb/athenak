@@ -27,6 +27,8 @@
 
 #include "hydro/hydro.hpp"
 #include "laser/laser.hpp"
+#include "fast_electrons/fast_electrons.hpp"
+#include "nuclear/dt_fusion.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
 #include "coordinates/adm.hpp"
@@ -83,6 +85,15 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
     refine_flag.h_view(m) = 0;
     ncyc_since_ref(m) = 0;
   }
+  if (pm->adaptive && pm->restart_refinement_ages.extent_int(0) != 0) {
+    // The restart footer uses global block order, so changing MPI ownership does
+    // not change the cooldown before a block can next refine or derefine.
+    if (pm->restart_refinement_ages.extent_int(0) != pm->nmb_total) {
+      Kokkos::abort("Incorrect number of AMR refinement ages in restart");
+    }
+    ncyc_since_ref = pm->restart_refinement_ages;
+    pm->restart_refinement_ages = HostArray1D<int>();
+  }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
 
@@ -92,6 +103,18 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
 #if MPI_PARALLEL_ENABLED
   // create unique communicators for AMR
   MPI_Comm_dup(MPI_COMM_WORLD, &amr_comm);
+  const std::string buffer_mode = pin->GetOrAddString(
+      "mesh_refinement", "communication_buffers", "fixed");
+  if (buffer_mode != "fixed" && buffer_mode != "dynamic") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
+              << "<mesh_refinement>/communication_buffers must be fixed or dynamic"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  // Dynamic buffers start with the small initial views and grow to the actual
+  // transfer counts in InitRecvAMR/PackAndSendAMR. Preserve fixed reservation as
+  // the default for devices that require the allocation workaround below.
+  if (buffer_mode == "dynamic") return;
   // allocate fixed-length send/recv data buffers as work around on Aurora and other
   // machines where frequent reallocation of Kokkos:Views causes memory issues
   // count number of cell- and face-centered variables communicated depending on physics
@@ -114,14 +137,23 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
   if (pm->pmb_pack->plaser != nullptr) {
     ncc_tosend += pm->pmb_pack->plaser->cell_data.extent_int(1);
   }
+  if (pm->pmb_pack->pfast_electrons != nullptr) {
+    ncc_tosend += pm->pmb_pack->pfast_electrons->cell_data.extent_int(1);
+  }
   int nmb = std::max((pm->pmb_pack->nmb_thispack), (pm->nmb_maxperrank));
   // number of cells per MB, including ghost zones
   int ncells = (pm->mb_indcs.nx1 + 2*pm->mb_indcs.ng);
   if (pm->multi_d) ncells *= (pm->mb_indcs.nx2 + 2*pm->mb_indcs.ng);
   if (pm->three_d) ncells *= (pm->mb_indcs.nx3 + 2*pm->mb_indcs.ng);
   int ndata = nmb*(ncc_tosend + nfc_tosend)*ncells;
-  Kokkos::realloc(recv_data, ndata);
-  Kokkos::realloc(send_data, ndata);
+  // A single rank never migrates a block: InitRecvAMR and PackAndSendAMR both
+  // return with zero transfers before accessing these arrays. Keep their small
+  // initial views instead of reserving two full copies of the evolved state.
+  // Multiple ranks in fixed mode reserve the capacity before load balancing.
+  if (global_variable::nranks > 1) {
+    Kokkos::realloc(recv_data, ndata);
+    Kokkos::realloc(send_data, ndata);
+  }
 #endif
 }
 
@@ -171,6 +203,12 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
 
     nmb_created += nnew;
     nmb_deleted += ndel;
+    if (pmbp->pfast_electrons != nullptr) pmbp->pfast_electrons->RefreshMesh();
+    if (pmbp->pdt_fusion != nullptr) {
+      pmbp->pdt_fusion->RefreshMesh();
+      pmbp->pdt_fusion->DepositMoments();
+      (void)pmbp->pdt_fusion->SourceTimeStep();
+    }
   }
   return;
 }
@@ -460,6 +498,17 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   // Calculate new load balance. Initialize new cost array with the simplest estimate
   // possible: all the blocks are equal
   // TODO(@user): implement variable cost per MeshBlock as needed
+#if MPI_PARALLEL_ENABLED
+  // Load balancing requires a nonempty MeshBlockPack on every rank, just as at
+  // startup. Derefinement can violate that requirement even when the old tree fits.
+  if (new_nmb_total < global_variable::nranks) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+        << "AMR would leave fewer MeshBlocks (nmb_total=" << new_nmb_total
+        << ") than MPI ranks (nranks=" << global_variable::nranks << "). "
+        << "Each rank must own at least one MeshBlock." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+#endif
   new_cost_eachmb = new float[new_nmb];
   new_rank_eachmb = new int[new_nmb];
   new_gids_eachrank = new int[global_variable::nranks];
@@ -502,6 +551,10 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     RestrictCC(pm->pmb_pack->plaser->cell_data,
                pm->pmb_pack->plaser->coarse_cell_data);
   }
+  if (pm->pmb_pack->pfast_electrons != nullptr) {
+    RestrictCC(pm->pmb_pack->pfast_electrons->cell_data,
+               pm->pmb_pack->pfast_electrons->coarse_cell_data);
+  }
 
   // Step 4.
   // Allocate send/recv buffers for load balancing, post receives.
@@ -522,6 +575,7 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   z4c::Z4c* pz4c = pm->pmb_pack->pz4c;
   adm::ADM* padm = pm->pmb_pack->padm;
   laser::Laser* plaser = pm->pmb_pack->plaser;
+  fast_electrons::FastElectrons* pfast_electrons = pm->pmb_pack->pfast_electrons;
   // derefine (if needed)
   if (ndel > 0) {
     if (phydro != nullptr) {
@@ -539,6 +593,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     }
     if (plaser != nullptr) {
       DerefineCCSameRank(plaser->cell_data, plaser->coarse_cell_data);
+    }
+    if (pfast_electrons != nullptr) {
+      DerefineCCSameRank(pfast_electrons->cell_data, pfast_electrons->coarse_cell_data);
     }
   }
 
@@ -563,6 +620,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   if (plaser != nullptr) {
     CopyCC(plaser->cell_data);
   }
+  if (pfast_electrons != nullptr) {
+    CopyCC(pfast_electrons->cell_data);
+  }
   // Step 7.
   // Copy evolved physics variables for MBs flagged for refinement from source fine array
   // to target coarse array, when both are on same rank.
@@ -582,6 +642,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     }
     if (plaser != nullptr) {
       CopyForRefinementCC(plaser->cell_data, plaser->coarse_cell_data);
+    }
+    if (pfast_electrons != nullptr) {
+      CopyForRefinementCC(pfast_electrons->cell_data, pfast_electrons->coarse_cell_data);
     }
   }
 
@@ -620,6 +683,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     }
     if (plaser != nullptr) {
       RefineCC(new_to_old, plaser->cell_data, plaser->coarse_cell_data);
+    }
+    if (pfast_electrons != nullptr) {
+      RefineCC(new_to_old, pfast_electrons->cell_data, pfast_electrons->coarse_cell_data);
     }
   }
 
@@ -1200,6 +1266,10 @@ void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
     par_for("restrictCC-1D",DevExeSpace(), 0,nmb-1, 0,nvar-1, cis,cie,
     KOKKOS_LAMBDA(const int m, const int n, const int i) {
       int finei = 2*i - cis;  // correct when cis=is
+      if (nvar == 1 && !is_z4c) {
+        cu(m,n,cks,cjs,i) = RestrictLinearAverage(u, m, n, cks, cjs, finei, false, false);
+        return;
+      }
       cu(m,n,cks,cjs,i) = 0.5*(u(m,n,cks,cjs,finei) + u(m,n,cks,cjs,finei+1));
     });
   // restrict in 2D
@@ -1208,6 +1278,10 @@ void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
     KOKKOS_LAMBDA(const int m, const int n, const int j, const int i) {
       int finei = 2*i - cis;  // correct when cis=is
       int finej = 2*j - cjs;  // correct when cjs=js
+      if (nvar == 1 && !is_z4c) {
+        cu(m,n,cks,j,i) = RestrictLinearAverage(u, m, n, cks, finej, finei, true, false);
+        return;
+      }
       cu(m,n,cks,j,i) = 0.25*(u(m,n,cks,finej  ,finei) + u(m,n,cks,finej  ,finei+1)
                             + u(m,n,cks,finej+1,finei) + u(m,n,cks,finej+1,finei+1));
     });
@@ -1219,6 +1293,10 @@ void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
       int finei = 2*i - cis;  // correct when cis=is
       int finej = 2*j - cjs;  // correct when cjs=js
       int finek = 2*k - cks;  // correct when cks=ks
+      if (nvar == 1 && !is_z4c) {
+        cu(m,n,k,j,i) = RestrictLinearAverage(u, m, n, finek, finej, finei, true, true);
+        return;
+      }
       if (!is_z4c) {
         cu(m,n,k,j,i) =
             0.125*(u(m,n,finek  ,finej  ,finei) + u(m,n,finek  ,finej  ,finei+1)

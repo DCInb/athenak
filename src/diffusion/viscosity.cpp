@@ -47,12 +47,12 @@ Viscosity::~Viscosity() {
 //! Currently only isotropic viscosity with constant coefficient implemented
 
 void Viscosity::AddViscousFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
   if (nu_iso != 0.0) {
-    AddViscousFluxIso(w0, eos, flx);
+    AddViscousFluxIso(w0, eos, flx, origin);
   }
   if (nu_iso != 0.0) {
-    AddViscousFluxAniso(w0, eos, flx);
+    AddViscousFluxAniso(w0, eos, flx, origin);
   }
   return;
 }
@@ -62,7 +62,7 @@ void Viscosity::AddViscousFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eo
 //  \brief Adds viscous fluxes to face-centered fluxes of conserved variables
 
 void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
@@ -77,7 +77,7 @@ void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &e
   // fluxes in x1-direction
   int scr_level = 0;
   size_t scr_size = (ScrArray1D<Real>::shmem_size(ncells1)) * 3;
-  auto flx1 = flx.x1f;
+  auto flx1 = MakeBandView(flx.x1f, origin);
 
   par_for_outer("visc1",DevExeSpace(), scr_size, scr_level, 0, nmb1, ks, ke, js, je,
   KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k, const int j) {
@@ -128,7 +128,7 @@ void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &e
   if (pmy_pack->pmesh->one_d) {return;}
 
   // fluxes in x2-direction
-  auto flx2 = flx.x2f;
+  auto flx2 = MakeBandView(flx.x2f, origin);
 
   par_for_outer("visc2",DevExeSpace(), scr_size, scr_level, 0, nmb1, ks, ke, js, je+1,
   KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k, const int j) {
@@ -173,7 +173,7 @@ void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &e
   if (pmy_pack->pmesh->two_d) {return;}
 
   // fluxes in x3-direction
-  auto flx3 = flx.x3f;
+  auto flx3 = MakeBandView(flx.x3f, origin);
 
   par_for_outer("visc3",DevExeSpace(), scr_size, scr_level, 0, nmb1, ks, ke+1, js, je,
   KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k, const int j) {
@@ -218,7 +218,7 @@ void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &e
 //  \brief Currently no-op function, to be added later
 
 void Viscosity::AddViscousFluxAniso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    DvceFaceFld5D<Real> &flx, const FaceFldOrigin origin) {
   return;
 }
 
